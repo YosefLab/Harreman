@@ -1,4 +1,110 @@
-an'
+import itertools
+import warnings
+import time
+from functools import partial
+from math import ceil
+from re import compile, match
+from typing import Dict, List, Literal, Optional, Sequence, Tuple, Union
+
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import sparse
+from anndata import AnnData
+from numba import jit
+from pynndescent import NNDescent
+from scipy.sparse import csr_matrix, triu
+from scipy.spatial import KDTree
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import normalize
+from tqdm import tqdm
+
+
+def compute_knn_graph(
+    adata: Union[str, AnnData],
+    compute_neighbors_on_key: Optional[str] = None,
+    distances_obsp_key: Optional[str] = None,
+    weighted_graph: Optional[bool] = False,
+    neighborhood_radius: Optional[int] = None,
+    n_neighbors: Optional[int] = None,
+    neighborhood_factor: Optional[int] = 3,
+    sample_key: Optional[str] = None,
+):
+    """Compute KNN graph.
+
+    Parameters
+    ----------
+    adata
+        AnnData object.
+    compute_neighbors_on_key
+        Key in `adata.obsm` to use for computing neighbors. If `None`, use neighbors stored in `adata`. If no neighbors have been previously computed an error will be raised.
+    distances_obsp_key
+        Distances encoding cell-cell similarities directly. Shape is (cells x cells). Input is key in `adata.obsp`.
+    weighted_graph
+        Whether or not to create a weighted graph.
+    neighborhood_radius
+        Neighborhood radius.
+    n_neighbors
+        Neighborhood size.
+    neighborhood_factor
+        Used when creating a weighted graph.  Sets how quickly weights decay relative to the distances within the neighborhood. The weight for a cell with a distance d will decay as exp(-d^2/D) where D is the distance to the `n_neighbors`/`neighborhood_factor`-th neighbor.
+    sample_key
+        Sample information in case the data contains different samples or samples from different conditions. Input is key in `adata.obs`.
+
+    """
+    start = time.time()
+
+    if compute_neighbors_on_key is not None:
+        print("Computing the neighborhood graph...")
+        compute_neighbors(
+            adata=adata,
+            compute_neighbors_on_key=compute_neighbors_on_key,
+            n_neighbors=n_neighbors,
+            neighborhood_radius=neighborhood_radius,
+            sample_key=sample_key,
+        )
+    else:
+        if distances_obsp_key is not None and distances_obsp_key in adata.obsp:
+            print("Computing the neighborhood graph from distances...")
+            compute_neighbors_from_distances(
+                adata,
+                distances_obsp_key,
+                n_neighbors,
+                sample_key,
+            )
+
+    if 'weights' not in adata.obsp and 'distances' in adata.obsp:
+        print("Computing the weights...")
+        compute_weights(
+            adata,
+            weighted_graph,
+            neighborhood_factor,
+        )
+
+    # weights = make_weights_non_redundant(adata.obsp["weights"].toarray())
+    # adata.obsp["weights"] = csr_matrix(weights)
+
+    print("Finished computing the KNN graph in %.3f seconds" %(time.time()-start))
+
+    return
+
+
+def compute_neighbors(
+        adata: Union[str, AnnData],
+        compute_neighbors_on_key: Optional[str] = None,
+        n_neighbors: Optional[int] = None,
+        neighborhood_radius: Optional[int] = None,
+        sample_key: Optional[str] = None,
+) -> None:
+
+    coords = adata.obsm[compute_neighbors_on_key]
+
+    if n_neighbors is not None:
+
+        nnbrs = NearestNeighbors(
+            n_neighbors=n_neighbors,
+            algorithm='ball_tree',
+            metric='euclidean'
         ).fit(coords)
         distances = nnbrs.kneighbors_graph(coords, mode='distance')
 

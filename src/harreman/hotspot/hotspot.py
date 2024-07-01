@@ -15,23 +15,25 @@ from .signature import compute_obs_df_scores, compute_signature_scores
 from .utils import filter_genes
 
 
-class VISION:
+class Hotspot:
     def __init__(
         self,
         adata: Optional[anndata.AnnData] = None,
         norm_data_key: Optional[Union[Literal["use_raw"], str]] = None,
-        protein_obsm_key: Optional[str] = None,
         compute_neighbors_on_key: Optional[str] = None,
         distances_obsp_key: Optional[str] = None,
         signature_varm_key: Optional[str] = None,
         signature_names_uns_key: Optional[str] = None,
         weighted_graph: Optional[bool] = True,
-        neighborhood_radius: Optional[int] = 100,
-        n_neighbors: Optional[int] = 30,
+        n_neighbors: Optional[int] = None,
         neighborhood_factor: Optional[int] = 3,
         sample_key: Optional[str] = None,
+        layer_key: Optional[Union[Literal["use_raw"], str]] = None,
+        model: Optional[str] = None,
+        neighborhood_radius: Optional[int] = 100,
+        jobs: Optional[int] = None,
     ) -> None:
-        """VISION object.
+        """Accessor to AnnData object.
 
         Parameters
         ----------
@@ -42,43 +44,32 @@ class VISION:
             `None` (default), uses `adata.X`
         protein_obsm_key
             Location for protein data
-        compute_neighbors_on_key
-            Key in `adata.obsm` to use for computing neighbors. If `None`, use neighbors stored in `adata`. If no neighbors have been previously computed an error will be raised.
-        distances_obsp_key
-            Distances encoding cell-cell similarities directly. Shape is (cells x cells). Input is key in `adata.obsp`.
         signature_varm_key
             Location for genes by signature matrix
-        signature_names_uns_key
-            Key in `adata.uns` for signature names. If `None`, attempts to read columns if `signature_varm_key` is a pandas DataFrame. Otherwise, uses `Signature_1`, `Signature_2`, etc.
-        weighted_graph
-            Whether or not to create a weighted graph.
-        neighborhood_radius
-            Neighborhood radius.
-        n_neighbors
-            Neighborhood size.
-        neighborhood_factor
-            Used when creating a weighted graph.  Sets how quickly weights decay relative to the distances within the neighborhood. The weight for a cell with a distance d will decay as exp(-d^2/D) where D is the distance to the `n_neighbors`/`neighborhood_factor`-th neighbor.
-        sample_key
-            Sample information in case the data contains different samples or samples from different conditions. Input is key in `adata.obs`.
 
         """
         self._adata = adata
         self._norm_data_key = norm_data_key
-        self._protein_obsm_key = protein_obsm_key
         self._compute_neighbors_on_key = compute_neighbors_on_key
         self._distances_obsp_key = distances_obsp_key
         self._signature_varm_key = signature_varm_key
         self._signature_names_uns_key = signature_names_uns_key
         self._weighted_graph = weighted_graph
-        self._neighborhood_radius = neighborhood_radius
         self._n_neighbors = n_neighbors
         self._neighborhood_factor = neighborhood_factor
         self._sample_key = sample_key
-        self._cells_selections = {}
+        self._layer_key = layer_key
+        self._model = model
+        self._neighborhood_radius = neighborhood_radius
+        self._jobs = jobs
 
     @property
     def adata(self):
         return self._adata
+
+    @adata.setter
+    def adata(self, key: str):
+        self._adata = key
 
     @property
     def var_names(self):
@@ -97,15 +88,6 @@ class VISION:
     def get_cells_selection(self, key):
         return self._cells_selections[key]
 
-    @adata.setter
-    def adata(self, adata: anndata.AnnData):
-        self._adata = adata
-        num_cols = adata.obs._get_numeric_data().columns.tolist()
-        cols = adata.obs.columns.tolist()
-        cat_vars = list(set(cols) - set(num_cols))
-        self.cat_obs_cols = cat_vars
-        self.numeric_obs_cols = num_cols
-
     @property
     def norm_data_key(self):
         return self._norm_data_key
@@ -113,14 +95,6 @@ class VISION:
     @norm_data_key.setter
     def norm_data_key(self, key: str):
         self._norm_data_key = key
-
-    @property
-    def protein_obsm_key(self):
-        return self._protein_obsm_key
-
-    @protein_obsm_key.setter
-    def protein_obsm_key(self, key: str):
-        self._protein_obsm_key = key
 
     @property
     def compute_neighbors_on_key(self):
@@ -185,38 +159,6 @@ class VISION:
     @sample_key.setter
     def sample_key(self, key: str):
         self._sample_key = key
-
-    @property
-    def obs_df_scores(self):
-        return self._obs_df_scores
-
-    @obs_df_scores.setter
-    def obs_df_scores(self, key: str):
-        self._obs_df_scores = key
-
-    @property
-    def one_vs_all_obs_cols(self):
-        return self._one_vs_all_obs_cols
-
-    @one_vs_all_obs_cols.setter
-    def one_vs_all_obs_cols(self, key: str):
-        self._one_vs_all_obs_cols = key
-
-    @property
-    def one_vs_all_signatures(self):
-        return self._one_vs_all_signatures
-
-    @one_vs_all_signatures.setter
-    def one_vs_all_signatures(self, key: str):
-        self._one_vs_all_signatures = key
-
-    @property
-    def gene_score_per_signature(self):
-        return self._gene_score_per_signature
-
-    @gene_score_per_signature.setter
-    def gene_score_per_signature(self, key: str):
-        self._gene_score_per_signature = key
 
     @property
     def layer_key(self):
@@ -329,6 +271,30 @@ class VISION:
     @test.setter
     def test(self, key: int):
         self._test = key
+
+    @property
+    def min_gene_threshold(self):
+        return self._min_gene_threshold
+
+    @min_gene_threshold.setter
+    def min_gene_threshold(self, key: int):
+        self._min_gene_threshold = key
+
+    @property
+    def core_only(self):
+        return self._core_only
+
+    @core_only.setter
+    def core_only(self, key: int):
+        self._core_only = key
+
+    @property
+    def fdr_threshold(self):
+        return self._fdr_threshold
+
+    @fdr_threshold.setter
+    def fdr_threshold(self, key: int):
+        self._fdr_threshold = key
 
     def get_gene_expression(self, gene: str, return_list=True) -> list:
         if self.adata is None:
@@ -443,39 +409,6 @@ class VISION:
                     }
 
         self.obs_adata = obs_adata
-
-    # TODO: refactor this function
-    def compute_gene_score_per_signature(self):
-        gene_score_sig = {}
-
-        if self.signature_names_uns_key is not None:
-            sig_names = self.adata.uns[self.signature_names_uns_key]
-        else:
-            sig_names = self.adata.obsm["vision_signatures"].columns
-
-        for s in sig_names:
-            gene_score_sig[s] = {"genes": [], "values": []}
-            df = self.get_genes_by_signature(s)
-            gene_names = df.index
-            # cells by genes
-            expr = np.array(self.get_gene_expression(gene_names, return_list=False))
-            # cells
-            sign = df.to_numpy().ravel()
-            gene_score_sig[s]["signs"] = sign.tolist()
-
-            # TODO: Make faster
-            for i, (g, sign_) in enumerate(zip(gene_names, sign)):
-                gene_score_sig[s]["values"].append(
-                    sign_ * pearsonr(expr[:, i], self.adata.obsm["vision_signatures"][s])[0]
-                )
-                gene_score_sig[s]["genes"].append(g)
-
-        for s in sig_names:
-            info = gene_score_sig[s]
-            gene_score_sig[s]["geneImportance"] = {g: v for g, v in zip(info["genes"], info["values"])}
-            gene_score_sig[s]["sigDict"] = {g: v for g, v in zip(info["genes"], info["signs"])}
-
-        self.gene_score_sig = gene_score_sig
 
     def compute_one_vs_one_de(self, key: str, group1: str, group2: str):
         rank_genes_groups(

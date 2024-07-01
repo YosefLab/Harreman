@@ -7,7 +7,7 @@ import pandas as pd
 
 from visionpy import data_accessor, hotspot_acc, vision_acc
 
-from .anndata import setup_anndata
+from ..preprocessing.anndata import setup_anndata
 from .cell_communication import (
     compute_cell_communication_np_fast,
     compute_cell_communication_p_fast,

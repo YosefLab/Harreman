@@ -1,4 +1,37 @@
-compute_local_cov_pairs_max,
+import itertools
+import time
+from random import sample
+from typing import Literal, Optional, Sequence, Union
+
+import anndata
+from numba import jit
+import numpy as np
+import pandas as pd
+from anndata import AnnData
+from scipy.cluster.hierarchy import linkage
+from scipy.spatial.distance import squareform
+from scipy.stats import norm
+from statsmodels.stats.multitest import multipletests
+from tqdm import tqdm
+import sparse
+from scipy.sparse import csr_matrix
+from scipy.stats.mstats import gmean
+from functools import partial
+from threadpoolctl import threadpool_limits
+
+from ..preprocessing.anndata import setup_anndata
+from .database import counts_from_anndata, extract_lr, extract_transporter_info
+from .knn import (
+    compute_neighbors,
+    compute_neighbors_from_distances,
+    compute_node_degree_ct_pair,
+    compute_weights,
+    make_weights_non_redundant,
+)
+from .local_autocorrelation import _compute_hs_inner_fast, center_values_total
+from .local_correlation import (
+    _compute_hs_pairs_inner_centered_cond_sym_fast,
+    compute_local_cov_pairs_max,
     create_centered_counts,
 )
 from .modules import (
@@ -12,7 +45,7 @@ from .modules import (
     sort_linkage,
 )
 from .signature import compute_signatures_anndata, read_gmt
-from .utils import filter_genes, get_interacting_cell_type_pairs
+from ..preprocessing.utils import filter_genes, get_interacting_cell_type_pairs
 
 
 def signatures_from_gmt(
@@ -298,7 +331,8 @@ def compute_local_autocorrelation(
 
     Wtot2 = (weights.data ** 2).sum()
 
-    center_vals_f = lambda x: center_values_total(x, num_umi, model)
+    def center_vals_f(x):
+        return center_values_total(x, num_umi, model)
     counts = np.apply_along_axis(lambda x: center_vals_f(x)[np.newaxis], 1, counts).squeeze(axis=1)
 
     results = _compute_hs_inner_fast(counts.T, weights, Wtot2, D)
@@ -852,7 +886,7 @@ def compute_cell_communication(
 
     adata.uns['ccc_results'] = {}
 
-    if not (test in ['both', 'parametric', 'non-parametric']):
+    if test not in ['both', 'parametric', 'non-parametric']:
         raise ValueError('The "test" variable should be one of ["both", "parametric", "non-parametric"].')
     
     if 'cell_type_key' in adata.uns and cell_type_key is None:
@@ -1036,11 +1070,11 @@ def run_cell_communication_analysis(
 
 
 def flatten(nested_list):
-        for item in nested_list:
-            if isinstance(item, (list, tuple)):
-                yield from flatten(item)
-            else:
-                yield item
+    for item in nested_list:
+        if isinstance(item, (list, tuple)):
+            yield from flatten(item)
+        else:
+            yield item
 
 
 def select_significant_interactions(

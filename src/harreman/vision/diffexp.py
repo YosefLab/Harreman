@@ -1,4 +1,37 @@
-est=None):
+"""Rank genes according to differential expression.
+
+Code adapted from:
+https://github.com/theislab/scanpy/blob/master/scanpy/tools/_rank_genes_groups.py
+
+Modified to output AUC for Wilcoxon score
+"""
+from math import floor
+from typing import Iterable, Literal, Optional, Union
+
+import numpy as np
+import pandas as pd
+from anndata import AnnData
+from scanpy import _utils
+from scanpy import logging as logg
+from scanpy._utils import check_nonnegative_integers
+from scanpy.preprocessing._simple import _get_mean_var
+from scipy.sparse import issparse, vstack
+
+_Method = Optional[Literal["wilcoxon"]]
+_CorrMethod = Literal["benjamini-hochberg", "bonferroni"]
+
+
+def _select_top_n(scores, n_top):
+    n_from = scores.shape[0]
+    reference_indices = np.arange(n_from, dtype=int)
+    partition = np.argpartition(scores, -n_top)[-n_top:]
+    partial_indices = np.argsort(scores[partition])[::-1]
+    global_indices = reference_indices[partition][partial_indices]
+
+    return global_indices
+
+
+def _ranks(X, mask=None, mask_rest=None):
     CONST_MAX_SIZE = 10000000
 
     n_genes = X.shape[1]

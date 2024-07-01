@@ -1,4 +1,38 @@
-       weights = weights.tocsr()
+import random
+from re import compile, match
+from typing import Dict, List, Literal, Optional, Sequence, Tuple, Union
+
+import numpy as np
+import pandas as pd
+from anndata import AnnData
+from scanpy.metrics._gearys_c import _gearys_c
+from scanpy.preprocessing._utils import _get_mean_var
+from scipy.sparse import csr_matrix, issparse
+from scipy.stats import chi2_contingency
+from sklearn.cluster import KMeans
+from statsmodels.stats.multitest import multipletests
+
+DOWN_SIG_KEY = "DN"
+UP_SIG_KEY = "UP"
+
+
+def compute_obs_df_scores(adata):
+    """Computes Geary's C for numerical data."""
+    numerical_df = adata.obs._get_numeric_data()
+    num_cols = numerical_df.columns.tolist()
+    cols = adata.obs.columns.tolist()
+    cat_cols = list(set(cols) - set(num_cols))
+
+    # aggregate results
+    res = pd.DataFrame(index=adata.obs.columns)
+    res["c_prime"] = 0
+    res["pvals"] = 0
+    res["fdr"] = 0
+
+    # first handle numerical data with geary's
+    if len(num_cols) > 0:
+        weights = adata.obsp["weights"]
+        weights = weights.tocsr()
         gearys_c = _gearys_c(weights, numerical_df.to_numpy().transpose())
         c_prime = 1-gearys_c
         pvals_num = compute_num_var_pvals(c_prime, weights, numerical_df)

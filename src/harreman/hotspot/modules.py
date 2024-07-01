@@ -1,10 +1,45 @@
-r each module for each gene
+from typing import Literal, Optional, Union
+import time
+import numpy as np
+import pandas as pd
+import scvi
+from anndata import AnnData
+from scipy.cluster.hierarchy import linkage
+from scipy.spatial.distance import squareform
+from scipy.stats import hypergeom, norm, pearsonr, spearmanr
+from sklearn.decomposition import PCA
+from statsmodels.stats.multitest import multipletests
+from tqdm import tqdm
+
+from ..vision.signature import compute_signatures_anndata
+from ..preprocessing.anndata import counts_from_anndata
+from .local_correlation import create_centered_counts_row
+from ..preprocessing.utils import neighbor_smoothing_row
+
+
+def calculate_module_scores(
+    adata: AnnData,
+    method: Optional[Union[Literal["PCA"], Literal["LDVAE"]]] = 'PCA',
+):
+    """Calculate Module Scores.
+
+    In addition to returning its result, this method stores
+    its output in the object at `self.module_scores`
+
+    Returns
+    -------
+    module_scores: pandas.DataFrame
+        Scores for each module for each gene
         Dimensions are genes x modules
 
     """
+    start = time.time()
+
+    layer_key = adata.uns['layer_key']
+    model = adata.uns['model']
 
     use_raw = layer_key == "use_raw"
-    modules = adata.uns["gene_modules"]
+    modules = adata.uns["gene_modules_dict"]
 
     umi_counts = adata.uns['umi_counts']
 
@@ -20,15 +55,14 @@ r each module for each gene
 
         if method == 'PCA':
             scores, loadings = compute_scores_PCA(
-                adata[:, module_genes].copy(),
+                adata[:, module_genes],
                 layer_key,
                 model,
                 umi_counts,
-                neighbor_smoothing,
             )
         elif method == 'LDVAE':
             scores, loadings = compute_scores_LDVAE(
-                adata[:, module_genes].copy(),
+                adata[:, module_genes],
             )
         else:
             raise ValueError('Invalid method: Please choose either "PCA" or "LDVAE".')
@@ -46,6 +80,10 @@ r each module for each gene
     adata.obsm['module_scores'] = module_scores
     adata.varm['gene_loadings'] = gene_loadings
     adata.uns["gene_modules_dict"] = gene_modules
+
+    print("Finished computing scores in %.3f seconds" %(time.time()-start))
+
+    return
 
 
 def compute_scores_PCA(
@@ -373,9 +411,14 @@ def assign_modules_core(Z, leaf_labels, offset, MIN_THRESHOLD=10, Z_THRESHOLD=3)
     return out_clusters
 
 
-def compute_modules(adata, min_gene_threshold=15, fdr_threshold=None, z_threshold=None, core_only=False):
-    """
-    Assigns modules from the gene pair-wise Z-scores
+def create_modules(
+    adata: Union[str, AnnData],
+    min_gene_threshold: Optional[int] = 15,
+    fdr_threshold: Optional[float] = 0.05,
+    z_threshold: Optional[float] = None,
+    core_only: bool = False,
+):
+    """Assigns modules from the gene pair-wise Z-scores.
 
     Parameters
     ----------
@@ -396,6 +439,8 @@ def compute_modules(adata, min_gene_threshold=15, fdr_threshold=None, z_threshol
         Linkage matrix in the format used by scipy.cluster.hierarchy.linkage
 
     """
+    start = time.time()
+    print("Creating modules...")
 
     # Determine Z_Threshold from FDR threshold
 
@@ -444,8 +489,13 @@ def compute_modules(adata, min_gene_threshold=15, fdr_threshold=None, z_threshol
     for mod in out_clusters.unique():
         gene_modules_dict[str(mod)] = out_clusters[out_clusters == mod].index.tolist()
 
-    adata.uns["gene_modules"] = gene_modules_dict
+    adata.uns["gene_modules"] = out_clusters
+    adata.uns["gene_modules_dict"] = gene_modules_dict
     adata.uns["linkage"] = linkage_out
+
+    print("Finished creating modules in %.3f seconds" %(time.time()-start))
+
+    return
 
 
 def compute_sig_mod_enrichment(adata, norm_data_key, signature_varm_key):
@@ -547,3 +597,44 @@ def compute_sig_mod_correlation(adata, method):
     cor_FDR_df = pd.Series(cor_FDR_values, index=cor_pval_df.stack().index).unstack()
 
     return cor_coef_df, cor_pval_df, cor_FDR_df
+
+
+def integrate_vision_hotspot_results(
+    adata: AnnData,
+    cor_method: Optional[Union[Literal["pearson"], Literal["spearman"]]] = 'pearson',
+):
+
+    if ("vision_signatures" in adata.obsm) and (len(adata.uns["gene_modules_dict"].keys()) > 0):
+
+        start = time.time()
+        print("Integrating VISION and Hotspot results...")
+
+        norm_data_key = adata.uns['norm_data_key']
+        signature_varm_key = adata.uns['signature_varm_key']
+
+        pvals_df, stats_df, FDR_df = compute_sig_mod_enrichment(adata, norm_data_key, signature_varm_key)
+        adata.uns["sig_mod_enrichment_stats"] = stats_df
+        adata.uns["sig_mod_enrichment_pvals"] = pvals_df
+        adata.uns["sig_mod_enrichment_FDR"] = FDR_df
+
+        if cor_method not in ['pearson', 'spearman']:
+            raise ValueError(f'Invalid method: {cor_method}. Choose either "pearson" or "spearman".')
+
+        cor_coef_df, cor_pval_df, cor_FDR_df = compute_sig_mod_correlation(adata, cor_method)
+        adata.uns["sig_mod_correlation_coefs"] = cor_coef_df
+        adata.uns["sig_mod_correlation_pvals"] = cor_pval_df
+        adata.uns["sig_mod_correlation_FDR"] = cor_FDR_df
+
+        adata.obsm["signature_modules_overlap"] = compute_signatures_anndata(
+            adata,
+            norm_data_key,
+            signature_varm_key='signatures_overlap',
+            signature_names_uns_key=None,
+        )
+
+        print("Finished integrating VISION and Hotspot results in %.3f seconds" %(time.time()-start))
+
+    else:
+        raise ValueError('Please make sure VISION has been run and Hotspot has identified at least one module.')
+
+    return

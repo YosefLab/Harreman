@@ -1,9 +1,37 @@
-Literal["use_raw"], str]] = None,
-        model: Optional[str] = None,
-        neighborhood_radius: Optional[int] = 200,
-        jobs: Optional[int] = None,
+import math
+from typing import Literal, Optional, Union
+
+import anndata
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import scipy
+from scipy.sparse import issparse
+from scipy.stats import chisquare, pearsonr
+
+from .diffexp import rank_genes_groups
+from .signature import compute_obs_df_scores, compute_signature_scores, compute_signatures_anndata
+from ..preprocessing.utils import filter_genes
+from ..tools.knn import compute_neighbors, compute_neighbors_from_distances, compute_weights
+
+
+class VISION:
+    def __init__(
+        self,
+        adata: Optional[anndata.AnnData] = None,
+        norm_data_key: Optional[Union[Literal["use_raw"], str]] = None,
+        protein_obsm_key: Optional[str] = None,
+        compute_neighbors_on_key: Optional[str] = None,
+        distances_obsp_key: Optional[str] = None,
+        signature_varm_key: Optional[str] = None,
+        signature_names_uns_key: Optional[str] = None,
+        weighted_graph: Optional[bool] = True,
+        neighborhood_radius: Optional[int] = 100,
+        n_neighbors: Optional[int] = 30,
+        neighborhood_factor: Optional[int] = 3,
+        sample_key: Optional[str] = None,
     ) -> None:
-        """Accessor to AnnData object.
+        """VISION object.
 
         Parameters
         ----------
@@ -14,24 +42,38 @@ Literal["use_raw"], str]] = None,
             `None` (default), uses `adata.X`
         protein_obsm_key
             Location for protein data
+        compute_neighbors_on_key
+            Key in `adata.obsm` to use for computing neighbors. If `None`, use neighbors stored in `adata`. If no neighbors have been previously computed an error will be raised.
+        distances_obsp_key
+            Distances encoding cell-cell similarities directly. Shape is (cells x cells). Input is key in `adata.obsp`.
         signature_varm_key
             Location for genes by signature matrix
+        signature_names_uns_key
+            Key in `adata.uns` for signature names. If `None`, attempts to read columns if `signature_varm_key` is a pandas DataFrame. Otherwise, uses `Signature_1`, `Signature_2`, etc.
+        weighted_graph
+            Whether or not to create a weighted graph.
+        neighborhood_radius
+            Neighborhood radius.
+        n_neighbors
+            Neighborhood size.
+        neighborhood_factor
+            Used when creating a weighted graph.  Sets how quickly weights decay relative to the distances within the neighborhood. The weight for a cell with a distance d will decay as exp(-d^2/D) where D is the distance to the `n_neighbors`/`neighborhood_factor`-th neighbor.
+        sample_key
+            Sample information in case the data contains different samples or samples from different conditions. Input is key in `adata.obs`.
 
         """
         self._adata = adata
         self._norm_data_key = norm_data_key
+        self._protein_obsm_key = protein_obsm_key
         self._compute_neighbors_on_key = compute_neighbors_on_key
         self._distances_obsp_key = distances_obsp_key
         self._signature_varm_key = signature_varm_key
         self._signature_names_uns_key = signature_names_uns_key
         self._weighted_graph = weighted_graph
+        self._neighborhood_radius = neighborhood_radius
         self._n_neighbors = n_neighbors
         self._neighborhood_factor = neighborhood_factor
         self._sample_key = sample_key
-        self._layer_key = layer_key
-        self._model = model
-        self._neighborhood_radius = neighborhood_radius
-        self._jobs = jobs
         self._cells_selections = {}
 
     @property
@@ -71,7 +113,15 @@ Literal["use_raw"], str]] = None,
     @norm_data_key.setter
     def norm_data_key(self, key: str):
         self._norm_data_key = key
-    
+
+    @property
+    def protein_obsm_key(self):
+        return self._protein_obsm_key
+
+    @protein_obsm_key.setter
+    def protein_obsm_key(self, key: str):
+        self._protein_obsm_key = key
+
     @property
     def compute_neighbors_on_key(self):
         return self._compute_neighbors_on_key
@@ -87,7 +137,7 @@ Literal["use_raw"], str]] = None,
     @distances_obsp_key.setter
     def distances_obsp_key(self, key: str):
         self._distances_obsp_key = key
-    
+
     @property
     def signature_varm_key(self):
         return self._signature_varm_key
@@ -103,7 +153,7 @@ Literal["use_raw"], str]] = None,
     @signature_names_uns_key.setter
     def signature_names_uns_key(self, key: str):
         self._signature_names_uns_key = key
-    
+
     @property
     def weighted_graph(self):
         return self._weighted_graph
@@ -119,7 +169,7 @@ Literal["use_raw"], str]] = None,
     @n_neighbors.setter
     def n_neighbors(self, key: list):
         self._n_neighbors = key
-    
+
     @property
     def neighborhood_factor(self):
         return self._neighborhood_factor
@@ -135,7 +185,7 @@ Literal["use_raw"], str]] = None,
     @sample_key.setter
     def sample_key(self, key: str):
         self._sample_key = key
-    
+
     @property
     def obs_df_scores(self):
         return self._obs_df_scores
@@ -143,7 +193,7 @@ Literal["use_raw"], str]] = None,
     @obs_df_scores.setter
     def obs_df_scores(self, key: str):
         self._obs_df_scores = key
-    
+
     @property
     def one_vs_all_obs_cols(self):
         return self._one_vs_all_obs_cols
@@ -151,7 +201,7 @@ Literal["use_raw"], str]] = None,
     @one_vs_all_obs_cols.setter
     def one_vs_all_obs_cols(self, key: str):
         self._one_vs_all_obs_cols = key
-    
+
     @property
     def one_vs_all_signatures(self):
         return self._one_vs_all_signatures
@@ -159,7 +209,7 @@ Literal["use_raw"], str]] = None,
     @one_vs_all_signatures.setter
     def one_vs_all_signatures(self, key: str):
         self._one_vs_all_signatures = key
-    
+
     @property
     def gene_score_per_signature(self):
         return self._gene_score_per_signature
@@ -183,7 +233,7 @@ Literal["use_raw"], str]] = None,
     @model.setter
     def model(self, key: str):
         self._model = key
-    
+
     @property
     def neighborhood_radius(self):
         return self._neighborhood_radius
@@ -191,7 +241,7 @@ Literal["use_raw"], str]] = None,
     @neighborhood_radius.setter
     def neighborhood_radius(self, key: list):
         self._neighborhood_radius = key
-    
+
     @property
     def jobs(self):
         return self._jobs
@@ -199,7 +249,7 @@ Literal["use_raw"], str]] = None,
     @jobs.setter
     def jobs(self, key: int):
         self._jobs = key
-    
+
     @property
     def deconv_data(self):
         return self._deconv_data
@@ -215,7 +265,7 @@ Literal["use_raw"], str]] = None,
     @cell_type_list.setter
     def cell_type_list(self, key: list):
         self._cell_type_list = key
-    
+
     @property
     def cell_type_key(self):
         return self._cell_type_key
@@ -231,7 +281,7 @@ Literal["use_raw"], str]] = None,
     @cell_type_pairs.setter
     def cell_type_pairs(self, key: str):
         self._cell_type_pairs = key
-    
+
     @property
     def database_varm_key(self):
         return self._database_varm_key
@@ -247,7 +297,7 @@ Literal["use_raw"], str]] = None,
     @spot_diameter.setter
     def spot_diameter(self, key: int):
         self._spot_diameter = key
-    
+
     @property
     def autocorrelation_filt(self):
         return self._autocorrelation_filt
@@ -255,7 +305,7 @@ Literal["use_raw"], str]] = None,
     @autocorrelation_filt.setter
     def autocorrelation_filt(self, key: int):
         self._autocorrelation_filt = key
-    
+
     @property
     def expression_filt(self):
         return self._expression_filt
@@ -263,7 +313,7 @@ Literal["use_raw"], str]] = None,
     @expression_filt.setter
     def expression_filt(self, key: int):
         self._expression_filt = key
-    
+
     @property
     def de_filt(self):
         return self._de_filt
@@ -271,7 +321,7 @@ Literal["use_raw"], str]] = None,
     @de_filt.setter
     def de_filt(self, key: int):
         self._de_filt = key
-    
+
     @property
     def test(self):
         return self._test
@@ -300,12 +350,12 @@ Literal["use_raw"], str]] = None,
 
     def get_genes_by_signature(self, sig_name: str) -> pd.DataFrame:
         """Df of genes in index, sign as values."""
-        
+
         if self.signature_names_uns_key is not None:
             index = np.where(np.asarray(self.adata.uns[self.signature_names_uns_key]) == sig_name)[0][0]
         else:
             index = np.where(np.asarray(self.adata.obsm["vision_signatures"].columns) == sig_name)[0][0]
-        
+
         if self._norm_data_key == "use_raw":
             matrix = self.adata.raw.varm[self.signature_varm_key]
         else:
@@ -322,13 +372,13 @@ Literal["use_raw"], str]] = None,
         sig_df = pd.DataFrame(index=self.var_names[mask], data=matrix[mask])
 
         return sig_df
-    
+
     def compute_obs_df_scores(self):
         self.adata.uns["vision_obs_df_scores"] = compute_obs_df_scores(self.adata)
 
     def compute_signature_scores(self):
         self.adata.uns["vision_signature_scores"] = compute_signature_scores(self.adata, self.norm_data_key, self.signature_varm_key)
-    
+
     def filter_genes(self):
         self.adata.uns['filtered_genes'], self.adata.uns['filtered_genes_ct'] = filter_genes(self.adata, self.layer_key, self.database_varm_key, self.cell_type_key, self.expression_filt, self.de_filt, self.autocorrelation_filt)
 
@@ -397,12 +447,12 @@ Literal["use_raw"], str]] = None,
     # TODO: refactor this function
     def compute_gene_score_per_signature(self):
         gene_score_sig = {}
-        
+
         if self.signature_names_uns_key is not None:
             sig_names = self.adata.uns[self.signature_names_uns_key]
         else:
             sig_names = self.adata.obsm["vision_signatures"].columns
-        
+
         for s in sig_names:
             gene_score_sig[s] = {"genes": [], "values": []}
             df = self.get_genes_by_signature(s)
@@ -439,88 +489,131 @@ Literal["use_raw"], str]] = None,
             layer=self.norm_data_key if self.norm_data_key != "use_raw" else None,
         )
         return sc.get.rank_genes_groups_df(self.adata, group1, key=f"rank_genes_groups_{key}")
-    
-    def compute_sig_mod_enrichment(self):
-        pvals_df, stats_df, FDR_df = compute_sig_mod_enrichment(self.adata, self.norm_data_key, self.signature_varm_key)
-        self.adata.uns["sig_mod_enrichment_stats"] = stats_df
-        self.adata.uns["sig_mod_enrichment_pvals"] = pvals_df
-        self.adata.uns["sig_mod_enrichment_FDR"] = FDR_df
+
+
+def start_vision(
+    adata: Union[str, anndata.AnnData],
+    norm_data_key: Optional[Union[Literal["use_raw"], str]] = None,
+    compute_neighbors_on_key: Optional[str] = None,
+    distances_obsp_key: Optional[str] = None,
+    signature_varm_key: Optional[str] = None,
+    signature_names_uns_key: Optional[str] = None,
+    weighted_graph: Optional[bool] = False,
+    neighborhood_radius: Optional[int] = None,
+    n_neighbors: Optional[int] = None,
+    neighborhood_factor: Optional[int] = 3,
+    sample_key: Optional[str] = None,
+    obs_df_scores: Optional[bool] = False,
+    one_vs_all_obs_cols: Optional[bool] = False,
+    one_vs_all_signatures: Optional[bool] = False,
+    gene_score_per_signature: Optional[bool] = False,
+    scores_only: Optional[bool] = False,
+):
+    """Start VISION.
+
+    Parameters
+    ----------
+    adata
+        AnnData object.
+    norm_data_key
+        Key for layer with log library size normalized data. If `None` (default), uses `adata.X`.
+    compute_neighbors_on_key
+        Key in `adata.obsm` to use for computing neighbors. If `None`, use neighbors stored in `adata`. If no neighbors have been previously computed an error will be raised.
+    distances_obsp_key
+        Distances encoding cell-cell similarities directly. Shape is (cells x cells). Input is key in `adata.obsp`.
+    signature_varm_key
+        Key in `adata.varm` for signatures. If `None` (default), no signatures. Matrix should encode positive genes with 1, negative genes with -1, and all other genes with 0.
+    signature_names_uns_key
+        Key in `adata.uns` for signature names. If `None`, attempts to read columns if `signature_varm_key` is a pandas DataFrame. Otherwise, uses `Signature_1`, `Signature_2`, etc.
+    weighted_graph
+        Whether or not to create a weighted graph.
+    neighborhood_radius
+        Neighborhood radius.
+    n_neighbors
+        Neighborhood size.
+    neighborhood_factor
+        Used when creating a weighted graph.  Sets how quickly weights decay relative to the distances within the neighborhood. The weight for a cell with a distance d will decay as exp(-d^2/D) where D is the distance to the `n_neighbors`/`neighborhood_factor`-th neighbor.
+    sample_key
+        Sample information in case the data contains different samples or samples from different conditions. Input is key in `adata.obs`.
+    obs_df_scores
+        Boolean variable indicating whether to compute observation scores or not.
+    one_vs_all_obs_cols
+        Boolean variable indicating whether to compute one vs all DE analysis of the numerical variables for every categorical variable or not.
+    one_vs_all_signatures
+        Boolean variable indicating whether to compute one vs all DE analysis of the signature scores for every categorical variable or not.
+    gene_score_per_signature
+        Boolean variable indicating whether to compute the correlation between gene expression and signature scores for every gene-signature pair or not.
+
+    """
+    if isinstance(adata, str):
+        adata = anndata.read(str)
+
+    if scores_only is False:
+
+        # compute neighbors and weights
+        if compute_neighbors_on_key is not None:
+            print("Computing the neighborhood graph...")
+            compute_neighbors(
+                adata=adata,
+                compute_neighbors_on_key=compute_neighbors_on_key,
+                n_neighbors=n_neighbors,
+                neighborhood_radius=neighborhood_radius,
+                sample_key=sample_key,
+            )
+        else:
+            if distances_obsp_key is not None and distances_obsp_key in adata.obsp:
+                print("Computing the neighborhood graph from distances...")
+                compute_neighbors_from_distances(
+                    adata,
+                    distances_obsp_key,
+                    n_neighbors,
+                    sample_key,
+                )
+
+        if 'weights' not in adata.obsp and 'distances' in adata.obsp:
+            print("Computing the weights...")
+            compute_weights(
+                adata,
+                weighted_graph,
+                neighborhood_factor,
+            )
+
+    VISION.adata = adata
+    VISION.norm_data_key = norm_data_key
+    VISION.compute_neighbors_on_key = compute_neighbors_on_key
+    VISION.distances_obsp_key = distances_obsp_key
+    VISION.signature_varm_key = signature_varm_key
+    VISION.signature_names_uns_key = signature_names_uns_key
+    VISION.weighted_graph = weighted_graph
+    VISION.neighborhood_radius = neighborhood_radius
+    VISION.n_neighbors = n_neighbors
+    VISION.neighborhood_factor = neighborhood_factor
+    VISION.sample_key = sample_key
+
+    if obs_df_scores is True:
+        VISION.compute_obs_df_scores()
+
+    if one_vs_all_obs_cols is True:
+        VISION.compute_one_vs_all_obs_cols()
+
+    # compute signatures
+    if signature_varm_key is not None:
+        adata.obsm["vision_signatures"] = compute_signatures_anndata(
+            adata,
+            norm_data_key,
+            signature_varm_key,
+            signature_names_uns_key,
+        )
+
+        if scores_only is False:
+            VISION.compute_signature_scores()
+
+        if one_vs_all_signatures is True:
+            VISION.compute_one_vs_all_signatures()
+
+    if gene_score_per_signature is True:
+        VISION.compute_gene_score_per_signature()
 
 
 def categories(col):
     return col.astype("category").cat.categories
-
-
-def setup_anndata(
-        input_adata: anndata.AnnData,
-        cell_types: list,
-        compute_neighbors_on_key: str,
-        cell_type_key: str,
-        database_varm_key: str,
-        sample_key: str,
-        spot_diameter: int,
-) -> anndata.AnnData:
-
-    database = input_adata.varm[database_varm_key]
-    barcode_key = 'barcodes'
-
-    for i, ct in enumerate(cell_types):
-        if ct not in input_adata.layers:
-            continue
-        adata = anndata.AnnData(input_adata.layers[ct])
-        adata.obs_names = input_adata.obs_names.astype(str) + '_' + ct
-        adata.var_names = input_adata.var_names
-        adata.obsm[compute_neighbors_on_key] = input_adata.obsm[compute_neighbors_on_key]
-        adata.obs[barcode_key] = input_adata.obs_names
-        adata.obs[cell_type_key] = ct
-        if sample_key is not None:
-            adata.obs[sample_key] = input_adata.obs[sample_key].values
-
-        if i == 0:
-            out_adata = adata.copy()
-        else:
-            out_adata = anndata.concat([out_adata, adata])
-
-    out_adata.uns['database_varm_key'] = input_adata.uns['database_varm_key']
-    out_adata.uns['spot_diameter'] = spot_diameter
-    out_adata.uns['barcode_key'] = barcode_key
-    out_adata.varm[database_varm_key] = database
-
-    valid_barcodes = out_adata.X.sum(axis=1) > 0
-    out_adata = out_adata[valid_barcodes,].copy()
-
-    return out_adata
-
-
-# The code below belongs to the SpatialDM package. Modify it accrodingly
-
-def drop_uns_na(adata, global_stat=False, local_stat=False):
-    adata.uns['geneInter'] = adata.uns['geneInter'].fillna('NA')
-    adata.uns['global_res'] = adata.uns['global_res'].fillna('NA')
-    adata.uns['ligand'] = adata.uns['ligand'].fillna('NA')
-    adata.uns['receptor'] = adata.uns['receptor'].fillna('NA')
-    adata.uns['local_stat']['n_spots'] = pd.DataFrame(adata.uns['local_stat']['n_spots'], columns=['n_spots'])
-    if global_stat and ('global_stat' in adata.uns.keys()):
-        adata.uns.pop('global_stat')
-    if local_stat and ('local_stat' in adata.uns.keys()):
-        adata.uns.pop('local_stat')
-
-def restore_uns_na(adata):
-    adata.uns['geneInter'] = adata.uns['geneInter'].replace('NA', np.nan)
-    adata.uns['global_res'] = adata.uns['global_res'].replace('NA', np.nan)
-    adata.uns['ligand'] = adata.uns['ligand'].replace('NA', np.nan)
-    adata.uns['receptor'] = adata.uns['receptor'].replace('NA', np.nan)
-    adata.uns['local_stat']['n_spots'] =  adata.uns['local_stat']['n_spots'].n_spots
-
-def write_spatialdm_h5ad(adata, filename=None):
-    if filename is None:
-        filename = 'spatialdm_out.h5ad'
-    elif not filename.endswith('h5ad'):
-        filename = filename+'.h5ad'
-    drop_uns_na(adata)
-    adata.write(filename)
-
-def read_spatialdm_h5ad(filename):
-    adata = anndata.read_h5ad(filename)
-    restore_uns_na(adata)
-    return adata

@@ -1,4 +1,67 @@
-row_vals
+from typing import Literal, Optional, Sequence, Union
+import time
+from anndata import AnnData
+import numpy as np
+import pandas as pd
+from numba import jit, njit
+from scipy.stats import wilcoxon, mannwhitneyu, ranksums
+from statsmodels.stats.multitest import multipletests
+
+from ..preprocessing.anndata import counts_from_anndata
+from ..hotspot.local_autocorrelation import compute_local_autocorrelation
+
+
+def load_metabolic_genes(
+    species: Optional[Union[Literal["mouse"], Literal["human"]]] = None,
+):
+
+    metabolic_genes_paths = {
+        'human': "/home/labs/nyosef/oier/Compass_data/metabolic_genes/metabolic_genes_h.csv",
+        'mouse': "/home/labs/nyosef/oier/Compass_data/metabolic_genes/metabolic_genes_m.csv"
+    }
+
+    metabolic_genes = list(pd.read_csv(metabolic_genes_paths[species], index_col=0, header=None).index)
+
+    return metabolic_genes
+
+
+@njit
+def center_values(vals, mu, var):
+    out = np.zeros_like(vals)
+
+    for i in range(len(vals)):
+        std = var[i]**0.5
+        if std == 0:
+            out[i] = 0
+        else:
+            out[i] = (vals[i] - mu[i])/std
+
+    return out
+
+
+@njit
+def neighbor_smoothing(vals, weights, _lambda=.9):
+    """
+
+    output is (neighborhood average) * _lambda + self * (1-_lambda)
+
+
+    vals: expression matrix (genes x cells)
+    weights: neighbor weights (cells x cells)
+    _lambda: ratio controlling self vs. neighborhood
+    """
+
+    out = np.zeros_like(vals, dtype=np.float64)
+
+    G = vals.shape[0]       # Genes
+
+    for g in range(G):
+
+        row_vals = vals[g, :]
+        smooth_row_vals = neighbor_smoothing_row(
+            row_vals, weights, _lambda)
+
+        out[g, :] = smooth_row_vals
 
     return out
 
@@ -44,6 +107,48 @@ def neighbor_smoothing_row(vals, weights, _lambda=.9):
     return out
 
 
+def apply_gene_filtering(
+    adata: AnnData,
+    layer_key: Optional[Union[Literal["use_raw"], str]] = None,
+    cell_type_key: Optional[str] = None,
+    model: Optional[str] = None,
+    autocorrelation_filt: bool = False,
+    expression_filt: bool = False,
+    de_filt: bool = False,
+):
+    
+    start = time.time()
+    print("Applying gene filtering...")
+    
+    adata.uns['autocorrelation_filt'] = autocorrelation_filt
+    adata.uns['expression_filt'] = expression_filt
+    adata.uns['de_filt'] = de_filt
+
+    if ('gene_autocorrelation_results' not in adata.uns) and (autocorrelation_filt is True):
+        compute_local_autocorrelation(
+            adata,
+            layer_key,
+            adata.uns['database_varm_key'],
+            model,
+            use_metabolic_genes = False,
+        )
+
+    if (expression_filt is True) or (de_filt is True):
+
+        if cell_type_key is None and 'cell_type_key' in adata.uns:
+            cell_type_key = adata.uns['cell_type_key']
+        elif cell_type_key is None and 'cell_type_key' not in adata.uns:
+            raise ValueError('The "cell_type_key" argument needs to be provided.')
+
+        filtered_genes, filtered_genes_ct = filter_genes(adata, layer_key, adata.uns['database_varm_key'], cell_type_key, expression_filt, de_filt, autocorrelation_filt)
+        adata.uns['filtered_genes'] = filtered_genes
+        adata.uns['filtered_genes_ct'] = filtered_genes_ct
+    
+    print("Finished applying gene filtering in %.3f seconds" %(time.time()-start))
+
+    return
+
+
 def filter_genes(adata, layer_key, database_varm_key, cell_type_key, expression_filt, de_filt, autocorrelation_filt):
 
     if autocorrelation_filt is True:
@@ -73,7 +178,7 @@ def filter_genes(adata, layer_key, database_varm_key, cell_type_key, expression_
     filtered_genes = []
     filtered_genes_ct = {}
 
-    if (expression_filt == True) and (de_filt == True):
+    if (expression_filt is True) and (de_filt is True):
 
         for cell_type in cell_type_list:
             cell_type_mask = cell_types == cell_type
@@ -183,6 +288,14 @@ def cohens_d(x, y):
     return (np.mean(x) - np.mean(y)) / pooled_std
 
 
+def flatten(nested_list):
+    for item in nested_list:
+        if isinstance(item, (list, tuple)):
+            yield from flatten(item)
+        else:
+            yield item
+
+
 def get_interacting_cell_type_pairs(x, weights, cell_types):
     ct_1, ct_2 = x
 
@@ -193,5 +306,3 @@ def get_interacting_cell_type_pairs(x, weights, cell_types):
     cell_types_weights = weights[ct_1_bin,][:, ct_2_bin]
 
     return bool(cell_types_weights.nnz)
-
-

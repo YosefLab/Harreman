@@ -1,4 +1,40 @@
-   Genes by metabolites (or LRs) dataframe. Index is aligned to genes from adata.
+from itertools import zip_longest
+from re import compile, match
+from typing import Dict, List, Literal, Optional, Sequence, Tuple, Union
+
+import numpy as np
+import pandas as pd
+from anndata import AnnData
+from scipy.sparse import issparse
+
+IMPORT_METAB_KEY = "IMPORT"
+EXPORT_METAB_KEY = "EXPORT"
+BOTH_METAB_KEY = "BOTH"
+
+
+def extract_interaction_db(
+    adata: AnnData,
+    use_raw: bool = False,
+    species: Optional[Union[Literal["mouse"], Literal["human"]]] = None,
+    database: Optional[Union[Literal["transporter"], Literal["LR"], Literal["both"]]] = None,
+    min_cell: Optional[int] = 0,
+):
+    """Extract the metabolite transporter or LR database from .csv files.
+
+    Parameters
+    ----------
+    adata
+        AnnData object to compute database for.
+    use_raw
+        Whether to use adata.raw.X for database computation.
+    species
+        Species identity to select the LR database from CellChatDB.
+    csv_files
+        List of .csv files to use for database computation.
+
+    Returns
+    -------
+    Genes by metabolites (or LRs) dataframe. Index is aligned to genes from adata.
 
     """
     if species not in ['human', 'mouse']:
@@ -25,7 +61,6 @@
         LR_df = LR_df.loc[:, (LR_df!=0).any(axis=0)]
 
     if database == 'both' or database == 'transporter':
-        # Modify the function such that the metabolite DB is provided with the code and not by the user. Save the DB in adata.uns
         metab_dict = {}
         metab_dict = extract_transporter_info(adata, species)
         index = adata.raw.var.index if use_raw else adata.var_names

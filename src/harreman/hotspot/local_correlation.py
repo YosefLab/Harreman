@@ -1,7 +1,7 @@
 import itertools
 import multiprocessing
 from typing import Dict, List, Literal, Optional, Sequence, Tuple, Union
-
+import time
 import numpy as np
 import pandas as pd
 import scipy.cluster.hierarchy as hcluster
@@ -19,102 +19,32 @@ from statsmodels.stats.multitest import multipletests
 from tqdm import tqdm
 
 from . import models
-from .database import counts_from_anndata
-from .knn import compute_node_degree
+from ..preprocessing.anndata import counts_from_anndata
+from ..tools.knn import compute_node_degree
 from .local_autocorrelation import compute_local_cov_max
-from .utils import center_values
+from ..preprocessing.utils import center_values
 
 
 def compute_local_correlation(
     adata: AnnData,
-    layer_key: Optional[Union[Literal["use_raw"], str]] = None,
-    model: Optional[str] = None,
-    genes: Optional[str] = None,
-    jobs: Optional[int] = 1,
+    genes: Optional[list] = None,
 ):
+
+    start = time.time()
+
+    if genes is None:
+        gene_autocorrelation_results = adata.uns['gene_autocorrelation_results']
+        genes = gene_autocorrelation_results.loc[gene_autocorrelation_results.FDR < 0.05].sort_values('Z', ascending=False).index
+
+    print(f"Computing pair-wise local correlation on {len(genes)} features...")
+    
+    layer_key = adata.uns['layer_key']
+    model = adata.uns['model']
 
     counts = counts_from_anndata(adata[:, genes], layer_key, dense=True)
 
-    neighbors = adata.obsm["neighbors_sort"].values
     weights = adata.obsp['weights']
     num_umi = counts.sum(axis=0)
-
-    D = compute_node_degree(neighbors, weights)
-
-    counts = create_centered_counts(counts, model, num_umi)
-
-    eg2s = np.array(
-        [
-            conditional_eg2(counts[i], neighbors, weights)
-            for i in range(counts.shape[0])
-        ]
-    )
-
-    def initializer():
-        global g_neighbors
-        global g_weights
-        global g_counts
-        global g_eg2s
-        g_counts = counts
-        g_neighbors = neighbors
-        g_weights = weights
-        g_eg2s = eg2s
-
-    pairs = list(itertools.combinations(range(counts.shape[0]), 2))
-
-    if jobs > 1:
-
-        with multiprocessing.Pool(
-                processes=jobs, initializer=initializer) as pool:
-
-            results = list(
-                tqdm(
-                    pool.imap(_map_fun_parallel_pairs_centered_cond, pairs),
-                    total=len(pairs)
-                )
-            )
-    else:
-        def _map_fun(rowpair):
-            return _compute_hs_pairs_inner_centered_cond_sym(
-                rowpair, counts, neighbors, weights, eg2s)
-        results = list(
-            tqdm(
-                map(_map_fun, pairs),
-                total=len(pairs)
-            )
-        )
-
-    N = counts.shape[0]
-    pairs = np.array(pairs)
-    vals_lc = np.array([x[0] for x in results])
-    vals_z = np.array([x[1] for x in results])
-    lcs = expand_pairs(pairs, vals_lc, N)
-    lc_zs = expand_pairs(pairs, vals_z, N)
-
-    lc_maxs = compute_local_cov_pairs_max(D, counts)
-    lcs = lcs / lc_maxs
-
-    lcs = pd.DataFrame(lcs, index=genes, columns=genes)
-    lc_zs = pd.DataFrame(lc_zs, index=genes, columns=genes)
-
-    adata.uns["lcs"] = lcs
-    adata.uns["lc_zs"] = lc_zs
-
-
-
-def compute_local_correlation_fast(
-    adata: AnnData,
-    layer_key: Optional[Union[Literal["use_raw"], str]] = None,
-    model: Optional[str] = None,
-    genes: Optional[str] = None,
-):
-
-    counts = counts_from_anndata(adata[:, genes], layer_key, dense=True)
-
-    weights = adata.obsp['weights'].tocsr()
-    num_umi = counts.sum(axis=0)
-
-    # D = compute_node_degree(weights.toarray())
 
     row_degrees = np.array(weights.sum(axis=1).T)[0]
     col_degrees = np.array(weights.sum(axis=0).T)[0]
@@ -122,7 +52,6 @@ def compute_local_correlation_fast(
 
     counts = create_centered_counts(counts, model, num_umi)
 
-    # eg2s = conditional_eg2_fast(counts.T, weights.tocsr())
     eg2s = ((weights @ counts.T) ** 2).sum(axis=0)
 
     results = _compute_hs_pairs_inner_centered_cond_sym_fast(counts, weights, eg2s)
@@ -137,6 +66,10 @@ def compute_local_correlation_fast(
 
     adata.uns["lcs"] = lcs
     adata.uns["lc_zs"] = lc_zs
+
+    print("Finished computing pair-wise local correlation in %.3f seconds" %(time.time()-start))
+
+    return
 
 
 @jit(nopython=True)
@@ -165,25 +98,6 @@ def conditional_eg2(x, neighbors, weights):
     out_eg2 = (t1x**2).sum()
 
     return out_eg2
-
-
-# @jit(nopython=True)
-def conditional_eg2_fast(counts, weights):
-    """
-    Computes EG2 for the conditional correlation
-    """
-
-    # counts = sparse.COO.from_numpy(counts)
-
-    # WC_cells = sparse.einsum('ij,kj->ik', weights, counts)
-
-    # WC_cells_sq_data = WC_cells.data ** 2
-    # WC_cells_sq = sparse.COO(WC_cells.coords, WC_cells_sq_data, shape=WC_cells.shape)
-    # eg2s = sparse.sum(WC_cells_sq, axis=0) # eg2s is a torch vector of length equal to the number of genes
-
-    eg2s = ((weights @ counts) ** 2).sum(axis=0)
-
-    return eg2s
 
 
 @jit(nopython=True)
@@ -341,16 +255,6 @@ def _compute_hs_pairs_inner_centered_cond_sym_fast(
     Z[i_upper] = Z.T[i_upper]
 
     return (lc, Z)
-
-
-def _map_fun_parallel_pairs_centered_cond(rowpair):
-    global g_neighbors
-    global g_weights
-    global g_counts
-    global g_eg2s
-    return _compute_hs_pairs_inner_centered_cond_sym(
-        rowpair, g_counts, g_neighbors, g_weights, g_eg2s
-    )
 
 
 @njit

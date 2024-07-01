@@ -1,91 +1,48 @@
-(axis=1)].index
-    else:
-        genes = adata.var_names if not use_raw else adata.raw.var.index
+import multiprocessing
+from typing import Dict, List, Literal, Optional, Sequence, Tuple, Union
+import time
+import numpy as np
+import pandas as pd
+import sparse
+from anndata import AnnData
+from numba import jit
+from scipy.sparse import issparse
+from scipy.stats import norm
+from statsmodels.stats.multitest import multipletests
+from tqdm import tqdm
 
-    counts = counts_from_anndata(adata[:, genes], layer_key, dense=True)
-
-    weights = adata.obsp['weights']
-    # We remove all-zero genes from the counts matrix and we update the gene list
-    genes = genes[~np.all(counts == 0, axis=1)]
-    counts = counts[~np.all(counts == 0, axis=1)]
-    num_umi = np.array(counts.sum(axis=0))
-
-    # D = compute_node_degree(weights)
-
-    row_degrees = weights.sum(axis=1).todense()
-    col_degrees = weights.sum(axis=0).todense()
-    D = row_degrees + col_degrees
-
-    # Wtot2 = (weights**2).sum()
-
-    weights_sq_data = weights.data ** 2
-    weights_sq = sparse.COO(weights.coords, weights_sq_data, shape=weights.shape)
-    Wtot2 = weights_sq.data.sum()
-
-    weights_data = weights.data
-    weights_coords = weights.coords
-
-    def data_iter():
-        for i in range(counts.shape[0]):
-            vals = counts[i]
-            if issparse(vals):
-                vals = np.asarray(vals.A).ravel()
-            vals = vals.astype("double")
-            yield vals
-
-    def initializer():
-        global g_weights_data
-        global g_weights_coords
-        global g_num_umi
-        global g_model
-        global g_Wtot2
-        global g_D
-        g_weights_data = weights_data
-        g_weights_coords = weights_coords
-        g_num_umi = num_umi
-        g_model = model
-        g_Wtot2 = Wtot2
-        g_D = D
-
-    if jobs > 1:
-
-        with multiprocessing.Pool(processes=jobs, initializer=initializer) as pool:
-
-            results = list(
-                tqdm(pool.imap(_map_fun_parallel, data_iter()), total=counts.shape[0])
-            )
-    else:
-
-        def _map_fun(vals):
-            return _compute_hs_inner(
-                vals, weights_data, weights_coords, num_umi, model, Wtot2, D
-            )
-
-        results = list(tqdm(map(_map_fun, data_iter()), total=counts.shape[0]))
-
-    results = pd.DataFrame(results, index=genes, columns=["G", "EG", "stdG", "Z", "C"])
-
-    results["Pval"] = norm.sf(results["Z"].values)
-    results["FDR"] = multipletests(results["Pval"], method="fdr_bh")[1]
-
-    results = results.sort_values("Z", ascending=False)
-    results.index.name = "Gene"
-
-    adata.uns['gene_autocorrelation_results'] = results
+from . import models
+from ..preprocessing.anndata import counts_from_anndata
+from ..preprocessing.utils import load_metabolic_genes
+from ..tools.knn import compute_node_degree
+from ..preprocessing.utils import center_values
 
 
-def compute_local_autocorrelation_fast(
+def compute_local_autocorrelation(
     adata: AnnData,
     layer_key: Optional[Union[Literal["use_raw"], str]] = None,
     database_varm_key: Optional[str] = None,
     model: Optional[str] = None,
+    genes: Optional[list] = None,
+    use_metabolic_genes: bool = True,
+    species: Optional[Union[Literal["mouse"], Literal["human"]]] = "mouse",
 ):
 
+    start = time.time()
+    print("Computing local autocorrelation...")
+
+    adata.uns['layer_key'] = layer_key
+    adata.uns['model'] = model
+
+    if use_metabolic_genes and genes is None:
+        genes = load_metabolic_genes(species)
+        genes = adata.var_names[adata.var_names.isin(genes)]
+
     use_raw = layer_key == "use_raw"
-    if database_varm_key is not None:
+    if (database_varm_key is not None) and (genes is None):
         metab_matrix = adata.varm[database_varm_key] if not use_raw else adata.raw.varm[database_varm_key]
         genes = metab_matrix.loc[(metab_matrix!=0).any(axis=1)].index
-    else:
+    elif (database_varm_key is None) and (genes is None):
         genes = adata.var_names if not use_raw else adata.raw.var.index
 
     counts = counts_from_anndata(adata[:, genes], layer_key, dense=True)
@@ -97,16 +54,17 @@ def compute_local_autocorrelation_fast(
 
     adata.uns['umi_counts'] = num_umi
 
-    row_degrees = weights.sum(axis=1).todense()
-    col_degrees = weights.sum(axis=0).todense()
+    row_degrees = np.array(weights.sum(axis=1).T)[0]
+    col_degrees = np.array(weights.sum(axis=0).T)[0]
     D = row_degrees + col_degrees
 
     Wtot2 = (weights.data ** 2).sum()
 
-    center_vals_f = lambda x: center_values_total(x, num_umi, model)
+    def center_vals_f(x):
+        return center_values_total(x, num_umi, model)
     counts = np.apply_along_axis(lambda x: center_vals_f(x)[np.newaxis], 1, counts).squeeze(axis=1)
 
-    results = _compute_hs_inner_fast(counts.T, weights.tocsr(), Wtot2, D)
+    results = _compute_hs_inner_fast(counts.T, weights, Wtot2, D)
     results = pd.DataFrame(results, index=["G", "G_max", "EG", "stdG", "Z", "C"], columns=genes).T
 
     results["Pval"] = norm.sf(results["Z"].values)
@@ -118,6 +76,10 @@ def compute_local_autocorrelation_fast(
     results = results[["C", "Z", "Pval", "FDR"]]
 
     adata.uns['gene_autocorrelation_results'] = results
+
+    print("Finished computing local autocorrelation in %.3f seconds" %(time.time()-start))
+
+    return
 
 
 @jit(nopython=True)
@@ -235,18 +197,6 @@ def _compute_hs_inner_fast(counts, weights, Wtot2, D):
     return [G, G_max, EG, stdG, Z, C]
 
 
-def _map_fun_parallel(vals):
-    global g_weights_data
-    global g_weights_coords
-    global g_num_umi
-    global g_model
-    global g_Wtot2
-    global g_D
-    return _compute_hs_inner(
-        vals, g_weights_data, g_weights_coords, g_num_umi, g_model, g_Wtot2, g_D
-    )
-
-
 def compute_communication_autocorrelation(adata, spatial_coords_obsm_key):
     """Computes Geary's C for numerical data."""
     
@@ -283,3 +233,4 @@ def compute_communication_autocorrelation(adata, spatial_coords_obsm_key):
         jobs = 1,
     )
 
+    adata.uns['gene_pair_autocorrelation_results'] = gene_pair_adata.uns['gene_autocorrelation_results']

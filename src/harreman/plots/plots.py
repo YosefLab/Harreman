@@ -1,3 +1,44 @@
+import warnings
+from typing import Literal, Optional, Union
+from anndata import AnnData
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from matplotlib.colors import ListedColormap
+from matplotlib.gridspec import GridSpec
+from scipy.cluster.hierarchy import leaves_list
+
+
+def local_correlation_plot(
+    adata: AnnData,
+    mod_cmap='tab10',
+    vmin=-10,
+    vmax=10,
+    z_cmap='RdBu_r',
+    yticklabels=False,
+):
+    
+    local_correlation_z = adata.uns["lc_zs"]
+    modules = adata.uns["gene_modules"]
+    linkage = adata.uns["linkage"]
+
+    row_colors = None
+    colors = list(plt.get_cmap(mod_cmap).colors)
+    module_colors = {i: colors[(i-1) % len(colors)] for i in modules.unique()}
+    module_colors[-1] = '#ffffff'
+
+    row_colors1 = pd.Series(
+        [module_colors[i] for i in modules],
+        index=local_correlation_z.index,
+    )
+
+    row_colors = pd.DataFrame({
+        "Modules": row_colors1,
+    })
+
+    cm = sns.clustermap(
         local_correlation_z,
         row_linkage=linkage,
         col_linkage=linkage,
