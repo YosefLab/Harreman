@@ -11,7 +11,6 @@ from scipy.stats import chisquare, pearsonr
 
 from .diffexp import rank_genes_groups
 from .signature import compute_obs_df_scores, compute_signature_scores, compute_signatures_anndata
-from ..preprocessing.utils import filter_genes
 from ..tools.knn import compute_neighbors, compute_neighbors_from_distances, compute_weights
 
 
@@ -378,9 +377,6 @@ class VISION:
 
     def compute_signature_scores(self):
         self.adata.uns["vision_signature_scores"] = compute_signature_scores(self.adata, self.norm_data_key, self.signature_varm_key)
-
-    def filter_genes(self):
-        self.adata.uns['filtered_genes'], self.adata.uns['filtered_genes_ct'] = filter_genes(self.adata, self.layer_key, self.database_varm_key, self.cell_type_key, self.expression_filt, self.de_filt, self.autocorrelation_filt)
 
     def compute_one_vs_all_signatures(self):
         sig_adata = anndata.AnnData(self.adata.obsm["vision_signatures"])

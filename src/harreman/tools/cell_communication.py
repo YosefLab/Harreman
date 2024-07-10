@@ -1,9 +1,7 @@
-import ast
 import itertools
 import json
-import multiprocessing
 from functools import partial
-from random import random, sample
+from random import random
 from typing import Literal, Optional, Union
 import time
 import numpy as np
@@ -11,11 +9,8 @@ import pandas as pd
 import scipy.cluster.hierarchy as hcluster
 import sparse
 import tensorly as tl
-import torch
 from anndata import AnnData
 from numba import jit, njit
-from scanpy.preprocessing._utils import _get_mean_var
-from scipy.sparse import csr_matrix, issparse
 from scipy.spatial.distance import squareform
 from scipy.stats import norm
 from sklearn.decomposition import PCA
@@ -24,12 +19,192 @@ from statsmodels.stats.multitest import multipletests
 from tqdm import tqdm
 from threadpoolctl import threadpool_limits
 from scipy.stats.mstats import gmean
-
+from scipy.stats import mannwhitneyu
 from ..hotspot import models
-from ..preprocessing.utils import flatten
-from ..preprocessing.anndata import setup_anndata, counts_from_anndata
-from .knn import compute_neighbors, compute_neighbors_from_distances, compute_node_degree_ct_pair, compute_weights
-from ..hotspot.local_autocorrelation import compute_local_autocorrelation_fast, compute_local_cov_max
+
+from ..preprocessing.anndata import counts_from_anndata
+from ..hotspot.local_autocorrelation import compute_local_autocorrelation
+
+
+def apply_gene_filtering(
+    adata: AnnData,
+    layer_key: Optional[Union[Literal["use_raw"], str]] = None,
+    cell_type_key: Optional[str] = None,
+    model: Optional[str] = None,
+    autocorrelation_filt: bool = False,
+    expression_filt: bool = False,
+    de_filt: bool = False,
+):
+    
+    start = time.time()
+    print("Applying gene filtering...")
+    
+    adata.uns['autocorrelation_filt'] = autocorrelation_filt
+    adata.uns['expression_filt'] = expression_filt
+    adata.uns['de_filt'] = de_filt
+
+    if ('gene_autocorrelation_results' not in adata.uns) and (autocorrelation_filt is True):
+        compute_local_autocorrelation(
+            adata,
+            layer_key,
+            adata.uns['database_varm_key'],
+            model,
+            use_metabolic_genes = False,
+        )
+
+    if (expression_filt is True) or (de_filt is True):
+
+        if cell_type_key is None and 'cell_type_key' in adata.uns:
+            cell_type_key = adata.uns['cell_type_key']
+        elif cell_type_key is None and 'cell_type_key' not in adata.uns:
+            raise ValueError('The "cell_type_key" argument needs to be provided.')
+
+        filtered_genes, filtered_genes_ct = filter_genes(adata, layer_key, adata.uns['database_varm_key'], cell_type_key, expression_filt, de_filt, autocorrelation_filt)
+        adata.uns['filtered_genes'] = filtered_genes
+        adata.uns['filtered_genes_ct'] = filtered_genes_ct
+    
+    print("Finished applying gene filtering in %.3f seconds" %(time.time()-start))
+
+    return
+
+
+def filter_genes(adata, layer_key, database_varm_key, cell_type_key, expression_filt, de_filt, autocorrelation_filt):
+
+    if autocorrelation_filt is True:
+        autocor_results = adata.uns['gene_autocorrelation_results']
+
+        non_sig_genes = autocor_results.loc[autocor_results.FDR > 0.05].index
+        sig_genes = autocor_results.loc[autocor_results.FDR < 0.05].index
+
+        if len(non_sig_genes) == autocor_results.shape[0]:
+            raise ValueError(
+                "There are no significantly autocorrelated genes."
+            )
+
+        counts = counts_from_anndata(adata[:, sig_genes], layer_key, dense=True)
+
+    else:
+        use_raw = layer_key == "use_raw"
+        database = adata.varm[database_varm_key] if not use_raw else adata.raw.varm[database_varm_key]
+
+        genes = database.loc[(database!=0).any(axis=1)].index
+        counts = counts_from_anndata(adata[:, genes], layer_key, dense=True) 
+
+
+    cell_types = adata.obs[cell_type_key]
+    cell_type_list = cell_types.unique().tolist()
+
+    filtered_genes = []
+    filtered_genes_ct = {}
+
+    if (expression_filt is True) and (de_filt is True):
+
+        for cell_type in cell_type_list:
+            cell_type_mask = cell_types == cell_type
+            counts_ct = counts[:,cell_type_mask]
+            # genes with high enough expression in each cell type
+            gene_expr_bin = np.apply_along_axis(expr_threshold, 1, counts_ct)
+            gene_expr_bin_df_ct = pd.DataFrame(gene_expr_bin, index=sig_genes, columns=['gene_expr_bin'])
+            gene_expr_bin_df_ct['cell_type'] = cell_type
+            gene_expr_bin_df_ct['gene'] = gene_expr_bin_df_ct.index
+            # genes overexpressed in each cell type
+            no_cell_type_mask = cell_types != cell_type
+            counts_no_ct = counts[:,no_cell_type_mask]
+            gene_de_results = [de_threshold(counts_ct[i], counts_no_ct[i]) for i in range(counts_ct.shape[0])]
+            gene_de_df_ct = pd.DataFrame(index=sig_genes)
+            gene_de_df_ct[['stat', 'pval', 'cohens_d']] = pd.Series(gene_de_results).tolist()
+            gene_de_df_ct['cell_type'] = cell_type
+            gene_de_df_ct['gene'] = gene_de_df_ct.index
+            if cell_type == cell_type_list[0]:
+                gene_expr_bin_df = gene_expr_bin_df_ct
+                gene_de_df = gene_de_df_ct
+            else:
+                gene_expr_bin_df = pd.concat([gene_expr_bin_df, gene_expr_bin_df_ct])
+                gene_de_df = pd.concat([gene_de_df, gene_de_df_ct])
+
+        gene_de_df['FDR'] = multipletests(gene_de_df["pval"], method="fdr_bh")[1]
+
+        for cell_type in cell_type_list:
+            gene_de_df_ct = gene_de_df[gene_de_df['cell_type'] == cell_type]
+            gene_expr_bin_df_ct = gene_expr_bin_df[gene_expr_bin_df['cell_type'] == cell_type]
+            gene_de_ct_sig = gene_de_df_ct[(gene_de_df_ct['FDR'] < 0.05) & gene_de_df_ct['cohens_d'] > 0]['gene'].tolist()
+            gene_expr_bin_ct = gene_expr_bin_df_ct[gene_expr_bin_df_ct['gene_expr_bin'] == True]['gene'].tolist()
+
+            filtered_genes_ct_list = list(set(gene_de_ct_sig) & set(gene_expr_bin_ct))
+
+            filtered_genes_ct[cell_type] = filtered_genes_ct_list
+            filtered_genes.append(filtered_genes_ct_list)
+
+        filtered_genes = [gene for ct_genes in filtered_genes for gene in ct_genes]
+        filtered_genes = list(np.unique(filtered_genes))
+
+
+    elif (expression_filt is True) and (de_filt is False):
+
+        for cell_type in cell_type_list:
+            cell_type_mask = cell_types == cell_type
+            counts_ct = counts[:,cell_type_mask]
+            # genes with high enough expression in each cell type
+            gene_expr_bin = np.apply_along_axis(expr_threshold, 1, counts_ct)
+            gene_expr_bin_df_ct = pd.DataFrame(gene_expr_bin, index=sig_genes, columns=['gene_expr_bin'])
+            gene_expr_bin_ct = gene_expr_bin_df_ct[gene_expr_bin_df_ct['gene_expr_bin'] is True].index.tolist()
+
+            filtered_genes_ct[cell_type] = gene_expr_bin_ct
+            filtered_genes.append(gene_expr_bin_ct)
+
+        filtered_genes = [gene for ct_genes in filtered_genes for gene in ct_genes]
+        filtered_genes = list(np.unique(filtered_genes))
+
+
+    elif (expression_filt is False) and (de_filt is True):
+
+        for cell_type in cell_type_list:
+            cell_type_mask = cell_types == cell_type
+            counts_ct = counts[:,cell_type_mask]
+            # genes overexpressed in each cell type
+            no_cell_type_mask = cell_types != cell_type
+            counts_no_ct = counts[:,no_cell_type_mask]
+            gene_de_results = [de_threshold(counts_ct[i], counts_no_ct[i]) for i in range(counts_ct.shape[0])]
+            gene_de_df_ct = pd.DataFrame(index=sig_genes)
+            gene_de_df_ct[['stat', 'pval', 'cohens_d']] = pd.Series(gene_de_results).tolist()
+            gene_de_df_ct['cell_type'] = cell_type
+            gene_de_df_ct['gene'] = gene_de_df_ct.index
+            if cell_type == cell_type_list[0]:
+                gene_de_df = gene_de_df_ct
+            else:
+                gene_de_df = pd.concat([gene_de_df, gene_de_df_ct])
+
+        gene_de_df['FDR'] = multipletests(gene_de_df["pval"], method="fdr_bh")[1]
+
+        for cell_type in cell_type_list:
+            gene_de_df_ct = gene_de_df[gene_de_df['cell_type'] == cell_type]
+            gene_de_ct_sig = gene_de_df_ct[(gene_de_df_ct['FDR'] < 0.05) & gene_de_df_ct['cohens_d'] > 0]['gene'].tolist()
+
+            filtered_genes_ct[cell_type] = gene_de_ct_sig
+            filtered_genes.append(gene_de_ct_sig)
+
+        filtered_genes = [gene for ct_genes in filtered_genes for gene in ct_genes]
+        filtered_genes = list(np.unique(filtered_genes))
+
+
+    return filtered_genes, filtered_genes_ct
+
+
+def expr_threshold(row):
+    return (row > 0).sum()/len(row) > 0.2
+
+
+def de_threshold(row1, row2):
+    stat, pval = mannwhitneyu(row1, row2, alternative='greater')
+    c_d = cohens_d(row1, row2)
+    return (stat, pval, c_d)
+
+
+def cohens_d(x, y):
+    pooled_std = np.sqrt(((len(x)-1) * np.var(x, ddof=1)
+                          + (len(y)-1) * np.var(y, ddof=1)) /
+                             (len(x) + len(y) - 2))
+    return (np.mean(x) - np.mean(y)) / pooled_std
 
 
 def compute_gene_pairs(
@@ -186,7 +361,8 @@ def compute_gene_pairs(
 
 def compute_cell_communication(
     adata: AnnData,
-    layer_key: Optional[Union[Literal["use_raw"], str]] = None,
+    layer_key_p_test: Optional[Union[Literal["use_raw"], str]] = None,
+    layer_key_np_test: Optional[Union[Literal["use_raw"], str]] = None,
     model: Optional[str] = None,
     cell_type_key: Optional[str] = None,
     center_counts_for_np_test: Optional[bool] = False,
@@ -208,20 +384,22 @@ def compute_cell_communication(
     elif 'cell_type_key' not in adata.uns and cell_type_key is None:
         raise ValueError('Please provide the "cell_type_key" argument.')
     
-    adata.uns['layer_key'] = layer_key
+    adata.uns['layer_key_p_test'] = layer_key_p_test
+    adata.uns['layer_key_np_test'] = layer_key_np_test
     adata.uns['model'] = model
     adata.uns['cell_type_key'] = cell_type_key
     adata.uns['center_counts_for_np_test'] = center_counts_for_np_test
     adata.uns['model'] = model
 
     with threadpool_limits(limits=njobs, user_api='blas'):
-        run_cell_communication_analysis(adata, layer_key, model, cell_type_key, center_counts_for_np_test, M, test)
+        run_cell_communication_analysis(adata, layer_key_p_test, layer_key_np_test, model, cell_type_key, center_counts_for_np_test, M, test)
 
     print("Obtaining the communication results...")
     get_cell_communication_results(
         adata,
         adata.uns["genes"],
-        layer_key,
+        layer_key_p_test,
+        layer_key_np_test,
         model,
         adata.uns["cell_types"],
         adata.uns["cell_type_pairs"],
@@ -236,7 +414,8 @@ def compute_cell_communication(
 
 def run_cell_communication_analysis(
     adata,
-    layer_key,
+    layer_key_p_test,
+    layer_key_np_test,
     model,
     cell_type_key,
     center_counts_for_np_test,
@@ -244,7 +423,7 @@ def run_cell_communication_analysis(
     test,
 ):
     
-    use_raw = layer_key == "use_raw"
+    use_raw = (layer_key_p_test == "use_raw") & (layer_key_np_test == "use_raw")
 
     cells = adata.obs_names if not use_raw else adata.raw.obs.index
     cells = cells.values.astype(str)
@@ -256,18 +435,6 @@ def run_cell_communication_analysis(
     adata.uns["genes"] = genes
     cell_type_pairs = adata.uns["cell_type_pairs"]
     gene_pairs_per_ct_pair = adata.uns["gene_pairs_per_ct_pair"]
-
-    counts_1 = np.vstack([counts_from_anndata(adata[:, gene_pair[0]], layer_key, dense=True) if type(gene_pair[0]) is not list else gmean(counts_from_anndata(adata[:, gene_pair[0]], layer_key, dense=True), axis=0) for gene_pair in gene_pairs])
-    counts_2 = np.vstack([counts_from_anndata(adata[:, gene_pair[1]], layer_key, dense=True) if type(gene_pair[1]) is not list else gmean(counts_from_anndata(adata[:, gene_pair[1]], layer_key, dense=True), axis=0) for gene_pair in gene_pairs])
-
-    if test in ['parametric', 'both'] or center_counts_for_np_test:
-        num_umi_1 = counts_1.sum(axis=0)
-        counts_1_std = create_centered_counts(counts_1, model, num_umi_1)
-        counts_1_std = np.nan_to_num(counts_1_std)
-
-        num_umi_2 = counts_2.sum(axis=0)
-        counts_2_std = create_centered_counts(counts_2, model, num_umi_2)
-        counts_2_std = np.nan_to_num(counts_2_std)
 
     gene_pairs_ind = []
     for pair in gene_pairs:
@@ -302,6 +469,17 @@ def run_cell_communication_analysis(
     adata.uns["D"] = D
 
     if test in ['parametric', 'both']:
+        counts_1 = np.vstack([counts_from_anndata(adata[:, gene_pair[0]], layer_key_p_test, dense=True) if type(gene_pair[0]) is not list else gmean(counts_from_anndata(adata[:, gene_pair[0]], layer_key_p_test, dense=True), axis=0) for gene_pair in gene_pairs])
+        counts_2 = np.vstack([counts_from_anndata(adata[:, gene_pair[1]], layer_key_p_test, dense=True) if type(gene_pair[1]) is not list else gmean(counts_from_anndata(adata[:, gene_pair[1]], layer_key_p_test, dense=True), axis=0) for gene_pair in gene_pairs])
+
+        num_umi_1 = counts_1.sum(axis=0)
+        counts_1_std = create_centered_counts(counts_1, model, num_umi_1)
+        counts_1_std = np.nan_to_num(counts_1_std)
+
+        num_umi_2 = counts_2.sum(axis=0)
+        counts_2_std = create_centered_counts(counts_2, model, num_umi_2)
+        counts_2_std = np.nan_to_num(counts_2_std)
+
         adata.uns['ccc_results']['p']={}
         adata.uns['ccc_results']['p']['cs'] = compute_CCC_scores(counts_1_std.T, counts_2_std.T, weigths_ct_pairs)
 
@@ -309,7 +487,7 @@ def run_cell_communication_analysis(
         weigths_ct_pairs_sq = sparse.COO(weigths_ct_pairs.coords, weigths_ct_pairs_sq_data, shape=weigths_ct_pairs.shape)
         Wtot2 = sparse.sum(weigths_ct_pairs_sq, axis=(1, 2))
 
-        counts = counts_from_anndata(adata[:, genes], layer_key, dense=True)
+        counts = counts_from_anndata(adata[:, genes], layer_key_p_test, dense=True)
         num_umi = counts.sum(axis=0)
         counts = create_centered_counts(counts, model, num_umi)
         counts = np.nan_to_num(counts)
@@ -339,10 +517,21 @@ def run_cell_communication_analysis(
         adata.uns['ccc_results']['p']['Z_FDR'] = multipletests(Z_pvals.flatten(), method="fdr_bh")[1].reshape(Z_pvals.shape)
 
     if test in ["non-parametric", "both"]:
+
+        counts_1 = np.vstack([counts_from_anndata(adata[:, gene_pair[0]], layer_key_np_test, dense=True) if type(gene_pair[0]) is not list else gmean(counts_from_anndata(adata[:, gene_pair[0]], layer_key_np_test, dense=True), axis=0) for gene_pair in gene_pairs])
+        counts_2 = np.vstack([counts_from_anndata(adata[:, gene_pair[1]], layer_key_np_test, dense=True) if type(gene_pair[1]) is not list else gmean(counts_from_anndata(adata[:, gene_pair[1]], layer_key_np_test, dense=True), axis=0) for gene_pair in gene_pairs])
+
+        if center_counts_for_np_test:
+            num_umi_1 = counts_1.sum(axis=0)
+            counts_1 = create_centered_counts(counts_1, model, num_umi_1)
+            counts_1 = np.nan_to_num(counts_1)
+
+            num_umi_2 = counts_2.sum(axis=0)
+            counts_2 = create_centered_counts(counts_2, model, num_umi_2)
+            counts_2 = np.nan_to_num(counts_2)
+
         adata.uns['ccc_results']['np']={}
         adata.uns['ccc_results']['np']['perm_cs'] = np.zeros((len(cell_type_pairs), counts_1.shape[0], M)).astype(np.float16)
-        counts_1 = counts_1_std if center_counts_for_np_test else counts_1
-        counts_2 = counts_2_std if center_counts_for_np_test else counts_2
         adata.uns['ccc_results']['np']['cs'] = compute_CCC_scores(counts_1.T, counts_2.T, weigths_ct_pairs) if not center_counts_for_np_test else adata.uns['ccc_results']['p']['cs']
         for i in tqdm(range(M)):
             idx = np.random.permutation(counts_1.shape[1])
@@ -374,13 +563,17 @@ def run_cell_communication_analysis(
         adata.uns['ccc_results']['np']['pval'] = pvals
         adata.uns['ccc_results']['np']['FDR'] = multipletests(pvals.flatten(), method="fdr_bh")[1].reshape(pvals.shape)
 
-        # counts_ct_pairs_t_null, counts_ct_pairs_u_null, weigths_ct_pairs_null = get_ct_pair_counts_and_weights_null(
-        #     counts_ct_pairs_t, counts_ct_pairs_u, weights, cell_type_pairs, cell_types, M
-        # )
-
     adata.uns["cell_types"] = cell_types.tolist()
     
     return
+
+
+def flatten(nested_list):
+    for item in nested_list:
+        if isinstance(item, (list, tuple)):
+            yield from flatten(item)
+        else:
+            yield item
 
 
 def select_significant_interactions(
@@ -403,6 +596,56 @@ def select_significant_interactions(
     return
 
 
+def compute_metabolite_scores(
+    adata: Union[str, AnnData],
+    var: str,
+    func: Optional[Union[Literal["sum"], Literal["mean"], Literal["max"]]] = 'mean',
+):
+
+    cell_communication_df = adata.uns['ccc_results']['cell_com_df_sig'].copy()
+    cell_communication_df[['Gene 1', 'Gene 2']] = cell_communication_df[['Gene 1', 'Gene 2']].map(lambda x: tuple(x) if isinstance(x, list) else x)
+    # cell_communication_df['gene_pair'] = cell_communication_df.apply(lambda row: ensure_tuple((row['Gene 1'], row['Gene 2'])), axis=1)
+    cell_communication_df['gene_pair'] = cell_communication_df.apply(lambda row: (row['Gene 1'], row['Gene 2']), axis=1)
+
+    gene_pairs_per_metabolite = adata.uns['gene_pairs_per_metabolite']
+
+    metabolite_gene_pair_df = pd.DataFrame.from_dict(gene_pairs_per_metabolite, orient="index").reset_index()
+    metabolite_gene_pair_df = metabolite_gene_pair_df.rename(columns={"index": "metabolite"})
+
+    metabolite_gene_pair_df['gene_pair'] = metabolite_gene_pair_df['gene_pair'].apply(lambda arr: [(sub_array[0], sub_array[1]) for sub_array in arr])
+    metabolite_gene_pair_df['gene_type'] = metabolite_gene_pair_df['gene_type'].apply(lambda arr: [(sub_array[0], sub_array[1]) for sub_array in arr])
+
+    metabolite_gene_pair_df = pd.concat(
+        [
+            metabolite_gene_pair_df['metabolite'],
+            metabolite_gene_pair_df.explode('gene_pair')['gene_pair'],
+            metabolite_gene_pair_df.explode('gene_type')['gene_type'],
+        ],
+        axis=1,
+    )
+    metabolite_gene_pair_df = metabolite_gene_pair_df.reset_index(drop=True)
+
+    adata.uns['metabolite_gene_pair_df'] = metabolite_gene_pair_df
+
+    metabolite_gene_pair_df['gene_pair'] = metabolite_gene_pair_df.apply(lambda row: ensure_tuple(row['gene_pair']), axis=1)
+
+    cell_communication_df = pd.merge(cell_communication_df, metabolite_gene_pair_df, on='gene_pair', how='inner')
+
+    adata.uns['ccc_results']['cell_com_df_sig_metab'] = cell_communication_df
+    if func == 'sum':
+        cell_communication_df = cell_communication_df.groupby(['Cell Type 1', 'Cell Type 2', 'metabolite'])[var].sum().reset_index()
+    elif func == 'mean':
+        cell_communication_df = cell_communication_df.groupby(['Cell Type 1', 'Cell Type 2', 'metabolite'])[var].mean().reset_index()
+    elif func == 'max':
+        cell_communication_df = cell_communication_df.groupby(['Cell Type 1', 'Cell Type 2', 'metabolite'])[var].max().reset_index()
+    else:
+        raise ValueError('The "func" variable should be one of ["sum", "mean", "max].')
+
+    adata.uns['ccc_results']['cell_com_df_sig_metab_scores'] = cell_communication_df
+
+    return
+
+
 def compute_interacting_cell_scores(
     adata: Union[str, AnnData],
     func: Optional[Union[Literal["max"], Literal["min"], Literal["mean"], Literal["prod"]]] = 'mean',
@@ -415,7 +658,7 @@ def compute_interacting_cell_scores(
     layer_key = adata.uns["layer_key"]
     use_raw = layer_key == "use_raw"
 
-    cell_communication_df = adata.uns['ccc_results']['cell_com_df_sig']
+    cell_communication_df = adata.uns['ccc_results']['cell_com_df_sig'].copy()
     cell_communication_df[['Gene 1', 'Gene 2']] = cell_communication_df[['Gene 1', 'Gene 2']].map(lambda x: tuple(x) if isinstance(x, list) else x)
 
     gene_pairs_per_ct_pair = adata.uns['gene_pairs_per_ct_pair']
@@ -487,6 +730,10 @@ def compute_interacting_cell_scores(
     adata.uns['interacting_cell_scores'] = results_dict
 
     return
+
+
+def ensure_tuple(x):
+    return tuple(tuple(i) if isinstance(i, list) else i for i in x)
 
 
 def extract_ct_pair_interacting_scores(
@@ -643,7 +890,6 @@ def get_interacting_cell_type_pairs(x, weights, cell_types):
 
     weights = weights.tocsc()
     cell_types_weights = weights[ct_1_bin,][:, ct_2_bin]
-    # cell_types_weights = sparse.COO.from_scipy_sparse(cell_types_weights)
 
     return bool(cell_types_weights.nnz)
 
@@ -716,7 +962,8 @@ def compute_np_results(ct_pair, cell_type_pairs, gene_pair_cor, pvals, gene_pair
 def get_cell_communication_results(
     adata, 
     genes,
-    layer_key,
+    layer_key_p_test,
+    layer_key_np_test,
     model, 
     cell_types, 
     cell_type_pairs,
@@ -726,8 +973,6 @@ def get_cell_communication_results(
     
     gene_pairs_per_ct_pair = adata.uns['gene_pairs_per_ct_pair']
     gene_pairs_per_ct_pair_ind = adata.uns['gene_pairs_per_ct_pair_ind']
-
-    counts = counts_from_anndata(adata[:, genes], layer_key, dense=True)
 
     cell_com_df = pd.DataFrame.from_dict(gene_pairs_per_ct_pair, orient="index").stack().to_frame().reset_index()
     cell_com_df = cell_com_df.drop(["level_1"], axis=1)
@@ -746,6 +991,7 @@ def get_cell_communication_results(
         FDR_values = adata.uns['ccc_results']['p']['Z_FDR']
         cell_com_df['Z_FDR'] = FDR_values.flatten()
 
+        counts = counts_from_anndata(adata[:, genes], layer_key_p_test, dense=True)
         num_umi = counts.sum(axis=0)
         counts_std = create_centered_counts(counts, model, num_umi)
         counts_std = np.nan_to_num(counts_std)
@@ -762,6 +1008,7 @@ def get_cell_communication_results(
         FDR_values = adata.uns['ccc_results']['np']['FDR']
         cell_com_df['FDR_np'] = FDR_values.flatten()
 
+        counts = counts_from_anndata(adata[:, genes], layer_key_np_test, dense=True)
         c_values_norm = normalize_values(counts, cell_types, cell_type_pairs, gene_pairs_per_ct_pair_ind, c_values, D)
         adata.uns['ccc_results']['np']['cs_norm'] = c_values_norm
         cell_com_df['C_norm_np'] = c_values_norm.flatten()
@@ -798,14 +1045,6 @@ def normalize_values(
 
 
 def compute_max_cs(node_degrees, counts, gene_pairs_ind):
-
-    # compute_max_cs_gp_partial = partial(
-    #     compute_max_cs_gp,
-    #     counts=counts.todense(),
-    #     node_degrees=node_degrees,
-    # )
-
-    # result = np.array(list(map(compute_max_cs_gp_partial, gene_pairs_ind)))
 
     result = np.zeros(len(gene_pairs_ind))
     for i, gene_pair_ind in enumerate(gene_pairs_ind):
@@ -890,110 +1129,6 @@ def create_centered_counts_row(vals_x, model, num_umi):
     return out_x
 
 
-# @jit(nopython=True)
-def _compute_hs_pairs_inner_centered_cond_sym_cellcom_p(
-    ct_pair_i, counts, weights, eg2s, cell_types, cell_type_pairs, gene_pairs_ind, gene_pairs_per_ct_pair_ind
-):
-    """
-    This version assumes that the counts have already been modeled
-    and centered
-    """
-
-    ct_pair = cell_type_pairs[ct_pair_i]
-    ct_t, ct_u = ct_pair
-    cell_type_t_mask = cell_types == ct_t
-    cell_type_t_mask = cell_type_t_mask.reset_index(drop=True)
-    cell_type_u_mask = cell_types == ct_u
-    cell_type_u_mask = cell_type_u_mask.reset_index(drop=True)
-
-    gene_pairs_ind = gene_pairs_per_ct_pair_ind[
-        ct_pair
-    ]  # If we consider all the gene pairs (irrespective of the cell type pair) use 'gene_pairs_ind' directly
-
-    weights_ct = weights[cell_type_t_mask,][:, cell_type_u_mask]
-    counts_ct_t = counts[:, cell_type_t_mask]
-    counts_ct_u = counts[:, cell_type_u_mask]
-    gene_pair_autocor = counts_ct_t @ weights_ct @ counts_ct_u.T
-
-    Wtot2 = (weights_ct**2).sum()
-
-    C = []
-    EG2 = []
-    for gene_pair_ind in gene_pairs_ind:
-        g1_ind, g2_ind = gene_pair_ind
-        lc = gene_pair_autocor[g1_ind, g2_ind]
-        if g1_ind == g2_ind:
-            eg2 = Wtot2
-        else:
-            eg2 = eg2s[ct_pair_i][g1_ind]
-        C.append(lc)
-        EG2.append(eg2)
-
-    EG = [0 for i in range(len(gene_pairs_ind))]
-
-    stdG = [(EG2[i] - EG[i] ** 2) ** 0.5 for i in range(len(gene_pairs_ind))]
-    stdG = [1 if stdG[i] == 0 else stdG[i] for i in range(len(stdG))]
-
-    Z = [(C[i] - EG[i]) / stdG[i] for i in range(len(gene_pairs_ind))]
-
-    return (C, Z)
-
-
-def compute_cellcom_p(
-    counts_ct_pairs_t,
-    counts_ct_pairs_u,
-    weigths_ct_pairs,
-    eg2s,
-    cell_types,
-    cell_type_pairs,
-    gene_pairs_ind,
-    gene_pairs_per_ct_pair_ind,
-):
-    """
-    This version assumes that the counts have already been modeled
-    and centered
-    """
-
-    counts_ct_pairs_u_perm = sparse.permute_dims(counts_ct_pairs_u, [0,2,1])
-    gene_pair_cor = sparse.einsum(
-        "cat,ctu,cub->cab", counts_ct_pairs_t, weigths_ct_pairs, counts_ct_pairs_u_perm
-    )
-
-    weigths_ct_pairs_sq_data = weigths_ct_pairs.data ** 2
-    weigths_ct_pairs_sq = sparse.COO(weigths_ct_pairs.coords, weigths_ct_pairs_sq_data, shape=weigths_ct_pairs.shape)
-    Wtot2 = sparse.sum(weigths_ct_pairs_sq, axis=(1, 2))
-
-    compute_Z_scores_cellcom_p_partial = partial(
-        compute_Z_scores_cellcom_p,
-        cell_type_pairs=cell_type_pairs,
-        gene_pair_cor=gene_pair_cor,
-        gene_pairs_per_ct_pair_ind=gene_pairs_per_ct_pair_ind,
-        Wtot2=Wtot2,
-        eg2s=eg2s,
-    )
-
-    results = list(map(compute_Z_scores_cellcom_p_partial, cell_type_pairs))
-
-    # gene_pair_cor = torch.einsum(
-    #     "cat,ctu,cub->cab", counts_ct_pairs_t, weigths_ct_pairs, counts_ct_pairs_u.permute(0, 2, 1)
-    # )
-
-    # Wtot2 = torch.sum(torch.pow(weigths_ct_pairs, 2), dim=(1, 2))
-
-    # compute_Z_scores_cellcom_p_partial = partial(
-    #     compute_Z_scores_cellcom_p,
-    #     cell_type_pairs=cell_type_pairs,
-    #     gene_pair_cor=gene_pair_cor,
-    #     gene_pairs_per_ct_pair_ind=gene_pairs_per_ct_pair_ind,
-    #     Wtot2=Wtot2,
-    #     eg2s=eg2s,
-    # )
-
-    # results = list(map(compute_Z_scores_cellcom_p_partial, cell_type_pairs))
-
-    return results
-
-
 def compute_Z_scores_cellcom_p(ct_pair, cell_type_pairs, gene_pair_cor, gene_pairs_per_ct_pair_ind, Wtot2, eg2s):
     i = cell_type_pairs.index(ct_pair)
     gene_pair_cor_ct = gene_pair_cor[i, :, :]
@@ -1021,144 +1156,6 @@ def compute_Z_scores_cellcom_p(ct_pair, cell_type_pairs, gene_pair_cor, gene_pai
     Z = [(C[i] - EG[i]) / stdG[i] for i in range(len(gene_pairs_ind))]
 
     return (C, Z)
-
-
-# @jit(nopython=True)
-def _compute_hs_pairs_inner_centered_cond_sym_cellcom_np(
-    ct_pair, weights, neighbors, counts, cell_types, gene_pairs_per_ct_pair_ind, genes, cells, M
-):
-    ct_t, ct_u = ct_pair
-    cell_type_t_mask = cell_types == ct_t
-    cell_type_t_mask = cell_type_t_mask.reset_index(drop=True)
-    cell_type_t_mask_ind = cell_type_t_mask[cell_type_t_mask].index.tolist()
-    cell_type_u_mask = cell_types == ct_u
-    cell_type_u_mask = cell_type_u_mask.reset_index(drop=True)
-    cell_type_u_mask_ind = cell_type_u_mask[cell_type_u_mask].index.tolist()
-
-    neighbors_ct = neighbors[cell_type_t_mask,]
-    weights_ct = weights[cell_type_t_mask,]
-
-    gene_pairs_ind = gene_pairs_per_ct_pair_ind[ct_pair]
-
-    # interacting_cells = {}
-
-    # for gp_ind in gene_pairs_ind:
-
-    #     gene_x_ind, gene_y_ind = gp_ind
-
-    #     for i in range(neighbors_ct.shape[0]):
-
-    #         neighbors_ct_i = neighbors_ct[i]
-    #         neighbors_ct_i = neighbors_ct_i[~np.isnan(neighbors_ct_i)]
-    #         neighbors_ct_i = [neighbor_ct_i for neighbor_ct_i in neighbors_ct_i if neighbor_ct_i in cell_type_u_mask_ind]
-    #         if len(neighbors_ct_i) == 0:
-    #             continue
-
-    #         for j in neighbors_ct_i:
-
-    #             ind_i = cell_type_t_mask_ind[i]
-    #             j = int(j)
-    #             w_ij = weights_ct[i, j]
-
-    #             xi = counts[gene_x_ind, ind_i]
-    #             cell_i = cells[ind_i]
-    #             yj = counts[gene_y_ind, j]
-    #             cell_j = cells[j]
-    #             cell_pair = cell_i + '/' + cell_j
-
-    #             gene_x = genes[gene_x_ind]
-    #             gene_y = genes[gene_y_ind]
-    #             gene_pair = gene_x + '_' + gene_y
-
-    #             if not xi == 0 or yj == 0 or w_ij == 0:
-    #                 if gene_pair not in interacting_cells.keys():
-    #                     interacting_cells[gene_pair] = {"cells": [], "scores": []}
-    #                 interacting_cells[gene_pair]["cells"].append(cell_pair)
-    #                 interacting_cells[gene_pair]["scores"].append(w_ij*xi*yj)
-
-    weights_ct = weights[cell_type_t_mask,][:, cell_type_u_mask]
-    counts_ct_t = counts[:, cell_type_t_mask]
-    counts_ct_u = counts[:, cell_type_u_mask]
-    gene_pair_autocor = counts_ct_t @ weights_ct @ counts_ct_u.T
-
-    # cell_type_ind = cell_type_list.index(cell_type)
-
-    # G_max = compute_local_cov_max_ct(counts_ct, D[cell_type_ind])
-    # C = gene_pair_autocor.diagonal() / G_max
-
-    C = []
-    for gene_pair_ind in gene_pairs_ind:
-        g1_ind, g2_ind = gene_pair_ind
-        C.append(gene_pair_autocor[g1_ind, g2_ind])
-
-    # Compute null distribution using permutations
-    print("Computing null distribution for {}...".format(ct_pair))
-
-    gene_pair_autocor_null = []
-    for i in tqdm(range(M)):
-        shuffled_cell_types = sorted(cell_types.tolist(), key=lambda x: random())
-        cell_type_t_mask = [ct == ct_t for ct in shuffled_cell_types]
-        cell_type_u_mask = [ct == ct_u for ct in shuffled_cell_types]
-
-        weights_ct = weights[cell_type_t_mask,][:, cell_type_u_mask]
-        counts_ct_t = counts[:, cell_type_t_mask]
-        counts_ct_u = counts[:, cell_type_u_mask]
-        gene_pair_autocor_rand = counts_ct_t @ weights_ct @ counts_ct_u.T
-
-        gene_pair_autocor_rand_list = []
-        for gene_pair_ind in gene_pairs_ind:
-            g1_ind, g2_ind = gene_pair_ind
-            gene_pair_autocor_rand_list.append(gene_pair_autocor_rand[g1_ind, g2_ind])
-        gene_pair_autocor_null.append(gene_pair_autocor_rand_list)
-
-    gene_pair_autocor_null = np.stack(gene_pair_autocor_null, axis=0)
-    x = np.sum(C < gene_pair_autocor_null, axis=0)
-    p_values = (x + 1) / (M + 1)
-
-    # return [C, p_values, interacting_cells]
-    return [C, p_values]
-
-
-def compute_cellcom_np(
-    counts_ct_pairs_t,
-    counts_ct_pairs_u,
-    weigths_ct_pairs,
-    counts_ct_pairs_t_null,
-    counts_ct_pairs_u_null,
-    weigths_ct_pairs_null,
-    cell_type_pairs,
-    gene_pairs_per_ct_pair_ind,
-    M,
-):
-
-    counts_ct_pairs_u_perm = sparse.permute_dims(counts_ct_pairs_u, [0,2,1])
-    gene_pair_cor = sparse.einsum(
-        "cat,ctu,cub->cab", counts_ct_pairs_t, weigths_ct_pairs, counts_ct_pairs_u_perm
-    )
-
-    counts_ct_pairs_u_null_perm = sparse.permute_dims(counts_ct_pairs_u_null, [0,1,3,2])
-    gene_pair_cor_null = sparse.einsum(
-        "rcat,rctu,rcub->rcab",
-        counts_ct_pairs_t_null,
-        weigths_ct_pairs_null,
-        counts_ct_pairs_u_null_perm,
-    )
-
-    gene_pair_cor_expanded = gene_pair_cor.reshape((1,) + gene_pair_cor.shape)
-    x = np.sum(gene_pair_cor_null > gene_pair_cor_expanded, axis=0)
-    pvals = (x + 1) / (M + 1)
-
-    extract_results_cellcom_np_partial = partial(
-        extract_results_cellcom_np,
-        cell_type_pairs=cell_type_pairs,
-        gene_pair_cor=gene_pair_cor,
-        pvals=pvals,
-        gene_pairs_per_ct_pair_ind=gene_pairs_per_ct_pair_ind,
-    )
-    results = list(map(extract_results_cellcom_np_partial, cell_type_pairs))
-
-
-    return results
 
 
 def extract_results_cellcom_np(ct_pair, cell_type_pairs, gene_pair_cor, pvals, gene_pairs_per_ct_pair_ind):
@@ -1261,6 +1258,16 @@ def compute_local_cov_pairs_max(node_degrees, counts):
     result = gene_maxs.reshape((-1, 1)) + gene_maxs.reshape((1, -1))
     result = result / 2
     return result
+
+
+@jit(nopython=True)
+def compute_local_cov_max(vals, node_degrees):
+    tot = 0.0
+
+    for i in range(node_degrees.size):
+        tot += node_degrees[i] * (vals[i] ** 2)
+
+    return tot / 2
 
 
 def get_ct_pair_counts_and_weights(counts, weights, cell_type_pairs, cell_types, gene_pairs_per_ct_pair_ind):
@@ -1461,77 +1468,6 @@ def extract_ct_pair_counts_weights_null(permutation, permutations, counts_ct_pai
 
 
     return (c_perm_data_t, c_perm_coords_4d_t, c_perm_data_u, c_perm_coords_4d_u, w_perm_data_all, w_perm_coords_4d_u)
-
-
-def get_cell_communication_results(
-    counts, results, gene_pairs_per_ct_pair, gene_pairs_per_ct_pair_ind, cell_types, cell_type_pairs, pairs, D, test,
-):
-    cell_com_df = pd.DataFrame.from_dict(gene_pairs_per_ct_pair, orient="index").stack().to_frame().reset_index()
-    cell_com_df = cell_com_df.drop(["level_1"], axis=1)
-    cell_com_df = cell_com_df.rename(columns={"level_0": "cell_type_pair", 0: "gene_pair"})
-    cell_com_df["Cell Type 1"], cell_com_df["Cell Type 2"] = zip(*cell_com_df["cell_type_pair"])
-    cell_com_df["Gene 1"], cell_com_df["Gene 2"] = zip(*cell_com_df["gene_pair"])
-
-    N = counts.shape[0]
-    pairs_array = np.array(pairs)
-
-    vals_lc = [x[0] for x in results]
-    if test == 'parametric':
-        z_values = [x[1] for x in results]
-    else:
-        p_values = [x[1] for x in results]
-
-    lcs = expand_ct_pairs_cellcom(pairs_array, np.array(vals_lc), N)
-    if test == 'parametric':
-        lc_zs = expand_ct_pairs_cellcom(pairs_array, np.array(z_values), N)
-
-    lc_values = []
-
-    for i in range(len(cell_type_pairs)):
-
-        ct_pair = cell_type_pairs[i]
-        ct_t, ct_u = ct_pair
-        cell_type_t_mask = [ct == ct_t for ct in cell_types]
-        counts_ct_t = counts[:,cell_type_t_mask]
-        D_ct_t = D[i][cell_type_t_mask]
-        lc_maxs = compute_local_cov_pairs_max(D_ct_t, counts_ct_t)
-        lcs[i] = lcs[i] / lc_maxs
-
-        gene_pairs_ind = gene_pairs_per_ct_pair_ind[ct_pair]
-
-        for gene_pair_ind in gene_pairs_ind:
-            g1_ind, g2_ind = gene_pair_ind
-            lc_values.append(lcs[i][g1_ind, g2_ind])
-
-    cell_type_list = np.unique(cell_types)
-    n_cell_types = len(cell_type_list)
-    lcs, gene_pairs_ind_new = expand_gene_pairs_cellcom(pairs_array, cell_type_pairs, cell_type_list, np.array(vals_lc), n_cell_types)
-    lcs_3d = np.stack(lcs)
-    if test == 'parametric':
-        lc_zs, gene_pairs_ind_new = expand_gene_pairs_cellcom(pairs_array, cell_type_pairs, cell_type_list, np.array(z_values), n_cell_types)
-        lc_zs_3d = np.stack(lc_zs)
-
-    vals_lc = [item.item() for sublist in vals_lc for item in sublist]
-    if test == 'parametric':
-        z_values = [item.item() for sublist in z_values for item in sublist]
-    else:
-        p_values = [item.item() for sublist in p_values for item in sublist]
-
-    cell_com_df["C"] = vals_lc
-    cell_com_df['C_norm'] = lc_values
-    if test == 'parametric':
-        cell_com_df["Z"] = z_values
-        cell_com_df["Pval"] = norm.sf(cell_com_df["Z"].values)
-    else:
-        cell_com_df["Pval"] = p_values
-
-    cell_communication_df = cell_com_df[["Cell Type 1", "Cell Type 2", "Gene 1", "Gene 2", "C", "C_norm", "Z", "Pval"]] if test == 'parametric' else cell_com_df[["Cell Type 1", "Cell Type 2", "Gene 1", "Gene 2", "C", "C_norm", "Pval"]]
-    cell_communication_df["FDR"] = multipletests(cell_communication_df["Pval"], method="fdr_bh")[1]
-
-    if test == 'parametric':
-        return (cell_communication_df, lcs_3d, lc_zs_3d, gene_pairs_ind_new, cell_type_list)
-    else:
-        return (cell_communication_df, lcs_3d, gene_pairs_ind_new, cell_type_list)
 
 
 def process_communication_output(
@@ -2016,134 +1952,6 @@ def compute_communication_modules(adata, layer_key, height=0.15):
     adata.obsm["gene_pair_module_scores"] = gene_pair_module_scores
     adata.uns["gene_pair_module_loadings"] = gene_pair_module_loadings_dict
     adata.uns["gene_pair_modules_dict"] = gene_pair_modules_dict
-
-
-def compute_interacting_cell_scores(
-    adata: Union[str, AnnData],
-    cell_communication_df: pd.DataFrame,
-    layer_key: Optional[Union[Literal["use_raw"], str]] = None,
-    model: Optional[str] = None,
-    compute_neighbors_on_key: Optional[str] = None,
-    distances_obsp_key: Optional[str] = None,
-    deconv_data: Optional[bool] = False,
-    cell_type_list: Optional[list] = None,
-    cell_type_key: Optional[str] = None,
-    barcode_key: Optional[str] = None,
-    database_varm_key: Optional[str] = None,
-    weighted_graph: Optional[bool] = True,
-    neighborhood_radius: Optional[int] = None,
-    n_neighbors: Optional[int] = None,
-    neighborhood_factor: Optional[int] = 3,
-    spot_diameter: Optional[int] = None,
-    sample_key: Optional[str] = None,
-    func: Optional[Union[Literal["max"], Literal["min"], Literal["mean"], Literal["prod"]]] = 'mean',
-):
-
-    # if deconv_data is True:
-    #     adata = setup_anndata(
-    #         adata,
-    #         cell_type_list,
-    #         compute_neighbors_on_key,
-    #         cell_type_key,
-    #         database_varm_key,
-    #         sample_key,
-    #         )
-    #     layer_key=None
-
-    #     if compute_neighbors_on_key is not None:
-    #         compute_neighbors(
-    #             adata=adata,
-    #             compute_neighbors_on_key=compute_neighbors_on_key,
-    #             n_neighbors=n_neighbors,
-    #             neighborhood_radius=neighborhood_radius,
-    #             spot_diameter=spot_diameter,
-    #             sample_key=sample_key,
-    #             deconv_data=deconv_data,
-    #         )
-    #     else:
-    #         if distances_obsp_key is not None and distances_obsp_key in adata.obsp:
-    #             compute_neighbors_from_distances(
-    #                 adata=adata,
-    #                 distances_obsp_key=distances_obsp_key,
-    #                 spot_diameter=spot_diameter,
-    #                 sample_key=sample_key,
-    #                 deconv_data=deconv_data,
-    #             )
-
-    #     if 'weights' not in adata.obsp and 'distances' in adata.obsp:
-    #         compute_weights(
-    #             adata,
-    #             weighted_graph,
-    #             neighborhood_factor,
-    #         )
-
-    use_raw = layer_key == "use_raw"
-    database = adata.varm[database_varm_key] if not use_raw else adata.raw.varm[database_varm_key]
-
-    if barcode_key is not None:
-        cells = pd.Series(adata.obs[barcode_key].tolist())
-    else:
-        cells = adata.obs_names if not use_raw else adata.raw.obs_names
-
-    genes = database.loc[(database != 0).any(axis=1)].index
-    counts = counts_from_anndata(adata[:, genes], layer_key, dense=True)
-    num_umi = counts.sum(axis=0)
-
-    weights = adata.obsp["weights"].tocsr()
-    cell_types = adata.obs[cell_type_key] if not use_raw else adata.raw.obs[cell_type_key]
-
-    counts = create_centered_counts(counts, model, num_umi)
-    counts = np.nan_to_num(counts)
-
-    cell_communication_df['interacting_cells'] = cell_communication_df.apply(compute_interacting_cell_scores_row, args=(counts, weights, cell_types, cells, genes, func), axis=1)
-
-    return cell_communication_df
-
-
-def compute_interacting_cell_scores_row(
-    row, counts, weights, cell_types, cells, genes, func,
-):
-
-    ct_t, ct_u = row['Cell Type 1'], row['Cell Type 2']
-    gene_a, gene_b = row['Gene 1'], row['Gene 2']
-    gene_a_ind = genes.to_list().index(gene_a)
-    gene_b_ind = genes.to_list().index(gene_b)
-    cell_type_t_mask = cell_types == ct_t
-    cell_type_t_mask = cell_type_t_mask.reset_index(drop=True)
-    cell_type_u_mask = cell_types == ct_u
-    cell_type_u_mask = cell_type_u_mask.reset_index(drop=True)
-
-    weights_ct = weights[cell_type_t_mask,][:,cell_type_u_mask]
-    cells_t = list(cells[cell_type_t_mask])
-    cells_u = list(cells[cell_type_u_mask])
-    counts_t = counts[:,cell_type_t_mask]
-    counts_u = counts[:,cell_type_u_mask]
-
-    interacting_cells = {"cells": [], "scores": []}
-
-    rows, cols = weights_ct.nonzero()
-    for i, j in zip(rows, cols):
-        w_ij = weights_ct[i, j]
-
-        ai = counts_t[gene_a_ind, i]
-        cell_i = cells_t[i]
-        bj = counts_u[gene_b_ind, j]
-        cell_j = cells_u[j]
-        cell_pair = (cell_i, cell_j)
-
-        if not ai == 0 or bj == 0:
-            interacting_cells["cells"].append(cell_pair)
-            if func == 'mean':
-                f_ai_jb = (ai+bj)/2
-            elif func == 'min':
-                f_ai_jb = ai if ai <= bj else bj
-            elif func == 'max':
-                f_ai_jb = ai if ai >= bj else bj
-            elif func == 'prod':
-                f_ai_jb = ai * bj
-            interacting_cells["scores"].append(w_ij * f_ai_jb)
-
-    return interacting_cells
 
 
 def get_metabolic_process(genes, m2h_dict, transporter_df, org='Mouse'):

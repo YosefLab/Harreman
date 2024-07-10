@@ -1,4 +1,4 @@
-from typing import Dict, List, Literal, Optional, Sequence, Tuple, Union
+from typing import Optional, Union
 import time
 import anndata
 import numpy as np
@@ -133,35 +133,77 @@ def setup_deconv_adata(
     return adata, deconv_adata
 
 
-# The code below belongs to the SpatialDM package. Modify it accordingly
+# The code below has been adapted from the SpatialDM package.
 
-def drop_uns_na(adata, global_stat=False, local_stat=False):
-    adata.uns['geneInter'] = adata.uns['geneInter'].fillna('NA')
-    adata.uns['global_res'] = adata.uns['global_res'].fillna('NA')
-    adata.uns['ligand'] = adata.uns['ligand'].fillna('NA')
-    adata.uns['receptor'] = adata.uns['receptor'].fillna('NA')
-    adata.uns['local_stat']['n_spots'] = pd.DataFrame(adata.uns['local_stat']['n_spots'], columns=['n_spots'])
-    if global_stat and ('global_stat' in adata.uns.keys()):
-        adata.uns.pop('global_stat')
-    if local_stat and ('local_stat' in adata.uns.keys()):
-        adata.uns.pop('local_stat')
+def modify_uns_hotspot(adata):
+    if 'gene_modules' in adata.uns.keys():
+        adata.var['gene_modules'] = adata.uns['gene_modules']
+        del adata.uns['gene_modules']
+    
+    return
 
-def restore_uns_na(adata):
-    adata.uns['geneInter'] = adata.uns['geneInter'].replace('NA', np.nan)
-    adata.uns['global_res'] = adata.uns['global_res'].replace('NA', np.nan)
-    adata.uns['ligand'] = adata.uns['ligand'].replace('NA', np.nan)
-    adata.uns['receptor'] = adata.uns['receptor'].replace('NA', np.nan)
-    adata.uns['local_stat']['n_spots'] =  adata.uns['local_stat']['n_spots'].n_spots
 
-def write_spatialdm_h5ad(adata, filename=None):
+def modify_uns_harreman(adata):
+    uns_keys = ['ligand', 'receptor', 'LR_database', 'import_export']
+    for uns_key in uns_keys:
+        if uns_key in adata.uns.keys():
+            adata.uns[uns_key] = adata.uns[uns_key].fillna('NA')
+
+    if 'gene_pairs' in adata.uns.keys():
+        adata.uns['gene_pairs'] = [(x, ' - '.join(y) if isinstance(y, list) else y) for x, y in adata.uns['gene_pairs']]
+    if 'gene_pairs_ind' in adata.uns.keys():
+        adata.uns['gene_pairs_ind'] = [(x, ' - '.join(map(str, y)) if isinstance(y, list) else y) for x, y in adata.uns['gene_pairs_ind']]
+    
+    if 'gene_pairs_per_metabolite' in adata.uns.keys():
+        adata.uns['gene_pairs_per_metabolite'] = {key: {
+            'gene_pair': [(gp_1, ' - '.join(gp_2) if isinstance(gp_2, list) else gp_2) for gp_1, gp_2 in subdict['gene_pair']],
+            'gene_type': subdict['gene_type']
+        } for key, subdict in adata.uns['gene_pairs_per_metabolite'].items()}
+    
+    if 'gene_pairs_per_ct_pair' in adata.uns.keys():
+        adata.uns['gene_pairs_per_ct_pair'] = {key: [(num, ' - '.join(val) if isinstance(val, list) else val) for num, val in tuples_list] for key, tuples_list in adata.uns['gene_pairs_per_ct_pair'].items()}
+        adata.uns['gene_pairs_per_ct_pair'] = {' - '.join(key): value for key, value in adata.uns['gene_pairs_per_ct_pair'].items()}
+    if 'gene_pairs_per_ct_pair_ind' in adata.uns.keys():
+        adata.uns['gene_pairs_per_ct_pair_ind'] = {key: [(num, ' - '.join(map(str, val)) if isinstance(val, list) else val) for num, val in tuples_list] for key, tuples_list in adata.uns['gene_pairs_per_ct_pair_ind'].items()}
+        adata.uns['gene_pairs_per_ct_pair_ind'] = {' - '.join(key): value for key, value in adata.uns['gene_pairs_per_ct_pair_ind'].items()}
+    
+    if 'ccc_results' in adata.uns.keys():
+        adata.uns['ccc_results']['cell_com_df'] = adata.uns['ccc_results']['cell_com_df'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
+        adata.uns['ccc_results']['cell_com_df_sig'] = adata.uns['ccc_results']['cell_com_df_sig'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
+        adata.uns['ccc_results']['cell_com_df_sig_metab']['Gene 1'] = [list(i) if isinstance(i, tuple) else i for i in adata.uns['ccc_results']['cell_com_df_sig_metab']['Gene 1'].values]
+        adata.uns['ccc_results']['cell_com_df_sig_metab']['Gene 2'] = [list(i) if isinstance(i, tuple) else i for i in adata.uns['ccc_results']['cell_com_df_sig_metab']['Gene 2'].values]
+        adata.uns['ccc_results']['cell_com_df_sig_metab'] = adata.uns['ccc_results']['cell_com_df_sig_metab'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
+        adata.uns['ccc_results']['cell_com_df_sig_metab'][['gene_type1', 'gene_type2']] = pd.DataFrame(adata.uns['ccc_results']['cell_com_df_sig_metab']['gene_type'].tolist(), index=adata.uns['ccc_results']['cell_com_df_sig_metab'].index)
+        adata.uns['ccc_results']['cell_com_df_sig_metab'] = adata.uns['ccc_results']['cell_com_df_sig_metab'].drop(['gene_pair', 'gene_type'] ,axis=1)
+
+    if 'metabolite_gene_pair_df' in adata.uns.keys():
+        adata.uns['metabolite_gene_pair_df'][['gene_pair1', 'gene_pair2']] = pd.DataFrame(adata.uns['metabolite_gene_pair_df']['gene_pair'].tolist(), index=adata.uns['metabolite_gene_pair_df'].index)
+        adata.uns['metabolite_gene_pair_df'][['gene_type1', 'gene_type2']] = pd.DataFrame(adata.uns['metabolite_gene_pair_df']['gene_type'].tolist(), index=adata.uns['metabolite_gene_pair_df'].index)
+        adata.uns['metabolite_gene_pair_df'] = adata.uns['metabolite_gene_pair_df'].drop(['gene_pair', 'gene_type'] ,axis=1)
+        adata.uns['metabolite_gene_pair_df']['gene_pair1'] = [list(i) if isinstance(i, tuple) else i for i in adata.uns['metabolite_gene_pair_df']['gene_pair1'].values]
+        adata.uns['metabolite_gene_pair_df']['gene_pair2'] = [list(i) if isinstance(i, tuple) else i for i in adata.uns['metabolite_gene_pair_df']['gene_pair2'].values]
+        adata.uns['metabolite_gene_pair_df'] = adata.uns['metabolite_gene_pair_df'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
+
+    return
+
+
+def write_harreman_h5ad(
+    adata: anndata.AnnData, 
+    filename: Optional[str] = None,
+):
     if filename is None:
-        filename = 'spatialdm_out.h5ad'
+        raise ValueError('Please provide the path to save the file.')
     elif not filename.endswith('h5ad'):
         filename = filename+'.h5ad'
-    drop_uns_na(adata)
+    
+    if 'distances' in adata.obsp.keys():
+        adata.obsp['distances'] = adata.obsp['distances'].tocsr()
+    
+    modify_uns_hotspot(adata)
+    modify_uns_harreman(adata)
     adata.write(filename)
 
-def read_spatialdm_h5ad(filename):
+
+def read_harreman_h5ad(filename):
     adata = anndata.read_h5ad(filename)
-    restore_uns_na(adata)
     return adata

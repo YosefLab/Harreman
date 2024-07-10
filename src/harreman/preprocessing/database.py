@@ -29,14 +29,18 @@ def extract_interaction_db(
         Whether to use adata.raw.X for database computation.
     species
         Species identity to select the LR database from CellChatDB.
-    csv_files
-        List of .csv files to use for database computation.
+    database
+        Whether to use the transporter database, the LR database, or both.
 
     Returns
     -------
     Genes by metabolites (or LRs) dataframe. Index is aligned to genes from adata.
 
     """
+    IMPORT_METAB_KEY = "IMPORT"
+    EXPORT_METAB_KEY = "EXPORT"
+    BOTH_METAB_KEY = "BOTH"
+
     if species not in ['human', 'mouse']:
         raise ValueError(f'species type: {species} is not supported currently. You should choose either "human" or "mouse".')
 
@@ -50,7 +54,7 @@ def extract_interaction_db(
         data = np.zeros((len(index), len(columns)))
         LR_df = pd.DataFrame(index=index, columns=columns, data=data)
         LR_df.index = LR_df.index.str.lower()
-        for LR_name in columns:
+        for LR_name in columns: #'EFNA5_EPHA3'
             for key in ['ligand', 'receptor']:
                 genes = adata.uns[key].loc[LR_name].dropna().values.tolist()
                 if len(genes) > 0:
@@ -61,6 +65,7 @@ def extract_interaction_db(
         LR_df = LR_df.loc[:, (LR_df!=0).any(axis=0)]
 
     if database == 'both' or database == 'transporter':
+        # Modify the function such that the metabolite DB is provided with the code and not by the user. Save the DB in adata.uns
         metab_dict = {}
         metab_dict = extract_transporter_info(adata, species)
         index = adata.raw.var.index if use_raw else adata.var_names
@@ -77,6 +82,9 @@ def extract_interaction_db(
                     metab_df.loc[genes, metab_name] = 1.0 if key == EXPORT_METAB_KEY else -1.0 if key == IMPORT_METAB_KEY else 2.0
         metab_df.index = index
         metab_df = metab_df.loc[:, (metab_df!=0).any(axis=0)]
+
+    adata.uns['database_varm_key'] = "database"
+    adata.uns['database'] = database
 
     if database == 'both':
         adata.varm["database"] = pd.concat([LR_df, metab_df], axis=1)

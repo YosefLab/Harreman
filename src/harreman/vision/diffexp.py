@@ -14,7 +14,7 @@ from anndata import AnnData
 from scanpy import _utils
 from scanpy import logging as logg
 from scanpy._utils import check_nonnegative_integers
-from scanpy.preprocessing._simple import _get_mean_var
+# from scanpy.preprocessing._simple import _get_mean_var
 from scipy.sparse import issparse, vstack
 
 _Method = Optional[Literal["wilcoxon"]]

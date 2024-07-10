@@ -14,7 +14,6 @@ from tqdm import tqdm
 from ..vision.signature import compute_signatures_anndata
 from ..preprocessing.anndata import counts_from_anndata
 from .local_correlation import create_centered_counts_row
-from ..preprocessing.utils import neighbor_smoothing_row
 
 
 def calculate_module_scores(

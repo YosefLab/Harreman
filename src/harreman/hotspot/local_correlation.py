@@ -1,28 +1,14 @@
-import itertools
-import multiprocessing
-from typing import Dict, List, Literal, Optional, Sequence, Tuple, Union
+from typing import Optional
 import time
 import numpy as np
 import pandas as pd
-import scipy.cluster.hierarchy as hcluster
 import sparse
-import torch
 from anndata import AnnData
 from numba import jit, njit
-from scanpy.preprocessing._utils import _get_mean_var
-from scipy.sparse import csr_matrix, issparse
-from scipy.spatial.distance import squareform
-from scipy.stats import norm
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import scale
-from statsmodels.stats.multitest import multipletests
-from tqdm import tqdm
 
 from . import models
 from ..preprocessing.anndata import counts_from_anndata
-from ..tools.knn import compute_node_degree
 from .local_autocorrelation import compute_local_cov_max
-from ..preprocessing.utils import center_values
 
 
 def compute_local_correlation(

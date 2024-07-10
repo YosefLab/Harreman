@@ -1,21 +1,28 @@
-import multiprocessing
-from typing import Dict, List, Literal, Optional, Sequence, Tuple, Union
+from typing import Literal, Optional, Union
 import time
 import numpy as np
 import pandas as pd
-import sparse
 from anndata import AnnData
-from numba import jit
-from scipy.sparse import issparse
+from numba import jit, njit
 from scipy.stats import norm
 from statsmodels.stats.multitest import multipletests
-from tqdm import tqdm
 
 from . import models
 from ..preprocessing.anndata import counts_from_anndata
-from ..preprocessing.utils import load_metabolic_genes
-from ..tools.knn import compute_node_degree
-from ..preprocessing.utils import center_values
+
+
+def load_metabolic_genes(
+    species: Optional[Union[Literal["mouse"], Literal["human"]]] = None,
+):
+
+    metabolic_genes_paths = {
+        'human': "/home/labs/nyosef/oier/Compass_data/metabolic_genes/metabolic_genes_h.csv",
+        'mouse': "/home/labs/nyosef/oier/Compass_data/metabolic_genes/metabolic_genes_m.csv"
+    }
+
+    metabolic_genes = list(pd.read_csv(metabolic_genes_paths[species], index_col=0, header=None).index)
+
+    return metabolic_genes
 
 
 def compute_local_autocorrelation(
@@ -149,6 +156,20 @@ def _compute_hs_inner(vals, weights_data, weights_coords, num_umi, model, Wtot2,
     C = (G - EG) / G_max
 
     return [G, EG, stdG, Z, C]
+
+
+@njit
+def center_values(vals, mu, var):
+    out = np.zeros_like(vals)
+
+    for i in range(len(vals)):
+        std = var[i]**0.5
+        if std == 0:
+            out[i] = 0
+        else:
+            out[i] = (vals[i] - mu[i])/std
+
+    return out
 
 
 def center_values_total(vals, num_umi, model):

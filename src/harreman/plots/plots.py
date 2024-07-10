@@ -1,5 +1,5 @@
 import warnings
-from typing import Literal, Optional, Union
+from typing import Optional
 from anndata import AnnData
 import matplotlib as mpl
 import matplotlib.pyplot as plt
