@@ -40,7 +40,7 @@ def compute_local_correlation(
 
     eg2s = ((weights @ counts.T) ** 2).sum(axis=0)
 
-    results = _compute_hs_pairs_inner_centered_cond_sym_fast(counts, weights, eg2s)
+    results = compute_local_cov_pairs(counts, weights, eg2s)
 
     lcs, lc_zs = results
 
@@ -208,8 +208,7 @@ def _compute_hs_pairs_inner_centered_cond_sym(
     return (lc, Z)
 
 
-# @jit(nopython=True)
-def _compute_hs_pairs_inner_centered_cond_sym_fast(
+def compute_local_cov_pairs(
     counts, weights, eg2s
 ):
     """
@@ -217,26 +216,18 @@ def _compute_hs_pairs_inner_centered_cond_sym_fast(
     and centered
     """
 
-    # lc = local_cov_pair_fast(counts, weights)
-
     lc = counts @ weights @ counts.T + counts @ weights.T @ counts.T
 
-    # Compute xy
     EG, EG2 = 0, eg2s
-
     stdG = (EG2 - EG ** 2) ** 0.5
 
-    # Compute the equation below with stdG being divided along columns, that is, all the elements from a given row are divided by the same value.
     Z = (lc - EG) / stdG[:, np.newaxis]
 
-    # We take the values that are in the lower and upper diagonal and define them as Zxy and Zyx, respectively.
     Zxy = np.tril(Z, k=-1)
     Zyx = np.tril(Z.T, k=-1)
 
-    # We calculate the minimum Z absolute values and keep the original sign
     Z = np.where(np.abs(Zxy) < np.abs(Zyx), Zxy, Zyx)
 
-    # Copy values from the lower diagonal to the upper diagonal
     i_upper = np.triu_indices(Z.shape[0], k=1)
     Z[i_upper] = Z.T[i_upper]
 

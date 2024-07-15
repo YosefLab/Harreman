@@ -13,7 +13,7 @@ import sparse
 from anndata import AnnData
 from numba import jit
 from pynndescent import NNDescent
-from scipy.sparse import csr_matrix, triu
+from scipy.sparse import csr_matrix, triu, lil_matrix
 from scipy.spatial import KDTree
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import normalize
@@ -29,6 +29,7 @@ def compute_knn_graph(
     n_neighbors: Optional[int] = None,
     neighborhood_factor: Optional[int] = 3,
     sample_key: Optional[str] = None,
+    tree = None,
 ):
     """Compute KNN graph.
 
@@ -50,9 +51,35 @@ def compute_knn_graph(
         Used when creating a weighted graph.  Sets how quickly weights decay relative to the distances within the neighborhood. The weight for a cell with a distance d will decay as exp(-d^2/D) where D is the distance to the `n_neighbors`/`neighborhood_factor`-th neighbor.
     sample_key
         Sample information in case the data contains different samples or samples from different conditions. Input is key in `adata.obs`.
+    tree
+        Root tree node. Can be created using ete3.Tree
 
     """
     start = time.time()
+
+    if tree is not None:
+        try:
+            all_leaves = []
+            for x in tree:
+                if x.is_leaf():
+                    all_leaves.append(x.name)
+        except:
+            raise ValueError("Can't parse supplied tree")
+
+        if len(all_leaves) != adata.shape[0] or len(
+            set(all_leaves) & set(adata.obs_names)
+        ) != len(all_leaves):
+            raise ValueError(
+                "Tree leaf labels don't match observations in supplied AnnData"
+            )
+        
+        if weighted_graph:
+            raise ValueError(
+                "When using `tree` as the metric space, `weighted_graph=True` is not supported"
+            )
+        tree_neighbors_and_weights(
+            adata, tree, n_neighbors=n_neighbors
+        )
 
     if compute_neighbors_on_key is not None:
         print("Computing the neighborhood graph...")
@@ -142,8 +169,9 @@ def compute_neighbors(
                     "The distance between cells from different samples should be 0."
                 )
 
-    # adata.obsp["distances"] = sparse.COO.from_scipy_sparse(distances)
     adata.obsp["distances"] = distances
+
+    return
 
 
 def compute_neighbors_from_distances(
@@ -198,8 +226,9 @@ def compute_neighbors_from_distances(
                     "The distance between cells from different samples should be 0."
                 )
 
-    # adata.obsp["distances"] = sparse.COO.from_scipy_sparse(distances)
     adata.obsp["distances"] = distances
+
+    return
 
 
 def object_scalar(x):
@@ -269,8 +298,9 @@ def compute_weights(
 
         weights_csr = weights.tocsr()
         weights_norm = normalize(weights_csr, norm="l1", axis=1)
-        # adata.obsp["weights"] = sparse.COO.from_scipy_sparse(weights_norm)
         adata.obsp["weights"] = weights_norm
+
+        return
 
 
 @jit(nopython=True)
@@ -291,6 +321,85 @@ def make_weights_non_redundant(weights):
                 w_no_redundant[i, j] += w_ji
 
     return w_no_redundant
+
+
+def tree_neighbors_and_weights(adata, tree, n_neighbors):
+    """
+    Computes nearest neighbors and associated weights for data
+    Uses distance along the tree object
+
+    Names of the leaves of the tree must match the columns in counts
+
+    Parameters
+    ==========
+    adata
+        AnnData object.
+    tree: ete3.TreeNode
+        The root of the tree
+    n_neighbors: int
+        Number of neighbors to find
+
+    """
+
+    K = n_neighbors
+    cell_labels = adata.obs_names
+
+    all_leaves = []
+    for x in tree:
+        if x.is_leaf():
+            all_leaves.append(x)
+
+    all_neighbors = {}
+
+    for leaf in tqdm(all_leaves):
+        neighbors = _knn(leaf, K)
+        all_neighbors[leaf.name] = neighbors
+
+    cell_ix = {c: i for i, c in enumerate(cell_labels)}
+
+    knn_ix = lil_matrix((len(all_neighbors), len(all_neighbors)), dtype=np.int8)
+    for cell in all_neighbors:
+        row = cell_ix[cell]
+        nn_ix = [cell_ix[x] for x in all_neighbors[cell]]
+        knn_ix[row, nn_ix] = 1
+
+    weights = knn_ix.tocsr()
+
+    adata.obsp["weights"] = weights
+
+    return
+
+
+def _knn(leaf, K):
+
+    dists = _search(leaf, None, 0)
+    dists = pd.Series(dists)
+    dists = dists + np.random.rand(len(dists)) * .9  # to break ties randomly
+
+    neighbors = dists.sort_values().index[0:K].tolist()
+
+    return neighbors
+
+
+def _search(current_node, previous_node, distance):
+
+    if current_node.is_root():
+        nodes_to_search = current_node.children
+    else:
+        nodes_to_search = current_node.children + [current_node.up]
+    nodes_to_search = [x for x in nodes_to_search if x != previous_node]
+
+    if len(nodes_to_search) == 0:
+        return {current_node.name: distance}
+
+    result = {}
+    for new_node in nodes_to_search:
+
+        res = _search(new_node, current_node, distance+1)
+        for k, v in res.items():
+            result[k] = v
+
+    return result
 
 
 # @jit(nopython=True)
