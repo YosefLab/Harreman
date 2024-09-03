@@ -398,8 +398,8 @@ def compute_cell_communication(
     # with threadpool_limits(limits=njobs, user_api='blas'):
     run_cell_communication_analysis(adata, layer_key_p_test, layer_key_np_test, model, cell_type_key, center_counts_for_np_test, M, test)
 
+    print("Obtaining the communication results...")
     if cell_type_key:
-        print("Obtaining the communication results...")
         get_cell_communication_results(
             adata,
             adata.uns["genes"],
@@ -411,6 +411,17 @@ def compute_cell_communication(
             adata.uns["D"],
             test,
         )
+    else:
+        get_cell_communication_results_no_ct(
+            adata,
+            adata.uns["genes"],
+            layer_key_p_test,
+            layer_key_np_test,
+            model,
+            adata.uns["D"],
+            test,
+        )
+
 
     print("Finished computing cell-cell communication analysis in %.3f seconds" %(time.time()-start))
 
@@ -530,10 +541,10 @@ def run_cell_communication_analysis(
 
             genes = pd.Series([gene for gene_pair in gene_pairs for gene in gene_pair]).drop_duplicates().tolist()
             genes = [tuple(i) if isinstance(i, list) else i for i in genes]
-            gene_pairs = [(tuple(gp_1) if isinstance(gp_1, list) else gp_1, tuple(gp_2) if isinstance(gp_2, list) else gp_2) for gp_1, gp_2 in gene_pairs]
+            gene_pairs_ = [(tuple(gp_1) if isinstance(gp_1, list) else gp_1, tuple(gp_2) if isinstance(gp_2, list) else gp_2) for gp_1, gp_2 in gene_pairs]
 
             lc_zs = pd.DataFrame(np.zeros((len(genes), len(genes))), index=genes, columns=genes)
-            for i, gene_pair in enumerate(gene_pairs):
+            for i, gene_pair in enumerate(gene_pairs_):
                 gp_1, gp_2 = gene_pair
                 gp_1_ind = genes.index(gp_1)
                 gp_2_ind = genes.index(gp_2)
@@ -566,7 +577,7 @@ def run_cell_communication_analysis(
             counts_2 = np.nan_to_num(counts_2)
 
         adata.uns['ccc_results']['np']={}
-        adata.uns['ccc_results']['np']['perm_cs'] = np.zeros((len(cell_type_pairs), counts_1.shape[0], M)).astype(np.float16)
+        adata.uns['ccc_results']['np']['perm_cs'] = np.zeros((len(cell_type_pairs), counts_1.shape[0], M)).astype(np.float16) if cell_type_key else np.zeros((counts_1.shape[0], M)).astype(np.float16)
         if center_counts_for_np_test and test == 'both':
             adata.uns['ccc_results']['np']['cs'] = adata.uns['ccc_results']['p']['cs']
         else:
@@ -581,10 +592,14 @@ def run_cell_communication_analysis(
                 weigths_ct_pairs_perm = get_ct_pair_weights(
                     weights, cell_type_pairs, cell_types_perm
                 )
-            
-            adata.uns['ccc_results']['np']['perm_cs'][:, :, i] = compute_CCC_scores(counts_1.T, counts_2.T, weigths_ct_pairs_perm) if cell_type_key else compute_CCC_scores(counts_1.T, counts_2.T, weights)
+                adata.uns['ccc_results']['np']['perm_cs'][:, :, i] = compute_CCC_scores(counts_1.T, counts_2.T, weigths_ct_pairs_perm)
+            else:
+                adata.uns['ccc_results']['np']['perm_cs'][:, i] = compute_CCC_scores(counts_1.T, counts_2.T, weights)
         
-        x = np.sum(adata.uns['ccc_results']['np']['perm_cs'] > adata.uns['ccc_results']['np']['cs'][:, :, np.newaxis], axis=2)
+        if cell_type_key:
+            x = np.sum(adata.uns['ccc_results']['np']['perm_cs'] > adata.uns['ccc_results']['np']['cs'][:, :, np.newaxis], axis=2)
+        else:
+            x = np.sum(adata.uns['ccc_results']['np']['perm_cs'] > adata.uns['ccc_results']['np']['cs'][:, np.newaxis], axis=1)
         pvals = (x + 1) / (M + 1)
 
         if cell_type_key:
@@ -606,7 +621,7 @@ def run_cell_communication_analysis(
         
         adata.uns['ccc_results']['np']['cs'] = C_scores
         adata.uns['ccc_results']['np']['pval'] = pvals
-        adata.uns['ccc_results']['np']['FDR'] = multipletests(pvals.flatten(), method="fdr_bh")[1].reshape(pvals.shape)
+        adata.uns['ccc_results']['np']['FDR'] = multipletests(pvals.flatten(), method="fdr_bh")[1].reshape(pvals.shape) if cell_type_key else multipletests(pvals, method="fdr_bh")[1]
 
     adata.uns["cell_types"] = cell_types.tolist() if cell_type_key else None
     
@@ -646,6 +661,8 @@ def compute_metabolite_scores(
     var: str,
     func: Optional[Union[Literal["sum"], Literal["mean"], Literal["max"]]] = 'mean',
 ):
+    
+    cell_type_key = adata.uns['cell_type_key']
 
     cell_communication_df = adata.uns['ccc_results']['cell_com_df_sig'].copy()
     cell_communication_df[['Gene 1', 'Gene 2']] = cell_communication_df[['Gene 1', 'Gene 2']].map(lambda x: tuple(x) if isinstance(x, list) else x)
@@ -678,11 +695,11 @@ def compute_metabolite_scores(
 
     adata.uns['ccc_results']['cell_com_df_sig_metab'] = cell_communication_df
     if func == 'sum':
-        cell_communication_df = cell_communication_df.groupby(['Cell Type 1', 'Cell Type 2', 'metabolite'])[var].sum().reset_index()
+        cell_communication_df = cell_communication_df.groupby(['Cell Type 1', 'Cell Type 2', 'metabolite'])[var].sum().reset_index() if cell_type_key else cell_communication_df.groupby(['metabolite'])[var].sum().reset_index()
     elif func == 'mean':
-        cell_communication_df = cell_communication_df.groupby(['Cell Type 1', 'Cell Type 2', 'metabolite'])[var].mean().reset_index()
+        cell_communication_df = cell_communication_df.groupby(['Cell Type 1', 'Cell Type 2', 'metabolite'])[var].mean().reset_index() if cell_type_key else cell_communication_df.groupby(['metabolite'])[var].sum().reset_index()
     elif func == 'max':
-        cell_communication_df = cell_communication_df.groupby(['Cell Type 1', 'Cell Type 2', 'metabolite'])[var].max().reset_index()
+        cell_communication_df = cell_communication_df.groupby(['Cell Type 1', 'Cell Type 2', 'metabolite'])[var].max().reset_index() if cell_type_key else cell_communication_df.groupby(['metabolite'])[var].sum().reset_index()
     else:
         raise ValueError('The "func" variable should be one of ["sum", "mean", "max].')
 
@@ -1113,6 +1130,59 @@ def get_cell_communication_results(
     return
 
 
+def get_cell_communication_results_no_ct(
+    adata, 
+    genes,
+    layer_key_p_test,
+    layer_key_np_test,
+    model,
+    D,
+    test,
+):
+    
+    gene_pairs = adata.uns['gene_pairs']
+    gene_pairs_ind = adata.uns['gene_pairs_ind']
+
+    cell_com_df = pd.DataFrame(gene_pairs)
+    cell_com_df = cell_com_df.rename(columns={0: "Gene 1", 1: "Gene 2"})
+
+    if test in ["parametric", "both"]:
+        c_values = adata.uns['ccc_results']['p']['cs']
+        cell_com_df['C_p'] = c_values
+        z_values = adata.uns['ccc_results']['p']['Z']
+        cell_com_df['Z'] = z_values
+        p_values = adata.uns['ccc_results']['p']['Z_pval']
+        cell_com_df['Z_pval'] = p_values
+        FDR_values = adata.uns['ccc_results']['p']['Z_FDR']
+        cell_com_df['Z_FDR'] = FDR_values
+
+        counts = counts_from_anndata(adata[:, genes], layer_key_p_test, dense=True)
+        num_umi = counts.sum(axis=0)
+        counts_std = create_centered_counts(counts, model, num_umi)
+        counts_std = np.nan_to_num(counts_std)
+
+        c_values_norm = normalize_values_no_ct(counts_std, gene_pairs_ind, c_values, D)
+        adata.uns['ccc_results']['p']['cs_norm'] = c_values_norm
+        cell_com_df['C_norm_p'] = c_values_norm
+
+    if test in ["non-parametric", "both"]:
+        c_values = adata.uns['ccc_results']['np']['cs']
+        cell_com_df['C_np'] = c_values
+        p_values = adata.uns['ccc_results']['np']['pval']
+        cell_com_df['pval_np'] = p_values
+        FDR_values = adata.uns['ccc_results']['np']['FDR']
+        cell_com_df['FDR_np'] = FDR_values
+
+        counts = counts_from_anndata(adata[:, genes], layer_key_np_test, dense=True)
+        c_values_norm = normalize_values_no_ct(counts, gene_pairs_ind, c_values, D)
+        adata.uns['ccc_results']['np']['cs_norm'] = c_values_norm
+        cell_com_df['C_norm_np'] = c_values_norm
+
+    adata.uns['ccc_results']['cell_com_df'] = cell_com_df
+    
+    return
+
+
 def normalize_values(
     counts,
     cell_types,
@@ -1135,6 +1205,22 @@ def normalize_values(
         lc_maxs[lc_maxs == 0] = 1
         c_values_norm[i] = lcs[i] / lc_maxs
         c_values_norm[i][np.isinf(c_values_norm[i])] = 1
+    
+    return c_values_norm
+
+
+def normalize_values_no_ct(
+    counts,
+    gene_pairs_ind,
+    lcs,
+    D,
+):
+    
+    c_values_norm = np.zeros(len(lcs))
+    lc_maxs = compute_max_cs(D, counts, gene_pairs_ind)
+    lc_maxs[lc_maxs == 0] = 1
+    c_values_norm = lcs / lc_maxs
+    c_values_norm[np.isinf(c_values_norm)] = 1
     
     return c_values_norm
 
