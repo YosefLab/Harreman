@@ -132,27 +132,37 @@ def plot_interacting_cell_scores(
     else:
         ct_pair = cell_type_pair
     
-    scores = interacting_cell_scores[ct_pair][interactions] if ct_pair is not None else sum_ct_pair_scores(interacting_cell_scores, interactions)
-
+    if ct_pair is None:
+        if isinstance(interacting_cell_scores, pd.DataFrame):
+            scores = interacting_cell_scores[interactions]
+        else:
+            if 'combined_cell_scores' not in adata.uns:
+                sum_ct_pair_scores(adata)
+            scores = adata.uns['combined_cell_scores'][interactions]
+    else:
+        scores = interacting_cell_scores[ct_pair][interactions]
+    
     for interaction in interactions:
         plot_interaction(adata, scores, interaction, ct_pair, coords_obsm_key, s, vmin, vmax, figsize, cmap)
         plt.show()
         plt.close()
 
 
-def sum_ct_pair_scores(interacting_cell_scores, interactions):
+def sum_ct_pair_scores(adata):
+
+    interacting_cell_scores = adata.uns['interacting_cell_scores']
 
     df_list = []
     for key in interacting_cell_scores.keys():
-        df = interacting_cell_scores[key]
+        df = interacting_cell_scores[key].copy()
         df_list.append(df)
     
     combined_df = pd.concat(df_list, axis=1)
-    combined_df = combined_df.T.groupby(level=0).sum().T
-    
-    combined_scores = combined_df[interactions]
+    combined_scores = combined_df.T.groupby(level=0).sum().T
 
-    return combined_scores
+    adata.uns['combined_cell_scores'] = combined_scores
+
+    return
 
 
 def plot_interaction(adata, scores, interaction, ct_pair, coords_obsm_key, s, vmin, vmax, figsize, cmap):
