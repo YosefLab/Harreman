@@ -18,6 +18,8 @@ def extract_interaction_db(
     species: Optional[Union[Literal["mouse"], Literal["human"]]] = None,
     database: Optional[Union[Literal["transporter"], Literal["LR"], Literal["both"]]] = None,
     min_cell: Optional[int] = 0,
+    subset_genes: Optional[list] = None,
+    subset_metabolites: Optional[list] = None,
 ):
     """Extract the metabolite transporter or LR database from .csv files.
 
@@ -87,11 +89,19 @@ def extract_interaction_db(
     adata.uns['database'] = database
 
     if database == 'both':
-        adata.varm["database"] = pd.concat([LR_df, metab_df], axis=1)
+        database_df = pd.concat([LR_df, metab_df], axis=1)
     elif database == 'LR':
-        adata.varm["database"] = LR_df
+        database_df = LR_df
     else:
-        adata.varm["database"] = metab_df
+        database_df = metab_df
+    
+    if subset_genes:
+        database_df.loc[~database_df.index.isin(subset_genes)] = 0
+        database_df = database_df.loc[:, (database_df!=0).any(axis=0)]
+    if subset_metabolites:
+        database_df = database_df[subset_metabolites]
+
+    adata.varm["database"] = database_df
 
     return
 

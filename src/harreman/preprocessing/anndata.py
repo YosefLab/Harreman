@@ -155,11 +155,14 @@ def modify_uns_harreman(adata):
             adata.uns[uns_key] = adata.uns[uns_key].fillna('NA')
 
     if 'gene_pairs' in adata.uns.keys():
-        adata.uns['gene_pairs'] = [(x, ' - '.join(y) if isinstance(y, list) else y) for x, y in adata.uns['gene_pairs']]
-        del adata.uns['gene_pairs']
+        gene_pairs_tmp = [(x, ' - '.join(y) if isinstance(y, list) else y) for x, y in adata.uns['gene_pairs']]
+        gene_pairs_tmp = [(' - '.join(x) if isinstance(x, list) else x, y) for x, y in gene_pairs_tmp]
+        adata.uns['gene_pairs'] = ['_'.join(gp) for gp in gene_pairs_tmp]
+
     if 'gene_pairs_ind' in adata.uns.keys():
-        adata.uns['gene_pairs_ind'] = [(x, ' - '.join(map(str, y)) if isinstance(y, list) else y) for x, y in adata.uns['gene_pairs_ind']]
-        del adata.uns['gene_pairs_ind']
+        gene_pairs_ind_tmp = [(x, ' - '.join(map(str, y)) if isinstance(y, list) else str(y)) for x, y in adata.uns['gene_pairs_ind']]
+        gene_pairs_ind_tmp = [(' - '.join(map(str, x)) if isinstance(x, list) else str(x), y) for x, y in gene_pairs_ind_tmp]
+        adata.uns['gene_pairs_ind'] = ['_'.join(gp) for gp in gene_pairs_ind_tmp]
     
     if 'gene_pairs_per_metabolite' in adata.uns.keys():
         adata.uns['gene_pairs_per_metabolite'] = {key: {
@@ -218,4 +221,18 @@ def write_harreman_h5ad(
 
 def read_harreman_h5ad(filename):
     adata = anndata.read_h5ad(filename)
+
+    if 'genes' in adata.uns.keys():
+        adata.uns['genes'] = list(adata.uns['genes'])
+    
+    if 'gene_pairs' in adata.uns.keys():
+        gene_pairs_tmp = [tuple(gp.split('_')) for gp in adata.uns['gene_pairs']]
+        gene_pairs_tmp = [(x, list(y.split(' - ')) if ' - ' in y else y) for x, y in gene_pairs_tmp]
+        adata.uns['gene_pairs'] = [(list(x.split(' - ')) if ' - ' in x else x, y) for x, y in gene_pairs_tmp]
+        
+    if 'gene_pairs_ind' in adata.uns.keys():
+        gene_pairs_ind_tmp = [tuple(gp.split('_')) for gp in adata.uns['gene_pairs_ind']]
+        gene_pairs_ind_tmp = [(x, list(int(val) for val in y.split(' - ')) if ' - ' in y else int(y)) for x, y in gene_pairs_ind_tmp]
+        adata.uns['gene_pairs_ind'] = [(list(int(val) for val in x.split(' - ')) if ' - ' in x else int(x), y) for x, y in gene_pairs_ind_tmp]
+
     return adata

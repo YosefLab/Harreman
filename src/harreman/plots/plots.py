@@ -102,20 +102,36 @@ def plot_interacting_cell_scores(
     cell_type_pair: Optional[list] = None,
     interactions: Optional[list] = None,
     coords_obsm_key: Optional[str] = None,
+    only_sig_values: Optional[bool] = False,
     s: Optional[float] = None,
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
     figsize: Optional[tuple] = (10,10),
     cmap: Optional[str] = 'Reds',
+    colorbar: Optional[bool] = True,
 ):
-        
+
     if deconv_adata is not None:
-        adata.uns['interacting_cell_scores'] = deconv_adata.uns['interacting_cell_scores']
+        adata.uns['interacting_cell_scores_gp'] = deconv_adata.uns['interacting_cell_scores_gp']
+        adata.uns['interacting_cell_scores_m'] = deconv_adata.uns['interacting_cell_scores_m']
+        if only_sig_values:
+            adata.uns['interacting_cell_scores_gp_sig'] = deconv_adata.uns['interacting_cell_scores_gp_sig']
+            adata.uns['interacting_cell_scores_m_sig'] = deconv_adata.uns['interacting_cell_scores_m_sig']
     
-    interacting_cell_scores = adata.uns['interacting_cell_scores']
+    interacting_cell_scores_gp = adata.uns['interacting_cell_scores_gp_sig'] if only_sig_values else adata.uns['interacting_cell_scores_gp']
+    interacting_cell_scores_m = adata.uns['interacting_cell_scores_m_sig'] if only_sig_values else adata.uns['interacting_cell_scores_m']
     
     if interactions is None:
         raise ValueError("Please provide a LR pair or a metabolite.")
+    
+    gene_pairs = [inter for inter in interactions if inter in interacting_cell_scores_gp.columns]
+    metabs = [inter for inter in interactions if inter in interacting_cell_scores_m.columns]
+    if len(gene_pairs) > 0 and len(metabs) > 0:
+        interacting_cell_scores = pd.concat([interacting_cell_scores_gp, interacting_cell_scores_m], axis=1)
+    elif len(gene_pairs) == 0 and len(metabs) == 0:
+        raise ValueError("The provided LR pairs and/or metabolites don't have significant interactions.")
+    else:
+        interacting_cell_scores = interacting_cell_scores_gp if len(gene_pairs) > 0 else interacting_cell_scores_m
     
     if isinstance(cell_type_pair, list):
         if len(cell_type_pair) != 2:
@@ -143,7 +159,7 @@ def plot_interacting_cell_scores(
         scores = interacting_cell_scores[ct_pair][interactions]
     
     for interaction in interactions:
-        plot_interaction(adata, scores, interaction, ct_pair, coords_obsm_key, s, vmin, vmax, figsize, cmap)
+        plot_interaction(adata, scores, interaction, ct_pair, coords_obsm_key, s, vmin, vmax, figsize, cmap, colorbar)
         plt.show()
         plt.close()
 
@@ -165,7 +181,7 @@ def sum_ct_pair_scores(adata):
     return
 
 
-def plot_interaction(adata, scores, interaction, ct_pair, coords_obsm_key, s, vmin, vmax, figsize, cmap):
+def plot_interaction(adata, scores, interaction, ct_pair, coords_obsm_key, s, vmin, vmax, figsize, cmap, colorbar):
 
     if isinstance(adata.obsm[coords_obsm_key], pd.DataFrame):
         coords = adata.obsm[coords_obsm_key].values
@@ -179,7 +195,8 @@ def plot_interaction(adata, scores, interaction, ct_pair, coords_obsm_key, s, vm
     plt.xticks([])
     plt.yticks([])
     plt.title(f'Communication score: {interaction}; {ct_pair[0]} and {ct_pair[1]}') if ct_pair is not None else plt.title(f'Communication score: {interaction}')
-    plt.colorbar()
+    if colorbar:
+        plt.colorbar()
 
 
 def _prettify_axis(ax, spatial=False):
