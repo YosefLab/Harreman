@@ -1,2 +1,2 @@
 # Harreman
-Metabolic cell-cell communication inference in spatial niches.
+Metabolic cell-cell communication inference in spatial transcriptomics.
