@@ -116,7 +116,6 @@ def setup_deconv_adata(
     if adata.uns["database"] in ['LR', 'both']:
         deconv_adata.uns['ligand'] = adata.uns['ligand']
         deconv_adata.uns['receptor'] = adata.uns['receptor']
-        deconv_adata.uns['num_pairs'] = adata.uns['num_pairs']
         deconv_adata.uns['LR_database'] = adata.uns['LR_database']
 
     if adata.uns["database"] in ['transporter', 'both']:
@@ -202,7 +201,7 @@ def modify_uns_harreman(adata):
     return
 
 
-def write_harreman_h5ad(
+def write_h5ad(
     adata: anndata.AnnData, 
     filename: Optional[str] = None,
 ):
@@ -219,7 +218,7 @@ def write_harreman_h5ad(
     adata.write(filename)
 
 
-def read_harreman_h5ad(filename):
+def read_h5ad(filename):
     adata = anndata.read_h5ad(filename)
 
     if 'genes' in adata.uns.keys():

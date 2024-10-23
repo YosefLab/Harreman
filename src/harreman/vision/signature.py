@@ -1,7 +1,7 @@
 import random
 from re import compile, match
 from typing import Dict, List, Literal, Optional, Sequence, Tuple, Union
-
+import time
 import numpy as np
 import pandas as pd
 from anndata import AnnData
@@ -18,6 +18,9 @@ UP_SIG_KEY = "UP"
 
 def compute_obs_df_scores(adata):
     """Computes Geary's C for numerical data."""
+    start = time.time()
+    print("Computing observation scores...")
+
     numerical_df = adata.obs._get_numeric_data()
     num_cols = numerical_df.columns.tolist()
     cols = adata.obs.columns.tolist()
@@ -66,17 +69,24 @@ def compute_obs_df_scores(adata):
         res.loc[cat_cols, "pvals"] = pvals_cat
         res.loc[cat_cols, "fdr"] = fdr_cat
 
+    print("Finished computing observation scores in %.3f seconds" %(time.time()-start))
+    
     return res
 
 
 def compute_signature_scores(adata, norm_data_key, signature_varm_key):
-    """Computes Geary's C for numerical data."""
+    """Computes Geary's C for all the signatures."""
+    start = time.time()
+    print("Computing Geary's C for all the signatures...")
+    
     df = adata.obsm["vision_signatures"]
     # first handle numerical data with geary's
     weights = adata.obsp["weights"]
     weights = weights.tocsr()
     gearys_c = _gearys_c(weights, df.to_numpy().transpose())
     c_prime = 1-gearys_c
+
+    print("Generating the null distribution...")
 
     random_sig_df, clusters, random_clusters = generate_permutations_null(adata, norm_data_key, signature_varm_key)
     adata.varm["random_signatures"] = random_sig_df
@@ -101,6 +111,8 @@ def compute_signature_scores(adata, norm_data_key, signature_varm_key):
     res["c_prime"] = c_prime
     res["pvals"] = pvals
     res["fdr"] = fdr
+
+    print("Finished computing Geary's C for all the signatures in %.3f seconds" %(time.time()-start))
 
     return res
 
@@ -292,6 +304,9 @@ def compute_signatures_anndata(
         is a pandas DataFrame. Otherwise, uses `Signature_1`, `Signature_2`, etc.
 
     """
+    start = time.time()
+    print("Computing signatures for each cell...")
+    
     adata.uns['norm_data_key'] = norm_data_key
     adata.uns['signature_varm_key'] = signature_varm_key
 
@@ -313,7 +328,10 @@ def compute_signatures_anndata(
         if isinstance(sig_matrix, pd.DataFrame):
             sig_matrix = sig_matrix.to_numpy()
         sig_matrix = csr_matrix(sig_matrix)
-    cell_signature_matrix = (gene_expr @ sig_matrix).toarray()
+    is_sparse = issparse(gene_expr)
+    gene_expr = gene_expr.A if is_sparse else gene_expr
+    cell_signature_matrix = gene_expr @ sig_matrix
+    # cell_signature_matrix = (gene_expr @ sig_matrix).toarray()
     sig_df = pd.DataFrame(data=cell_signature_matrix, columns=cols, index=adata.obs_names)
     # normalize
     mean, var = _get_mean_var(gene_expr, axis=1)
@@ -325,6 +343,8 @@ def compute_signatures_anndata(
     # cells by signatures
     sig_std = np.sqrt(np.outer(var, 1 / (n + m)))
     sig_df = (sig_df - sig_mean) / sig_std
+
+    print("Finished computing signatures for each cell in %.3f seconds" %(time.time()-start))
 
     return sig_df
 

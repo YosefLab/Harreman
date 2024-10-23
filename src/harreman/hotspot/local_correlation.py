@@ -3,12 +3,14 @@ import time
 import numpy as np
 import pandas as pd
 import sparse
+from scipy.sparse import csr_matrix
 from anndata import AnnData
 from numba import jit, njit
 
 from . import models
 from ..preprocessing.anndata import counts_from_anndata
 from .local_autocorrelation import compute_local_cov_max
+from ..tools.knn import make_weights_non_redundant
 
 
 def compute_local_correlation(
@@ -31,6 +33,8 @@ def compute_local_correlation(
 
     weights = adata.obsp['weights']
     num_umi = counts.sum(axis=0)
+
+    # weights = make_weights_non_redundant(weights)
 
     row_degrees = np.array(weights.sum(axis=1).T)[0]
     col_degrees = np.array(weights.sum(axis=0).T)[0]

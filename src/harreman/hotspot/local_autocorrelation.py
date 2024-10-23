@@ -5,10 +5,12 @@ import pandas as pd
 from anndata import AnnData
 from numba import jit, njit
 from scipy.stats import norm
+from scipy.sparse import csr_matrix
 from statsmodels.stats.multitest import multipletests
 
 from . import models
 from ..preprocessing.anndata import counts_from_anndata
+from ..tools.knn import make_weights_non_redundant
 
 
 def load_metabolic_genes(
@@ -40,6 +42,7 @@ def compute_local_autocorrelation(
 
     adata.uns['layer_key'] = layer_key
     adata.uns['model'] = model
+    adata.uns['species'] = species
 
     if use_metabolic_genes and genes is None:
         genes = load_metabolic_genes(species)
@@ -54,10 +57,12 @@ def compute_local_autocorrelation(
 
     counts = counts_from_anndata(adata[:, genes], layer_key, dense=True)
 
-    weights = adata.obsp['weights']
+    weights = adata.obsp['weights'].copy()
     genes = genes[~np.all(counts == 0, axis=1)]
     counts = counts[~np.all(counts == 0, axis=1)]
     num_umi = np.array(counts.sum(axis=0))
+
+    # weights = make_weights_non_redundant(weights)
 
     adata.uns['umi_counts'] = num_umi
 
@@ -71,7 +76,7 @@ def compute_local_autocorrelation(
         return center_values_total(x, num_umi, model)
     counts = np.apply_along_axis(lambda x: center_vals_f(x)[np.newaxis], 1, counts).squeeze(axis=1)
 
-    results = _compute_hs_inner_fast(counts.T, weights, Wtot2, D)
+    results = _compute_hs_inner_fast(counts, weights, Wtot2, D)
     results = pd.DataFrame(results, index=["G", "G_max", "EG", "stdG", "Z", "C"], columns=genes).T
 
     results["Pval"] = norm.sf(results["Z"].values)
@@ -200,7 +205,7 @@ def center_values_total(vals, num_umi, model):
 
 def _compute_hs_inner_fast(counts, weights, Wtot2, D):
 
-    G = (weights @ counts * counts).sum(axis=0)
+    G = (counts.T * (weights @ counts.T)).sum(axis=0)
 
     EG, EG2 = 0, Wtot2
 
@@ -208,7 +213,7 @@ def _compute_hs_inner_fast(counts, weights, Wtot2, D):
 
     Z = [(G[i] - EG) / stdG for i in range(len(G))]
 
-    G_max = np.apply_along_axis(compute_local_cov_max, 0, counts, D)
+    G_max = np.apply_along_axis(compute_local_cov_max, 0, counts.T, D)
 
     C = (G - EG) / G_max
 

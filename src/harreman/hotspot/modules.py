@@ -14,6 +14,7 @@ from tqdm import tqdm
 from ..vision.signature import compute_signatures_anndata
 from ..preprocessing.anndata import counts_from_anndata
 from .local_correlation import create_centered_counts_row
+from ..tools.knn import make_weights_non_redundant
 
 
 def calculate_module_scores(
@@ -92,6 +93,7 @@ def compute_scores_PCA(
     """
 
     weights = adata.obsp['weights']
+    # weights = make_weights_non_redundant(weights)
 
     counts_sub = counts_from_anndata(adata, layer_key, dense=True)
 
@@ -105,7 +107,7 @@ def compute_scores_PCA(
         weights_sum = np.array(weights.sum(axis=1).T)[0]
         weights_sum[weights_sum == 0] = 1
         out /= weights_sum
-        centered_row = (out * _lambda) + (1 - _lambda) * centered_row
+        centered_row = (out * _lambda) + ((1 - _lambda) * centered_row)
         cc_smooth[i] = centered_row
 
     pca_data = cc_smooth

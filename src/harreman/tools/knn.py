@@ -108,9 +108,6 @@ def compute_knn_graph(
             neighborhood_factor,
         )
 
-    # weights = make_weights_non_redundant(adata.obsp["weights"].toarray())
-    # adata.obsp["weights"] = csr_matrix(weights)
-
     print("Finished computing the KNN graph in %.3f seconds" %(time.time()-start))
 
     return
@@ -303,24 +300,36 @@ def compute_weights(
         return
 
 
-@jit(nopython=True)
+# @jit(nopython=True)
 def make_weights_non_redundant(weights):
 
     w_no_redundant = weights.copy()
     
-    for i in range(weights.shape[0]):
-        neighbors = np.where(weights[i] != 0)[0]
-        for j in neighbors:
+    rows, cols = w_no_redundant.nonzero()
+    upper_diag_mask = rows < cols
+    upper_rows, upper_cols = rows[upper_diag_mask], cols[upper_diag_mask]
 
-            if j < i:
-                continue
-
-            if weights[j, i] != 0:
-                w_ji = w_no_redundant[j, i]
-                w_no_redundant[j, i] = 0
-                w_no_redundant[i, j] += w_ji
+    w_no_redundant[upper_cols, upper_rows] += w_no_redundant[upper_rows, upper_cols]
+    w_no_redundant[upper_rows, upper_cols] = 0
+    w_no_redundant.eliminate_zeros()
 
     return w_no_redundant
+
+    # w_no_redundant = weights.copy()
+    
+    # for i in range(weights.shape[0]):
+    #     neighbors = np.where(weights[i] != 0)[0]
+    #     for j in neighbors:
+
+    #         if j < i:
+    #             continue
+
+    #         if weights[j, i] != 0:
+    #             w_ji = w_no_redundant[j, i]
+    #             w_no_redundant[j, i] = 0
+    #             w_no_redundant[i, j] += w_ji
+
+    # return w_no_redundant
 
 
 def tree_neighbors_and_weights(adata, tree, n_neighbors):

@@ -1,7 +1,7 @@
 from itertools import zip_longest
 from re import compile, match
 from typing import Dict, List, Literal, Optional, Sequence, Tuple, Union
-
+import os
 import numpy as np
 import pandas as pd
 from anndata import AnnData
@@ -17,9 +17,9 @@ def extract_interaction_db(
     use_raw: bool = False,
     species: Optional[Union[Literal["mouse"], Literal["human"]]] = None,
     database: Optional[Union[Literal["transporter"], Literal["LR"], Literal["both"]]] = None,
-    min_cell: Optional[int] = 0,
     subset_genes: Optional[list] = None,
     subset_metabolites: Optional[list] = None,
+    extracellular_only: Optional[bool] = True,
 ):
     """Extract the metabolite transporter or LR database from .csv files.
 
@@ -39,9 +39,6 @@ def extract_interaction_db(
     Genes by metabolites (or LRs) dataframe. Index is aligned to genes from adata.
 
     """
-    IMPORT_METAB_KEY = "IMPORT"
-    EXPORT_METAB_KEY = "EXPORT"
-    BOTH_METAB_KEY = "BOTH"
 
     if species not in ['human', 'mouse']:
         raise ValueError(f'species type: {species} is not supported currently. You should choose either "human" or "mouse".')
@@ -49,14 +46,16 @@ def extract_interaction_db(
     if database is None:
         raise ValueError('Please one of the options to extract the interaction database: "transporter", "LR" or "both".')
 
+    adata.uns['species'] = species
+    
     if database == 'both' or database == 'LR':
-        extract_lr(adata, species, min_cell=min_cell)
+        extract_lr_pairs(adata, species)
         index = adata.raw.var.index if use_raw else adata.var_names
         columns = adata.uns['LR_database'].index
         data = np.zeros((len(index), len(columns)))
         LR_df = pd.DataFrame(index=index, columns=columns, data=data)
         LR_df.index = LR_df.index.str.lower()
-        for LR_name in columns: #'EFNA5_EPHA3'
+        for LR_name in columns:
             for key in ['ligand', 'receptor']:
                 genes = adata.uns[key].loc[LR_name].dropna().values.tolist()
                 if len(genes) > 0:
@@ -67,9 +66,8 @@ def extract_interaction_db(
         LR_df = LR_df.loc[:, (LR_df!=0).any(axis=0)]
 
     if database == 'both' or database == 'transporter':
-        # Modify the function such that the metabolite DB is provided with the code and not by the user. Save the DB in adata.uns
         metab_dict = {}
-        metab_dict = extract_transporter_info(adata, species)
+        metab_dict = extract_transporter_info(adata, species, extracellular_only)
         index = adata.raw.var.index if use_raw else adata.var_names
         columns = list(metab_dict.keys())
         data = np.zeros((len(index), len(columns)))
@@ -109,15 +107,34 @@ def extract_interaction_db(
 def extract_transporter_info(
     adata: AnnData,
     species: Optional[Union[Literal["mouse"], Literal["human"]]] = None,
+    extracellular_only: bool = True,
     export_suffix: Tuple[str] = "(_exp|_export)",
     import_suffix: str = "(_imp|_import)",
     verbose: bool = False,
 ) -> Dict[str, Dict[str, List[str]]]:
     """Read csv file to extract the metabolite database."""
-    if species == 'mouse':
-        database_df = pd.read_csv('/home/labs/nyosef/oier/Cell_cell_communication/Metabolite_transporters/transporter_database_metabs_m.csv', index_col=0)
-    elif species == 'human':
-        database_df = pd.read_csv('/home/labs/nyosef/oier/Cell_cell_communication/Metabolite_transporters/transporter_database_metabs_h.csv', index_col=0)
+
+    BASE_PATH = '/home/labs/nyosef/oier/Harreman/data/HarremanDB'
+    
+    database_info = {
+        'mouse': {
+            'extracellular': os.path.join(BASE_PATH, 'HarremanDB_mouse_extracellular.csv'),
+            'all': os.path.join(BASE_PATH, 'HarremanDB_mouse.csv'),
+            'heterodimer': os.path.join(BASE_PATH, 'Heterodimer_info_mouse.csv'),
+        },
+        'human': {
+            'extracellular': os.path.join(BASE_PATH, 'HarremanDB_human_extracellular.csv'),
+            'all': os.path.join(BASE_PATH, 'HarremanDB_human.csv'),
+            'heterodimer': os.path.join(BASE_PATH, 'Heterodimer_info_human.csv'),
+        }
+    }
+
+    if extracellular_only:
+        database_df = pd.read_csv(database_info[species]['extracellular'], index_col=0)
+    else:
+        database_df = pd.read_csv(database_info[species]['all'], index_col=0)
+    
+    heterodimer_info = pd.read_csv(database_info[species]['heterodimer'], index_col=0)
 
     directional_metabs = {}
     metab_genes_dir = {}
@@ -185,92 +202,52 @@ def extract_transporter_info(
     adata.uns['import_export'].index = ind
     adata.uns['num_metabolites'] = len(ind)
     adata.uns['metabolite_database'] = database_df
+    adata.uns['heterodimer_info'] = heterodimer_info
 
     return directional_metabs
 
 
-# Function obtained from SpatialDM (consider just importing the function and using it)
-def extract_lr(adata, species, mean='algebra', min_cell=0, datahost='builtin'):
-    """Find overlapping LRs from CellChatDB
-    :param adata: AnnData object
-    :param species: support 'human', 'mouse' and 'zebrafish'
-    :param mean: 'algebra' (default) or 'geometric'
-    :param min_cell: for each selected pair, the spots expressing ligand or receptor should be larger than the min,
-    respectively.
-    :param datahost: the host of the ligand-receptor data. 'builtin' for package built-in otherwise from figshare
-    :return: ligand, receptor, geneInter (containing comprehensive info from CellChatDB) dataframes \
-            in adata.uns.
-    """
-    if mean=='geometric':
-        from scipy.stats.mstats import gmean
-    adata.uns['mean'] = mean
+def extract_lr_pairs(adata, species):
+    """Extracting LR pairs from CellChatDB."""
 
-    if datahost == 'package':
-        if species in ['mouse', 'human', 'zerafish']:
-            datapath = './datasets/LR_data/%s-' %(species)
-        else:
-            raise ValueError(f"species type: {species} is not supported currently. Please have a check.")
+    BASE_PATH = '/home/labs/nyosef/oier/Harreman/data/CellChatDB'
 
-        import pkg_resources
-        stream1 = pkg_resources.resource_stream(__name__, datapath + 'interaction_input_CellChatDB.csv.gz')
-        geneInter = pd.read_csv(stream1, index_col=0, compression='gzip')
+    database_info = {
+        'mouse': {
+            'interaction': os.path.join(BASE_PATH, 'interaction_input_CellChatDB_v2_mouse.csv'),
+            'complex': os.path.join(BASE_PATH, 'complex_input_CellChatDB_v2_mouse.csv'),
+        },
+        'human': {
+            'interaction': os.path.join(BASE_PATH, 'interaction_input_CellChatDB_v2_human.csv'),
+            'complex': os.path.join(BASE_PATH, 'complex_input_CellChatDB_v2_human.csv'),
+        }
+    }
 
-        stream2 = pkg_resources.resource_stream(__name__, datapath + 'complex_input_CellChatDB.csv')
-        comp = pd.read_csv(stream2, header=0, index_col=0)
-    else:
-        if species == 'mouse':
-            geneInter = pd.read_csv('https://figshare.com/ndownloader/files/36638919', index_col=0)
-            comp = pd.read_csv('https://figshare.com/ndownloader/files/36638916', header=0, index_col=0)
-        elif species == 'human':
-            geneInter = pd.read_csv('https://figshare.com/ndownloader/files/36638943', header=0, index_col=0)
-            comp = pd.read_csv('https://figshare.com/ndownloader/files/36638940', header=0, index_col=0)
-        elif species == 'zebrafish':
-            geneInter = pd.read_csv('https://figshare.com/ndownloader/files/38756022', header=0, index_col=0)
-            comp = pd.read_csv('https://figshare.com/ndownloader/files/38756019', header=0, index_col=0)
-        else:
-            raise ValueError(f"species type: {species} is not supported currently. Please have a check.")
+    interaction = pd.read_csv(database_info[species]['interaction'], index_col=0)
+    complex = pd.read_csv(database_info[species]['complex'], header=0, index_col=0)
 
-    geneInter = geneInter.sort_values('annotation')
-    ligand = geneInter.ligand.values
-    receptor = geneInter.receptor.values
-    geneInter.pop('ligand')
-    geneInter.pop('receptor')
+    interaction = interaction.sort_values('annotation')
+    ligand = interaction.ligand.values
+    receptor = interaction.receptor.values
+    interaction.pop('ligand')
+    interaction.pop('receptor')
 
-    ## NOTE: the following for loop needs speed up
-    # t = []
     for i in range(len(ligand)):
         for n in [ligand, receptor]:
             l = n[i]
-            if l in comp.index:
-                n[i] = comp.loc[l].dropna().values[pd.Series \
-                    (comp.loc[l].dropna().values).isin(adata.var_names)]
+            if l in complex.index:
+                n[i] = complex.loc[l].dropna().values[pd.Series(complex.loc[l].dropna().values).isin(adata.var_names)]
             else:
                 n[i] = pd.Series(l).values[pd.Series(l).isin(adata.var_names)]
-        # if (len(ligand[i]) > 0) * (len(receptor[i]) > 0):
-        #     if mean=='geometric':
-        #         meanL = gmean(adata[:, ligand[i]].X, axis=1)
-        #         meanR = gmean(adata[:, receptor[i]].X, axis=1)
-        #     else:
-        #         meanL = adata[:, ligand[i]].X.mean(axis=1)
-        #         meanR = adata[:, receptor[i]].X.mean(axis=1)
-        #     if (sum(meanL > 0) >= min_cell) * \
-        #             (sum(meanR > 0) >= min_cell):
-        #         t.append(True)
-        #     else:
-        #         t.append(False)
-        # else:
-        #     t.append(False)
-    ind = geneInter.index
+
     adata.uns['ligand'] = pd.DataFrame.from_records(zip_longest(*pd.Series(ligand).values)).transpose()
     adata.uns['ligand'].columns = ['Ligand' + str(i) for i in range(adata.uns['ligand'].shape[1])]
-    adata.uns['ligand'].index = ind
+    adata.uns['ligand'].index = interaction.index
     adata.uns['receptor'] = pd.DataFrame.from_records(zip_longest(*pd.Series(receptor).values)).transpose()
     adata.uns['receptor'].columns = ['Receptor' + str(i) for i in range(adata.uns['receptor'].shape[1])]
-    adata.uns['receptor'].index = ind
-    adata.uns['num_pairs'] = len(ind)
-    adata.uns['LR_database'] = geneInter.loc[ind]
-    if adata.uns['num_pairs'] == 0:
-        raise ValueError("No effective RL. Please have a check on input count matrix/species.")
+    adata.uns['receptor'].index = interaction.index
+    adata.uns['LR_database'] = interaction
+    
     return
 
 
