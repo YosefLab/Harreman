@@ -253,8 +253,9 @@ def compute_gene_pairs(
         cell_types = cell_types.values.astype(str)
 
     database = adata.varm["database"]
-    heterodimer_info = adata.uns["heterodimer_info"]
-    heterodimer_info['Genes'] = heterodimer_info['Genes'].apply(ast.literal_eval)
+    if "heterodimer_info" in adata.uns.keys():
+        heterodimer_info = adata.uns["heterodimer_info"]
+        heterodimer_info['Genes'] = heterodimer_info['Genes'].apply(ast.literal_eval)
 
     if (expression_filt is True) or (de_filt is True):
         filtered_genes = adata.uns["filtered_genes"]
@@ -322,7 +323,7 @@ def compute_gene_pairs(
                 for heterodimer_genes in heterodimer_genes_list:
                     metab_genes_red = [gene for gene in metab_genes if gene not in heterodimer_genes]
                     metab_genes = metab_genes_red + tuple(heterodimer_genes) if all(gene in metab_genes for gene in heterodimer_genes) else metab_genes_red
-            all_pairs = list(set(itertools.combinations_with_replacement(metab_genes, 2)) | set(itertools.permutations(metab_genes, 2)))
+            all_pairs = list(set(itertools.combinations_with_replacement(metab_genes, 2)) | set(itertools.permutations(metab_genes, 2))) if ct_specific else list(set(itertools.combinations_with_replacement(metab_genes, 2)))
         else:
             ligand = adata.uns['ligand'].loc[metabolite].dropna().tolist()
             ligand = ligand[0] if len(ligand) == 1 else ligand
@@ -330,7 +331,7 @@ def compute_gene_pairs(
             receptor = receptor[0] if len(receptor) == 1 else receptor
             if len(ligand) == 0 or len(receptor) == 0:
                 continue
-            all_pairs = [(ligand, receptor)]
+            all_pairs = [(ligand, receptor), (receptor, ligand)] if ct_specific else [(ligand, receptor)]
         
         for pair in all_pairs:
             var1, var2 = pair
@@ -905,7 +906,7 @@ def compute_interacting_cell_scores(
         )
     
     adata.uns['interacting_cell_results'] = {}
-    adata.uns['interacting_cell_results']['cs'] = counts_1.T * np.tensordot(weigths_ct_pairs, counts_2.T, axes=([2], [0])) if cell_type_key else (counts_1.T * (weights @ counts_2.T)) + (counts_2 * (counts_1 @ weights.T)).T
+    adata.uns['interacting_cell_results']['cs'] = counts_1.T * np.tensordot(weigths_ct_pairs, counts_2.T, axes=([2], [0])) if cell_type_key else counts_1.T * (weights @ counts_2.T)
     
     if compute_significance:
         adata.uns['interacting_cell_results']['np'] = {}
@@ -921,7 +922,7 @@ def compute_interacting_cell_scores(
                 )
                 adata.uns['interacting_cell_results']['np']['perm_cs'][:, :, :, i] = counts_1.T * np.tensordot(weigths_ct_pairs_perm, counts_2.T, axes=([2], [0]))
             else:
-                adata.uns['interacting_cell_results']['np']['perm_cs'][:, :, i] = (counts_1.T * (weights @ counts_2.T)) + (counts_2 * (counts_1 @ weights.T)).T
+                adata.uns['interacting_cell_results']['np']['perm_cs'][:, :, i] = (counts_1.T * (weights @ counts_2.T))
         
         if cell_type_key:
             x = np.sum(adata.uns['interacting_cell_results']['np']['perm_cs'] > adata.uns['interacting_cell_results']['cs'][:, :, :, np.newaxis], axis=3)

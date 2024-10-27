@@ -151,16 +151,14 @@ def compute_neighbors(
 
     if sample_key is not None:
         samples = adata.obs[sample_key].unique().tolist()
-        sample_pairs = list(itertools.permutations(samples, 2))
-        for sample_pair in sample_pairs:
-            sample_1, sample_2 = sample_pair
-            sample_1_mask = adata.obs[sample_key] == sample_1
-            sample_1_mask = sample_1_mask.reset_index(drop=True)
-            sample_1_mask_ind = sample_1_mask[sample_1_mask].index.tolist()
-            sample_2_mask = adata.obs[sample_key] == sample_2
-            sample_2_mask = sample_2_mask.reset_index(drop=True)
-            sample_2_mask_ind = sample_2_mask[sample_2_mask].index.tolist()
-            subset = distances.tolil()[sample_1_mask_ind,:][:,sample_2_mask_ind]
+        for sample in samples:
+            sample_mask = adata.obs[sample_key] == sample
+            sample_mask = sample_mask.reset_index(drop=True)
+            sample_mask_ind = sample_mask[sample_mask].index.tolist()
+            not_sample_mask = adata.obs[sample_key] != sample
+            not_sample_mask = not_sample_mask.reset_index(drop=True)
+            not_sample_mask_ind = not_sample_mask[not_sample_mask].index.tolist()
+            subset = distances.tolil()[sample_mask_ind,:][:,not_sample_mask_ind]
             if subset.nnz > 0:
                 raise ValueError(
                     "The distance between cells from different samples should be 0."

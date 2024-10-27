@@ -33,7 +33,7 @@ def compute_local_autocorrelation(
     database_varm_key: Optional[str] = None,
     model: Optional[str] = None,
     genes: Optional[list] = None,
-    use_metabolic_genes: bool = True,
+    use_metabolic_genes: bool = False,
     species: Optional[Union[Literal["mouse"], Literal["human"]]] = "mouse",
 ):
 
