@@ -295,7 +295,6 @@ def compute_weights(
         return
 
 
-# @jit(nopython=True)
 def make_weights_non_redundant(weights):
 
     w_no_redundant = weights.copy()
@@ -304,27 +303,31 @@ def make_weights_non_redundant(weights):
     upper_diag_mask = rows < cols
     upper_rows, upper_cols = rows[upper_diag_mask], cols[upper_diag_mask]
 
-    w_no_redundant[upper_cols, upper_rows] += w_no_redundant[upper_rows, upper_cols]
-    w_no_redundant[upper_rows, upper_cols] = 0
+    w_no_redundant[upper_rows, upper_cols] += w_no_redundant[upper_cols, upper_rows]
+    w_no_redundant[upper_cols, upper_rows] = 0
     w_no_redundant.eliminate_zeros()
 
     return w_no_redundant
 
-    # w_no_redundant = weights.copy()
-    
-    # for i in range(weights.shape[0]):
-    #     neighbors = np.where(weights[i] != 0)[0]
-    #     for j in neighbors:
 
-    #         if j < i:
-    #             continue
+@jit(nopython=True)
+def make_weights_non_redundant_orig(neighbors, weights):
+    w_no_redundant = weights.copy()
 
-    #         if weights[j, i] != 0:
-    #             w_ji = w_no_redundant[j, i]
-    #             w_no_redundant[j, i] = 0
-    #             w_no_redundant[i, j] += w_ji
+    for i in range(neighbors.shape[0]):
+        for k in range(neighbors.shape[1]):
+            j = neighbors[i, k]
 
-    # return w_no_redundant
+            if j < i:
+                continue
+
+            for k2 in range(neighbors.shape[1]):
+                if neighbors[j, k2] == i:
+                    w_ji = w_no_redundant[j, k2]
+                    w_no_redundant[j, k2] = 0
+                    w_no_redundant[i, k] += w_ji
+
+    return w_no_redundant
 
 
 def tree_neighbors_and_weights(adata, tree, n_neighbors):
@@ -406,7 +409,6 @@ def _search(current_node, previous_node, distance):
     return result
 
 
-# @jit(nopython=True)
 def compute_node_degree(weights):
 
     D = np.zeros(weights.shape[0])
@@ -418,6 +420,23 @@ def compute_node_degree(weights):
 
             j = int(j)
             w_ij = weights[i, j]
+
+            D[i] += w_ij
+            D[j] += w_ij
+
+    return D
+
+
+@jit(nopython=True)
+def compute_node_degree_orig(neighbors, weights):
+
+    D = np.zeros(neighbors.shape[0])
+
+    for i in range(neighbors.shape[0]):
+        for k in range(neighbors.shape[1]):
+
+            j = neighbors[i, k]
+            w_ij = weights[i, k]
 
             D[i] += w_ij
             D[j] += w_ij
@@ -446,7 +465,6 @@ def compute_node_degree_ct(weights_ct, cell_type_mask_ind):
     return D
 
 
-# @jit(nopython=True)
 def compute_node_degree_ct_pair(weights, cell_type_pairs, cell_types):
 
     # D = np.zeros(weights_ct.shape[0])
