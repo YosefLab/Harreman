@@ -32,17 +32,18 @@ def compute_local_correlation(
     counts = counts_from_anndata(adata[:, genes], layer_key, dense=True)
 
     weights = adata.obsp['weights']
-    num_umi = counts.sum(axis=0)
+    num_umi = adata.uns['umi_counts']
 
-    # weights = make_weights_non_redundant(weights)
+    weights = make_weights_non_redundant(weights)
 
     row_degrees = np.array(weights.sum(axis=1).T)[0]
-    col_degrees = np.array(weights.sum(axis=0).T)[0]
+    col_degrees = np.array(weights.sum(axis=0))[0]
     D = row_degrees + col_degrees
 
     counts = create_centered_counts(counts, model, num_umi)
 
-    eg2s = ((weights @ counts.T) ** 2).sum(axis=0)
+    # eg2s = ((weights @ counts.T) ** 2).sum(axis=0)
+    eg2s = (((weights @ counts.T) + (weights.T @ counts.T)) ** 2).sum(axis=0)
 
     results = compute_local_cov_pairs(counts, weights, eg2s)
 

@@ -112,6 +112,7 @@ def plot_interacting_cell_scores(
     figsize: Optional[tuple] = (10,10),
     cmap: Optional[str] = 'Reds',
     colorbar: Optional[bool] = True,
+    swap_y_axis: Optional[bool] = False,
 ):
     
     if isinstance(vmin, str) and 'p' not in vmin:
@@ -186,7 +187,7 @@ def plot_interacting_cell_scores(
         else:
             vmax_new = vmax
         
-        plot_interaction(adata, scores, interaction, ct_pair, coords_obsm_key, s, vmin_new, vmax_new, figsize, cmap, colorbar)
+        plot_interaction(adata, scores, interaction, ct_pair, coords_obsm_key, s, vmin_new, vmax_new, figsize, cmap, colorbar, swap_y_axis)
         plt.show()
         plt.close()
 
@@ -208,7 +209,7 @@ def sum_ct_pair_scores(adata):
     return
 
 
-def plot_interaction(adata, scores, interaction, ct_pair, coords_obsm_key, s, vmin, vmax, figsize, cmap, colorbar):
+def plot_interaction(adata, scores, interaction, ct_pair, coords_obsm_key, s, vmin, vmax, figsize, cmap, colorbar, swap_y_axis):
 
     if isinstance(adata.obsm[coords_obsm_key], pd.DataFrame):
         coords = adata.obsm[coords_obsm_key].values
@@ -218,7 +219,10 @@ def plot_interaction(adata, scores, interaction, ct_pair, coords_obsm_key, s, vm
     plt.figure(figsize=figsize)
     ax = plt.subplot(111)
     _prettify_axis(ax, spatial=True)
-    plt.scatter(coords[:,0], coords[:,1], c=scores[interaction], cmap=cmap, s=s, vmin=vmin, vmax=vmax)
+    if swap_y_axis:
+        plt.scatter(coords[:,0], -coords[:,1], c=scores[interaction], cmap=cmap, s=s, vmin=vmin, vmax=vmax)
+    else:
+        plt.scatter(coords[:,0], coords[:,1], c=scores[interaction], cmap=cmap, s=s, vmin=vmin, vmax=vmax)
     plt.title(f'Communication score: {interaction}; {ct_pair[0]} and {ct_pair[1]}') if ct_pair is not None else plt.title(f'Communication score: {interaction}')
     if colorbar:
         plt.colorbar()
@@ -238,6 +242,7 @@ def plot_NMF_results(
     figsize: Optional[tuple] = (10,10),
     cmap: Optional[str] = 'Reds',
     colorbar: Optional[bool] = True,
+    swap_y_axis: Optional[bool] = False,
 ):
     
     if isinstance(vmin, str) and 'p' not in vmin:
@@ -272,12 +277,12 @@ def plot_NMF_results(
         else:
             vmax_new = vmax
         
-        plot_factor(adata, W, factor, coords_obsm_key, s, vmin_new, vmax_new, figsize, cmap, colorbar)
+        plot_factor(adata, W, factor, coords_obsm_key, s, vmin_new, vmax_new, figsize, cmap, colorbar, swap_y_axis)
         plt.show()
         plt.close()
 
 
-def plot_factor(adata, W, factor, coords_obsm_key, s, vmin, vmax, figsize, cmap, colorbar):
+def plot_factor(adata, W, factor, coords_obsm_key, s, vmin, vmax, figsize, cmap, colorbar, swap_y_axis):
 
     if isinstance(adata.obsm[coords_obsm_key], pd.DataFrame):
         coords = adata.obsm[coords_obsm_key].values
@@ -287,7 +292,10 @@ def plot_factor(adata, W, factor, coords_obsm_key, s, vmin, vmax, figsize, cmap,
     plt.figure(figsize=figsize)
     ax = plt.subplot(111)
     _prettify_axis(ax, spatial=True)
-    plt.scatter(coords[:,0], coords[:,1], c=W[factor], cmap=cmap, s=s, vmin=vmin, vmax=vmax)
+    if swap_y_axis:
+        plt.scatter(coords[:,0], -coords[:,1], c=W[factor], cmap=cmap, s=s, vmin=vmin, vmax=vmax)
+    else:
+        plt.scatter(coords[:,0], coords[:,1], c=W[factor], cmap=cmap, s=s, vmin=vmin, vmax=vmax)
     plt.title(factor)
     if colorbar:
         plt.colorbar()
@@ -396,6 +404,213 @@ def plot_vision_de_results(
 
     return
 
+
+def plot_sig_mod_correlation(
+    adata,
+    x_rotation: Optional[int] = 0,
+    y_rotation: Optional[int] = 0,
+    use_FDR: Optional[bool] = True,
+    subset_signatures: Optional[list] = None,
+    subset_modules: Optional[list] = None,
+    cmap: Optional[str] = 'RdBu_r',
+):
+    
+    coef = adata.uns['sig_mod_correlation_coefs'] if 'sig_mod_correlation_coefs' in adata.uns.keys() else None
+    if use_FDR:
+        padj = adata.uns['sig_mod_correlation_FDR'] if 'sig_mod_correlation_FDR' in adata.uns.keys() else None
+    else:
+        padj = adata.uns['sig_mod_correlation_pvals'] if 'sig_mod_correlation_pvals' in adata.uns.keys() else None
+
+    if coef is None or padj is None:
+        raise ValueError('Run the "harreman.hs.integrate_vision_hotspot_results" function before plotting the results.')
+    
+    coef = coef.loc[subset_signatures] if subset_signatures is not None else coef
+    padj = padj.loc[subset_signatures] if subset_signatures is not None else padj
+    coef = coef[subset_modules] if subset_modules is not None else coef
+    padj = padj[subset_modules] if subset_modules is not None else padj
+    
+    coef = coef[padj < 0.05].dropna(how='all').copy()
+    padj = padj[padj < 0.05].dropna(how='all').copy()
+
+    coef.replace(np.nan, 0, inplace=True)
+    padj.replace(np.nan, 1, inplace=True)
+    
+    cmap = mpl.colormaps.get_cmap(cmap)
+    cmap.set_bad("gray")
+
+    g = sns.clustermap(coef, cmap=cmap, xticklabels=True, yticklabels=True, mask=padj > 0.05, center=0)
+
+    fig = plt.gcf()
+
+    for tick in g.ax_heatmap.get_xticklabels():
+        tick.set_rotation(x_rotation)
+    for tick in g.ax_heatmap.get_yticklabels():
+        tick.set_rotation(y_rotation)
+
+    padj = padj[g.data2d.columns]
+
+    for i, ix in enumerate(g.dendrogram_row.reordered_ind):
+        for j in range(len(coef.columns)):
+                text = g.ax_heatmap.text(
+                    j + 0.5,
+                    i + 0.5,
+                    "***" if padj.iloc[ix, j] < 0.0005 else "**"
+                    if padj.iloc[ix, j] < 0.005 else "*" if padj.iloc[ix, j] < 0.05 else '',
+                    ha="center",
+                    va="center",
+                    color="black",
+                )
+    
+    # Find the colorbar 'child' and modify
+    min_delta = 1e99
+    min_aa = None
+    for aa in fig.get_children():
+        try:
+            bbox = aa.get_position()
+            delta = (0-bbox.xmin)**2 + (1-bbox.ymax)**2
+            if delta < min_delta:
+                delta = min_delta
+                min_aa = aa
+        except AttributeError:
+            pass
+
+    label = 'Spearman R' if adata.uns['cor_method'] == 'spearman' else 'Pearson R'
+    min_aa.set_ylabel(label)
+    min_aa.yaxis.set_label_position("left")
+    
+    plt.show()
+
+
+def plot_sig_mod_enrichment(
+    adata,
+    x_rotation: Optional[int] = 0,
+    y_rotation: Optional[int] = 0,
+    use_FDR: Optional[bool] = True,
+    subset_signatures: Optional[list] = None,
+    subset_modules: Optional[list] = None,
+    cmap: Optional[str] = 'RdBu_r',
+):
+    
+    coef = adata.uns['sig_mod_enrichment_stats'] if 'sig_mod_enrichment_stats' in adata.uns.keys() else None
+    if use_FDR:
+        padj = adata.uns['sig_mod_enrichment_FDR'] if 'sig_mod_enrichment_FDR' in adata.uns.keys() else None
+    else:
+        padj = adata.uns['sig_mod_enrichment_pvals'] if 'sig_mod_enrichment_pvals' in adata.uns.keys() else None
+
+    if coef is None or padj is None:
+        raise ValueError('Run the "harreman.hs.integrate_vision_hotspot_results" function before plotting the results.')
+    
+    coef = coef.loc[subset_signatures] if subset_signatures is not None else coef
+    padj = padj.loc[subset_signatures] if subset_signatures is not None else padj
+    coef = coef[subset_modules] if subset_modules is not None else coef
+    padj = padj[subset_modules] if subset_modules is not None else padj
+    
+    coef = coef[padj < 0.05].T.dropna(how='all').copy()
+    padj = padj[padj < 0.05].T.dropna(how='all').copy()
+
+    coef.replace(np.nan, 0, inplace=True)
+    padj.replace(np.nan, 1, inplace=True)
+    
+    cmap = mpl.colormaps.get_cmap(cmap)
+    cmap.set_bad("gray")
+
+    g = sns.clustermap(coef, cmap=cmap, xticklabels=True, yticklabels=True, mask=padj > 0.05, center=0)
+
+    for tick in g.ax_heatmap.get_xticklabels():
+        tick.set_rotation(x_rotation)
+    for tick in g.ax_heatmap.get_yticklabels():
+        tick.set_rotation(y_rotation)
+
+    padj = padj[g.data2d.columns]
+
+    for i, ix in enumerate(g.dendrogram_row.reordered_ind):
+        for j in range(len(coef.columns)):
+                text = g.ax_heatmap.text(
+                    j + 0.5,
+                    i + 0.5,
+                    "***" if padj.iloc[ix, j] < 0.0005 else "**"
+                    if padj.iloc[ix, j] < 0.005 else "*" if padj.iloc[ix, j] < 0.05 else '',
+                    ha="center",
+                    va="center",
+                    color="black",
+                )
+
+
+def plot_interaction_module_correlation(
+    adata,
+    x_rotation: Optional[int] = 0,
+    y_rotation: Optional[int] = 0,
+    use_FDR: Optional[bool] = True,
+    subset_interactions: Optional[list] = None,
+    subset_modules: Optional[list] = None,
+    cmap: Optional[str] = 'RdBu_r',
+    figsize: Optional[tuple] = (10,10),
+):
+    
+    coef = adata.uns['interaction_module_correlation_coefs'].T if 'interaction_module_correlation_coefs' in adata.uns.keys() else None
+    if use_FDR:
+        padj = adata.uns['interaction_module_correlation_FDR'].T if 'interaction_module_correlation_FDR' in adata.uns.keys() else None
+    else:
+        padj = adata.uns['interaction_module_correlation_pvals'].T if 'interaction_module_correlation_pvals' in adata.uns.keys() else None
+
+    if coef is None or padj is None:
+        raise ValueError('Run the "harreman.tl.compute_interaction_module_correlation" function before plotting the results.')
+    
+    coef = coef.loc[subset_interactions] if subset_interactions is not None else coef
+    padj = padj.loc[subset_interactions] if subset_interactions is not None else padj
+    coef = coef[subset_modules] if subset_modules is not None else coef
+    padj = padj[subset_modules] if subset_modules is not None else padj
+    
+    coef = coef[padj < 0.05].dropna(how='all').copy()
+    padj = padj[padj < 0.05].dropna(how='all').copy()
+
+    coef.replace(np.nan, 0, inplace=True)
+    padj.replace(np.nan, 1, inplace=True)
+    
+    cmap = mpl.colormaps.get_cmap(cmap)
+    cmap.set_bad("gray")
+
+    g = sns.clustermap(coef, cmap=cmap, xticklabels=True, yticklabels=True, mask=padj > 0.05, center=0, figsize=figsize)
+
+    fig = plt.gcf()
+
+    for tick in g.ax_heatmap.get_xticklabels():
+        tick.set_rotation(x_rotation)
+    for tick in g.ax_heatmap.get_yticklabels():
+        tick.set_rotation(y_rotation)
+
+    padj = padj[g.data2d.columns]
+
+    for i, ix in enumerate(g.dendrogram_row.reordered_ind):
+        for j in range(len(coef.columns)):
+                text = g.ax_heatmap.text(
+                    j + 0.5,
+                    i + 0.5,
+                    "***" if padj.iloc[ix, j] < 0.0005 else "**"
+                    if padj.iloc[ix, j] < 0.005 else "*" if padj.iloc[ix, j] < 0.05 else '',
+                    ha="center",
+                    va="center",
+                    color="black",
+                )
+    
+    # Find the colorbar 'child' and modify
+    min_delta = 1e99
+    min_aa = None
+    for aa in fig.get_children():
+        try:
+            bbox = aa.get_position()
+            delta = (0-bbox.xmin)**2 + (1-bbox.ymax)**2
+            if delta < min_delta:
+                delta = min_delta
+                min_aa = aa
+        except AttributeError:
+            pass
+
+    label = 'Spearman R' if adata.uns['cor_method'] == 'spearman' else 'Pearson R'
+    min_aa.set_ylabel(label)
+    min_aa.yaxis.set_label_position("left")
+    
+    plt.show()
 
 
 # The code below has been replicated from cell2location (https://cell2location.readthedocs.io/en/latest/notebooks/cell2location_tutorial.html)

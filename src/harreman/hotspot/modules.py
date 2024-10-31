@@ -39,11 +39,14 @@ def calculate_module_scores(
     model = adata.uns['model']
 
     use_raw = layer_key == "use_raw"
-    modules = adata.uns["gene_modules_dict"]
+    modules = adata.uns["gene_modules_dict"].copy()
 
     umi_counts = adata.uns['umi_counts']
 
     modules_to_compute = sorted([x for x in modules.keys() if x != '-1'])
+    mod_list = [int(mod) for mod in modules_to_compute]
+    mod_list.sort()
+    modules_to_compute = [str(mod) for mod in mod_list]
 
     print(f"Computing scores for {len(modules_to_compute)} modules...")
 
@@ -67,7 +70,7 @@ def calculate_module_scores(
         else:
             raise ValueError('Invalid method: Please choose either "PCA" or "LDVAE".')
 
-        module_name = f'HOTSPOT_{module}'
+        module_name = f'HOTSPOT_{module}' if 'HOTSPOT_' not in module else module
         module_scores[module_name] = scores
         gene_loadings[module_name] = pd.Series(loadings, index=module_genes)
         gene_modules[module_name] = module_genes
@@ -93,7 +96,7 @@ def compute_scores_PCA(
     """
 
     weights = adata.obsp['weights']
-    # weights = make_weights_non_redundant(weights)
+    weights = make_weights_non_redundant(weights)
 
     counts_sub = counts_from_anndata(adata, layer_key, dense=True)
 
@@ -103,8 +106,10 @@ def compute_scores_PCA(
 
         counts_row = counts_sub[i, :]
         centered_row = create_centered_counts_row(counts_row, model, num_umi)
-        out = weights @ centered_row
-        weights_sum = np.array(weights.sum(axis=1).T)[0]
+        # out = weights @ centered_row
+        out = (weights @ centered_row) + (weights.T @ centered_row) # if make_weights_non_redundant is used
+        # weights_sum = np.array(weights.sum(axis=1).T)[0]
+        weights_sum = np.array(weights.sum(axis=1).T)[0] + np.array(weights.sum(axis=0))[0] # if make_weights_non_redundant is used
         weights_sum[weights_sum == 0] = 1
         out /= weights_sum
         centered_row = (out * _lambda) + ((1 - _lambda) * centered_row)
@@ -620,6 +625,8 @@ def integrate_vision_hotspot_results(
 
         if cor_method not in ['pearson', 'spearman']:
             raise ValueError(f'Invalid method: {cor_method}. Choose either "pearson" or "spearman".')
+        
+        adata.uns['cor_method'] = cor_method
 
         cor_coef_df, cor_pval_df, cor_FDR_df = compute_sig_mod_correlation(adata, cor_method)
         adata.uns["sig_mod_correlation_coefs"] = cor_coef_df

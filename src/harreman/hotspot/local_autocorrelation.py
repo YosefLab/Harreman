@@ -35,6 +35,7 @@ def compute_local_autocorrelation(
     genes: Optional[list] = None,
     use_metabolic_genes: bool = False,
     species: Optional[Union[Literal["mouse"], Literal["human"]]] = "mouse",
+    umi_counts_obs_key: Optional[str] = None,
 ):
 
     start = time.time()
@@ -60,14 +61,15 @@ def compute_local_autocorrelation(
     weights = adata.obsp['weights'].copy()
     genes = genes[~np.all(counts == 0, axis=1)]
     counts = counts[~np.all(counts == 0, axis=1)]
-    num_umi = np.array(counts.sum(axis=0))
+    num_umi = counts.sum(axis=0) if umi_counts_obs_key is None else adata.obs[umi_counts_obs_key]
+    num_umi = np.array(num_umi)
 
-    # weights = make_weights_non_redundant(weights)
+    weights = make_weights_non_redundant(weights)
 
     adata.uns['umi_counts'] = num_umi
 
     row_degrees = np.array(weights.sum(axis=1).T)[0]
-    col_degrees = np.array(weights.sum(axis=0).T)[0]
+    col_degrees = np.array(weights.sum(axis=0))[0]
     D = row_degrees + col_degrees
 
     Wtot2 = (weights.data ** 2).sum()
@@ -213,7 +215,7 @@ def _compute_hs_inner_fast(counts, weights, Wtot2, D):
 
     Z = [(G[i] - EG) / stdG for i in range(len(G))]
 
-    G_max = np.apply_along_axis(compute_local_cov_max, 0, counts.T, D)
+    G_max = np.apply_along_axis(compute_local_cov_max, 1, counts, D)
 
     C = (G - EG) / G_max
 

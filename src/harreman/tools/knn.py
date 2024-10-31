@@ -124,13 +124,10 @@ def compute_neighbors(
     coords = adata.obsm[compute_neighbors_on_key]
 
     if n_neighbors is not None:
-
-        nnbrs = NearestNeighbors(
-            n_neighbors=n_neighbors,
-            algorithm='ball_tree',
-            metric='euclidean'
-        ).fit(coords)
-        distances = nnbrs.kneighbors_graph(coords, mode='distance')
+        nbrs = NearestNeighbors(
+            n_neighbors=n_neighbors+1,
+            algorithm='ball_tree').fit(coords)
+        distances = nbrs.kneighbors_graph(coords, mode='distance')
 
     else:
         coords_tree = KDTree(coords)

@@ -13,7 +13,7 @@ import tensorly as tl
 from anndata import AnnData
 from numba import jit, njit
 from scipy.spatial.distance import squareform
-from scipy.stats import norm, zscore
+from scipy.stats import norm, zscore, pearsonr, spearmanr
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import scale
 from statsmodels.stats.multitest import multipletests
@@ -45,7 +45,7 @@ def apply_gene_filtering(
     adata.uns['expression_filt'] = expression_filt
     adata.uns['de_filt'] = de_filt
 
-    if ('gene_autocorrelation_results' not in adata.uns) and (autocorrelation_filt is True):
+    if autocorrelation_filt is True:
         compute_local_autocorrelation(
             adata,
             layer_key,
@@ -322,8 +322,9 @@ def compute_gene_pairs(
                 heterodimer_genes_list = heterodimer_info[heterodimer_info['Metabolite'] == metabolite]['Genes'].tolist()
                 for heterodimer_genes in heterodimer_genes_list:
                     metab_genes_red = [gene for gene in metab_genes if gene not in heterodimer_genes]
-                    metab_genes = metab_genes_red + tuple(heterodimer_genes) if all(gene in metab_genes for gene in heterodimer_genes) else metab_genes_red
+                    metab_genes = metab_genes_red + [tuple(heterodimer_genes)] if all(gene in metab_genes for gene in heterodimer_genes) else metab_genes_red
             all_pairs = list(set(itertools.combinations_with_replacement(metab_genes, 2)) | set(itertools.permutations(metab_genes, 2))) if ct_specific else list(set(itertools.combinations_with_replacement(metab_genes, 2)))
+            all_pairs = [(x if isinstance(x, str) else list(x), y if isinstance(y, str) else list(y)) for x, y in all_pairs]
         else:
             ligand = adata.uns['ligand'].loc[metabolite].dropna().tolist()
             ligand = ligand[0] if len(ligand) == 1 else ligand
@@ -2026,6 +2027,7 @@ def NMF_interacting_cell_scores(
     only_sig_values: Optional[bool] = False,
     use_FDR: Optional[bool] = True,
     n_factors: Optional[int] = 5,
+    normalize_values: Optional[bool] = True,
 ):
     
     if interaction_type not in ["metabolite", "gene_pair"]:
@@ -2038,6 +2040,9 @@ def NMF_interacting_cell_scores(
         X = adata.uns[f'interacting_cell_scores_{interaction_type_str}_sig_{sig_str}']
     else:
         X = adata.uns[f'interacting_cell_scores_{interaction_type_str}']
+    
+    if normalize_values:
+        X = X / X.sum(axis=0)
 
     nmf_model = NMF(n_components=n_factors, init='random', random_state=42)
 
@@ -2057,6 +2062,7 @@ def NMF_interacting_cell_scores(
     adata.uns["NMF_results"][NMF_results_key_H] = H
 
     return
+
 
 def compute_score_autocorrelation(
     adata: AnnData,
@@ -2103,6 +2109,67 @@ def compute_score_autocorrelation(
     adata.uns[f'{score}_autocorrelation_results'] = score_adata.uns['gene_autocorrelation_results']
     adata.uns[f'{score}_autocorrelation_results'].index.name = score
     
+    return
+
+
+def compute_interaction_module_correlation(
+    adata: AnnData,
+    cor_method: Optional[Union[Literal["pearson"], Literal["spearman"]]] = 'pearson',
+    interaction_type: Optional[Union[Literal["metabolite"], Literal["gene_pair"]]] = "metabolite",
+    only_sig_values: Optional[bool] = False,
+    use_FDR: Optional[bool] = True,
+):
+    
+    if cor_method not in ['pearson', 'spearman']:
+        raise ValueError(f'Invalid method: {cor_method}. Choose either "pearson" or "spearman".')
+    
+    adata.uns['cor_method'] = cor_method
+    
+    if interaction_type not in ["metabolite", "gene_pair"]:
+        raise ValueError('The "interaction_type" variable should be one of ["metabolite", "gene_pair"].')
+    
+    interaction_type_str = 'm' if interaction_type == 'metabolite' else 'gp'
+
+    if only_sig_values:
+        sig_str = 'FDR' if use_FDR else 'pval'
+        interaction_scores = adata.uns[f'interacting_cell_scores_{interaction_type_str}_sig_{sig_str}']
+    else:
+        interaction_scores = adata.uns[f'interacting_cell_scores_{interaction_type_str}']
+
+    metabolites = interaction_scores.columns.tolist()
+    modules = adata.obsm['module_scores'].columns.tolist()
+
+    cor_pval_df = pd.DataFrame(index=modules)
+    cor_coef_df = pd.DataFrame(index=modules)
+
+    for metab in metabolites:
+
+        correlation_values = []
+        pvals = []
+
+        for module in modules:
+
+            metab_df = interaction_scores[metab]
+            module_df = adata.obsm['module_scores'][module]
+
+            if cor_method == 'pearson':
+                correlation_value, pval = pearsonr(metab_df, module_df)
+            elif cor_method == 'spearman':
+                correlation_value, pval = spearmanr(metab_df, module_df)
+
+            correlation_values.append(correlation_value)
+            pvals.append(pval)
+
+        cor_coef_df[metab] = correlation_values
+        cor_pval_df[metab] = pvals
+
+    cor_FDR_values = multipletests(cor_pval_df.unstack().values, method='fdr_bh')[1]
+    cor_FDR_df = pd.Series(cor_FDR_values, index=cor_pval_df.stack().index).unstack()
+
+    adata.uns["interaction_module_correlation_coefs"] = cor_coef_df
+    adata.uns["interaction_module_correlation_pvals"] = cor_pval_df
+    adata.uns["interaction_module_correlation_FDR"] = cor_FDR_df
+
     return
 
 
