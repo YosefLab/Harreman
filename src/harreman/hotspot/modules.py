@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from ..vision.signature import compute_signatures_anndata
 from ..preprocessing.anndata import counts_from_anndata
-from .local_correlation import create_centered_counts_row
+from .local_correlation import create_centered_counts_row, create_centered_counts
 from ..tools.knn import make_weights_non_redundant
 
 
@@ -82,7 +82,7 @@ def calculate_module_scores(
 
     adata.obsm['module_scores'] = module_scores
     adata.varm['gene_loadings'] = gene_loadings
-    adata.uns["gene_modules_dict"] = gene_modules
+    adata.uns["gene_modules"] = gene_modules
 
     print("Finished computing scores in %.3f seconds" %(time.time()-start))
 
@@ -102,18 +102,14 @@ def compute_scores_PCA(
 
     cc_smooth = np.zeros_like(counts_sub, dtype=np.float64)
 
-    for i in range(counts_sub.shape[0]):
-
-        counts_row = counts_sub[i, :]
-        centered_row = create_centered_counts_row(counts_row, model, num_umi)
-        # out = weights @ centered_row
-        out = (weights @ centered_row) + (weights.T @ centered_row) # if make_weights_non_redundant is used
-        # weights_sum = np.array(weights.sum(axis=1).T)[0]
-        weights_sum = np.array(weights.sum(axis=1).T)[0] + np.array(weights.sum(axis=0))[0] # if make_weights_non_redundant is used
-        weights_sum[weights_sum == 0] = 1
-        out /= weights_sum
-        centered_row = (out * _lambda) + ((1 - _lambda) * centered_row)
-        cc_smooth[i] = centered_row
+    centered_row = create_centered_counts(counts_sub, model, num_umi)
+    # out = weights @ centered_row.T
+    out = (weights @ centered_row.T) + (centered_row @ weights).T # if make_weights_non_redundant is used
+    # weights_sum = np.array(weights.sum(axis=1).T)[0]
+    weights_sum = np.array(weights.sum(axis=1).T)[0] + np.array(weights.sum(axis=0))[0] # if make_weights_non_redundant is used
+    weights_sum[weights_sum == 0] = 1
+    out /= weights_sum[:, np.newaxis]
+    cc_smooth = (out.T * _lambda) + ((1 - _lambda) * centered_row)
 
     pca_data = cc_smooth
 

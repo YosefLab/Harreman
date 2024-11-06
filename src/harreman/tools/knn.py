@@ -13,7 +13,7 @@ import sparse
 from anndata import AnnData
 from numba import jit
 from pynndescent import NNDescent
-from scipy.sparse import csr_matrix, triu, lil_matrix
+from scipy.sparse import csr_matrix, triu, lil_matrix, coo_matrix
 from scipy.spatial import KDTree
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import normalize
@@ -100,7 +100,7 @@ def compute_knn_graph(
                 sample_key,
             )
 
-    if 'weights' not in adata.obsp and 'distances' in adata.obsp:
+    if 'distances' in adata.obsp:
         print("Computing the weights...")
         compute_weights(
             adata,
@@ -157,9 +157,11 @@ def compute_neighbors(
             not_sample_mask_ind = not_sample_mask[not_sample_mask].index.tolist()
             subset = distances.tolil()[sample_mask_ind,:][:,not_sample_mask_ind]
             if subset.nnz > 0:
-                raise ValueError(
-                    "The distance between cells from different samples should be 0."
-                )
+                distances_coo = distances.tocoo()
+                mask = np.isin(distances_coo.row, sample_mask_ind) & np.isin(distances_coo.col, not_sample_mask_ind)
+                distances_coo.data[mask] = 0
+                distances_coo = coo_matrix((distances_coo.data[distances_coo.data != 0], (distances_coo.row[distances_coo.data != 0], distances_coo.col[distances_coo.data != 0])), shape=distances_coo.shape)
+                distances = distances_coo.tocsr()
 
     adata.obsp["distances"] = distances
 
@@ -203,20 +205,20 @@ def compute_neighbors_from_distances(
 
     if sample_key is not None:
         samples = adata.obs[sample_key].unique().tolist()
-        sample_pairs = list(itertools.permutations(samples, 2))
-        for sample_pair in sample_pairs:
-            sample_1, sample_2 = sample_pair
-            sample_1_mask = adata.obs[sample_key] == sample_1
-            sample_1_mask = sample_1_mask.reset_index(drop=True)
-            sample_1_mask_ind = sample_1_mask[sample_1_mask].index.tolist()
-            sample_2_mask = adata.obs[sample_key] == sample_2
-            sample_2_mask = sample_2_mask.reset_index(drop=True)
-            sample_2_mask_ind = sample_2_mask[sample_2_mask].index.tolist()
-            subset = distances.tolil()[sample_1_mask_ind,:][:,sample_2_mask_ind]
+        for sample in samples:
+            sample_mask = adata.obs[sample_key] == sample
+            sample_mask = sample_mask.reset_index(drop=True)
+            sample_mask_ind = sample_mask[sample_mask].index.tolist()
+            not_sample_mask = adata.obs[sample_key] != sample
+            not_sample_mask = not_sample_mask.reset_index(drop=True)
+            not_sample_mask_ind = not_sample_mask[not_sample_mask].index.tolist()
+            subset = distances.tolil()[sample_mask_ind,:][:,not_sample_mask_ind]
             if subset.nnz > 0:
-                raise ValueError(
-                    "The distance between cells from different samples should be 0."
-                )
+                distances_coo = distances.tocoo()
+                mask = np.isin(distances_coo.row, sample_mask_ind) & np.isin(distances_coo.col, not_sample_mask_ind)
+                distances_coo.data[mask] = 0
+                distances_coo = coo_matrix((distances_coo.data[distances_coo.data != 0], (distances_coo.row[distances_coo.data != 0], distances_coo.col[distances_coo.data != 0])), shape=distances_coo.shape)
+                distances = distances_coo.tocsr()
 
     adata.obsp["distances"] = distances
 

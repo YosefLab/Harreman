@@ -43,7 +43,7 @@ def compute_local_correlation(
     counts = create_centered_counts(counts, model, num_umi)
 
     # eg2s = ((weights @ counts.T) ** 2).sum(axis=0)
-    eg2s = (((weights @ counts.T) + (weights.T @ counts.T)) ** 2).sum(axis=0)
+    eg2s = (((weights @ counts.T) + (counts @ weights).T) ** 2).sum(axis=0) # if make_weights_non_redundant is used
 
     results = compute_local_cov_pairs(counts, weights, eg2s)
 

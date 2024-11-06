@@ -141,7 +141,7 @@ def true_params_scaled(gene_p, umi_counts):
 def bernoulli_model_linear(gene_detects, umi_counts):
 
     # We modify the 0 UMI counts to 0.001 to remove the NaN values from the qcut output.
-    umi_counts[umi_counts == 0] = 0.01
+    # umi_counts[umi_counts == 0] = 0.01
     
     umi_count_bins, bins = pd.qcut(
         np.log10(umi_counts), N_BIN_TARGET, labels=False, retbins=True,
