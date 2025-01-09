@@ -7,6 +7,7 @@ from numba import jit, njit
 from scipy.stats import norm
 from scipy.sparse import csr_matrix
 from statsmodels.stats.multitest import multipletests
+from tqdm import tqdm
 
 from . import models
 from ..preprocessing.anndata import counts_from_anndata
@@ -33,9 +34,11 @@ def compute_local_autocorrelation(
     database_varm_key: Optional[str] = None,
     model: Optional[str] = None,
     genes: Optional[list] = None,
-    use_metabolic_genes: bool = False,
+    use_metabolic_genes: Optional[bool] = False,
     species: Optional[Union[Literal["mouse"], Literal["human"]]] = "mouse",
     umi_counts_obs_key: Optional[str] = None,
+    permutation_test: Optional[bool] = False,
+    M: Optional[int] = 1000,
 ):
 
     start = time.time()
@@ -63,6 +66,9 @@ def compute_local_autocorrelation(
     counts = counts[~np.all(counts == 0, axis=1)]
     num_umi = counts.sum(axis=0) if umi_counts_obs_key is None else adata.obs[umi_counts_obs_key]
     num_umi = np.array(num_umi)
+    
+    adata.var['local_autocorrelation'] = False
+    adata.var['local_autocorrelation'].loc[genes] = True
 
     weights = make_weights_non_redundant(weights)
 
@@ -77,17 +83,34 @@ def compute_local_autocorrelation(
     def center_vals_f(x):
         return center_values_total(x, num_umi, model)
     counts = np.apply_along_axis(lambda x: center_vals_f(x)[np.newaxis], 1, counts).squeeze(axis=1)
-
-    results = _compute_hs_inner_fast(counts, weights, Wtot2, D)
-    results = pd.DataFrame(results, index=["G", "G_max", "EG", "stdG", "Z", "C"], columns=genes).T
-
-    results["Pval"] = norm.sf(results["Z"].values)
-    results["FDR"] = multipletests(results["Pval"], method="fdr_bh")[1]
+    
+    G = (counts.T * (weights @ counts.T)).sum(axis=0)
+    G_max = np.apply_along_axis(compute_local_cov_max, 1, counts, D)
+    
+    results = compute_autocor_Z_scores(G, G_max, Wtot2)
+    variables = ["G", "G_max", "EG", "stdG", "Z", "C"]
+    results = pd.DataFrame(results, index=variables, columns=genes).T
+    
+    results["Z_Pval"] = norm.sf(results["Z"].values)
+    results["Z_FDR"] = multipletests(results["Z_Pval"], method="fdr_bh")[1]
+    
+    if permutation_test:
+        perm_array = np.zeros((counts.shape[0], M)).astype(np.float16)
+        for i in tqdm(range(M)):
+            idx = np.random.permutation(counts.shape[1])
+            counts = counts[:, idx]
+            perm_array[:, i] = (counts.T * (weights @ counts.T)).sum(axis=0)
+        
+        x = np.sum(perm_array > G[:, np.newaxis], axis=1)
+        pvals = (x + 1) / (M + 1)
+        
+        results["Perm_Pval"] = pvals
+        results["Perm_FDR"] = multipletests(results["Perm_Pval"], method="fdr_bh")[1]
 
     results = results.sort_values("Z", ascending=False)
     results.index.name = "Gene"
 
-    results = results[["C", "Z", "Pval", "FDR"]]
+    results = results[["C", "Z", "Z_Pval", "Z_FDR", "Perm_Pval", "Perm_FDR"]] if permutation_test else results[["C", "Z", "Z_Pval", "Z_FDR"]]
 
     adata.uns['gene_autocorrelation_results'] = results
 
@@ -205,17 +228,13 @@ def center_values_total(vals, num_umi, model):
     return centered_vals
 
 
-def _compute_hs_inner_fast(counts, weights, Wtot2, D):
-
-    G = (counts.T * (weights @ counts.T)).sum(axis=0)
+def compute_autocor_Z_scores(G, G_max, Wtot2):
 
     EG, EG2 = 0, Wtot2
 
     stdG = (EG2 - EG * EG) ** 0.5
 
     Z = [(G[i] - EG) / stdG for i in range(len(G))]
-
-    G_max = np.apply_along_axis(compute_local_cov_max, 1, counts, D)
 
     C = (G - EG) / G_max
 

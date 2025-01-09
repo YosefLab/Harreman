@@ -16,11 +16,11 @@ def danb_model(gene_counts, umi_counts):
 
     mu = tj*tis/total
     vv = (gene_counts - mu).var()*(N/(N-1))
+    # vv = ((gene_counts - mu)**2).sum()
     my_rowvar = vv
 
-    # size = (tj**2) * (tis**2).sum()/total**2 / ((N-1)*my_rowvar-tj)
-    # regroup terms to protect against overflow errors
     size = ((tj**2) / total) * ((tis**2).sum() / total) / ((N-1)*my_rowvar-tj)
+    # size = ((tj**2) * ((tis/total)**2).sum()) / ((N-1)*my_rowvar-tj)
 
     if size < 0:    # Can't have negative dispersion
         size = 1e9
@@ -140,8 +140,8 @@ def true_params_scaled(gene_p, umi_counts):
 
 def bernoulli_model_linear(gene_detects, umi_counts):
 
-    # We modify the 0 UMI counts to 0.001 to remove the NaN values from the qcut output.
-    # umi_counts[umi_counts == 0] = 0.01
+    # We modify the 0 UMI counts to 1e-10 to remove the NaN values from the qcut output.
+    umi_counts[umi_counts == 0] = 1e-10
     
     umi_count_bins, bins = pd.qcut(
         np.log10(umi_counts), N_BIN_TARGET, labels=False, retbins=True,

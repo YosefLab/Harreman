@@ -18,10 +18,11 @@ def local_correlation_plot(
     vmax=10,
     z_cmap='RdBu_r',
     yticklabels=False,
+    use_super_modules=False,
 ):
     
     local_correlation_z = adata.uns["lc_zs"]
-    modules = adata.uns["gene_modules"]
+    modules = adata.uns["super_modules"] if use_super_modules else adata.uns["modules"]
     linkage = adata.uns["linkage"]
 
     row_colors = None
@@ -95,6 +96,89 @@ def local_correlation_plot(
     min_aa.set_ylabel('Z-Scores')
     min_aa.yaxis.set_label_position("left")
 
+
+def average_local_correlation_plot(
+    adata: AnnData,
+    mod_cmap='tab10',
+    vmin=-10,
+    vmax=10,
+    z_cmap='RdBu_r',
+    yticklabels=False,
+):
+    
+    local_correlation_z = adata.uns["lc_zs"]
+    modules = adata.uns["modules"]
+    
+    avg_local_correlation_z = local_correlation_z.copy()
+    avg_local_correlation_z['module_row'] = modules
+    avg_local_correlation_z = avg_local_correlation_z.set_index('module_row', append=True)
+    avg_local_correlation_z.columns = pd.MultiIndex.from_arrays([modules[avg_local_correlation_z.columns].values, avg_local_correlation_z.columns])
+
+    avg_local_correlation_z = avg_local_correlation_z.groupby(level=1).mean().groupby(level=0, axis=1).mean()
+    avg_local_correlation_z = avg_local_correlation_z.loc[avg_local_correlation_z.index != -1, avg_local_correlation_z.columns != -1]
+
+    row_colors = None
+    colors = list(plt.get_cmap(mod_cmap).colors)
+    module_colors = {i: colors[(i-1) % len(colors)] for i in modules.unique()}
+    module_colors[-1] = '#ffffff'
+
+    row_colors = pd.DataFrame({
+        "Modules": module_colors,
+    })
+
+    cm = sns.clustermap(
+        avg_local_correlation_z,
+        vmin=vmin,
+        vmax=vmax,
+        cmap=z_cmap,
+        xticklabels=False,
+        yticklabels=yticklabels,
+        row_colors=row_colors,
+        rasterized=True,
+    )
+
+    fig = plt.gcf()
+    plt.sca(cm.ax_heatmap)
+    plt.ylabel("")
+    plt.xlabel("")
+
+    cm.ax_row_dendrogram.remove()
+
+    reordered_indices = cm.dendrogram_row.reordered_ind
+    mod_reordered = [avg_local_correlation_z.index[i] for i in reordered_indices]
+
+    mod_map = {}
+    y = np.arange(len(mod_reordered))
+
+    for x in mod_reordered:
+        if x == -1:
+            continue
+
+        mod_map[x] = y[mod_reordered == x].mean() + 0.5
+
+    plt.sca(cm.ax_row_colors)
+    for mod, mod_y in mod_map.items():
+        plt.text(-.5, y=mod_y, s="Module {}".format(mod),
+                    horizontalalignment='right',
+                    verticalalignment='center')
+    plt.xticks([])
+
+    # Find the colorbar 'child' and modify
+    min_delta = 1e99
+    min_aa = None
+    for aa in fig.get_children():
+        try:
+            bbox = aa.get_position()
+            delta = (0-bbox.xmin)**2 + (1-bbox.ymax)**2
+            if delta < min_delta:
+                delta = min_delta
+                min_aa = aa
+        except AttributeError:
+            pass
+
+    min_aa.set_ylabel('Avg. local correlation Z')
+    min_aa.yaxis.set_label_position("left")
+
     plt.show()
 
 
@@ -106,6 +190,8 @@ def plot_interacting_cell_scores(
     coords_obsm_key: Optional[str] = None,
     only_sig_values: Optional[bool] = False,
     use_FDR: Optional[bool] = True,
+    normalize_values: Optional[bool] = False,
+    use_zscored_values: Optional[bool] = False,
     s: Optional[float] = None,
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
@@ -123,6 +209,8 @@ def plot_interacting_cell_scores(
     if deconv_adata is not None:
         adata.uns['interacting_cell_scores_gp'] = deconv_adata.uns['interacting_cell_scores_gp']
         adata.uns['interacting_cell_scores_m'] = deconv_adata.uns['interacting_cell_scores_m']
+        adata.uns['interacting_cell_scores_gp_zscore'] = deconv_adata.uns['interacting_cell_scores_gp_zscore']
+        adata.uns['interacting_cell_scores_m_zscore'] = deconv_adata.uns['interacting_cell_scores_m_zscore']
         if only_sig_values:
             adata.uns['interacting_cell_scores_gp_sig'] = deconv_adata.uns['interacting_cell_scores_gp_sig']
             adata.uns['interacting_cell_scores_m_sig'] = deconv_adata.uns['interacting_cell_scores_m_sig']
@@ -135,8 +223,8 @@ def plot_interacting_cell_scores(
             interacting_cell_scores_gp = adata.uns['interacting_cell_scores_gp_sig_pval']
             interacting_cell_scores_m = adata.uns['interacting_cell_scores_m_sig_pval']
     else:
-        interacting_cell_scores_gp = adata.uns['interacting_cell_scores_gp']
-        interacting_cell_scores_m = adata.uns['interacting_cell_scores_m']
+        interacting_cell_scores_gp = adata.uns['interacting_cell_scores_gp_zscore'] if use_zscored_values else adata.uns['interacting_cell_scores_gp']
+        interacting_cell_scores_m = adata.uns['interacting_cell_scores_m_zscore'] if use_zscored_values else adata.uns['interacting_cell_scores_m']
     
     if interactions is None:
         raise ValueError("Please provide a LR pair or a metabolite.")
@@ -174,6 +262,11 @@ def plot_interacting_cell_scores(
             scores = adata.uns['combined_cell_scores'][interactions]
     else:
         scores = interacting_cell_scores[ct_pair][interactions]
+    
+    if normalize_values and use_zscored_values:
+        raise ValueError('Choose either "normalize_values" or "use_zscored_values".') 
+    elif normalize_values and not use_zscored_values:
+        scores = scores.apply(lambda x: (x - x.min()) / (x.max() - x.min()), axis=0) #We apply min-max normalization
     
     for interaction in interactions:
         if isinstance(vmin, str):
@@ -216,8 +309,9 @@ def plot_interaction(adata, scores, interaction, ct_pair, coords_obsm_key, s, vm
     else:
         coords = adata.obsm[coords_obsm_key]
     
-    plt.figure(figsize=figsize)
+    # plt.figure(figsize=figsize)
     ax = plt.subplot(111)
+    ax.set_aspect('equal', adjustable='box')
     _prettify_axis(ax, spatial=True)
     if swap_y_axis:
         plt.scatter(coords[:,0], -coords[:,1], c=scores[interaction], cmap=cmap, s=s, vmin=vmin, vmax=vmax)
@@ -545,6 +639,7 @@ def plot_interaction_module_correlation(
     subset_modules: Optional[list] = None,
     cmap: Optional[str] = 'RdBu_r',
     figsize: Optional[tuple] = (10,10),
+    threshold: Optional[float] = None,
 ):
     
     coef = adata.uns['interaction_module_correlation_coefs'].T if 'interaction_module_correlation_coefs' in adata.uns.keys() else None
@@ -567,6 +662,10 @@ def plot_interaction_module_correlation(
     coef.replace(np.nan, 0, inplace=True)
     padj.replace(np.nan, 1, inplace=True)
     
+    if threshold:
+        padj = padj[(coef > threshold).any(axis=1)]
+        coef = coef[(coef > threshold).any(axis=1)]
+    
     cmap = mpl.colormaps.get_cmap(cmap)
     cmap.set_bad("gray")
 
@@ -583,15 +682,15 @@ def plot_interaction_module_correlation(
 
     for i, ix in enumerate(g.dendrogram_row.reordered_ind):
         for j in range(len(coef.columns)):
-                text = g.ax_heatmap.text(
-                    j + 0.5,
-                    i + 0.5,
-                    "***" if padj.iloc[ix, j] < 0.0005 else "**"
-                    if padj.iloc[ix, j] < 0.005 else "*" if padj.iloc[ix, j] < 0.05 else '',
-                    ha="center",
-                    va="center",
-                    color="black",
-                )
+            text = g.ax_heatmap.text(
+                j + 0.5,
+                i + 0.5,
+                "***" if padj.iloc[ix, j] < 0.0005 else "**"
+                if padj.iloc[ix, j] < 0.005 else "*" if padj.iloc[ix, j] < 0.05 else '',
+                ha="center",
+                va="center",
+                color="black",
+            )
     
     # Find the colorbar 'child' and modify
     min_delta = 1e99
@@ -780,8 +879,8 @@ def plot_spatial_general(
 
     """
 
-    if value_df.shape[1] > 7:
-        raise ValueError("Maximum of 7 cell types / factors can be plotted at the moment")
+    # if value_df.shape[1] > 7:
+    #     raise ValueError("Maximum of 7 cell types / factors can be plotted at the moment")
 
     def create_colormap(R, G, B):
         spacing = int(white_spacing * 2.55)
@@ -801,18 +900,32 @@ def plot_spatial_general(
 
         return ListedColormap(vals)
 
+    # # Create linearly scaled colormaps
+    # YellowCM = create_colormap(240, 228, 66)  # #F0E442 
+    # RedCM = create_colormap(213, 94, 0)  # #D55E00
+    # BlueCM = create_colormap(86, 180, 233)  # #56B4E9
+    # GreenCM = create_colormap(0, 158, 115)  # #009E73
+    # GreyCM = create_colormap(200, 200, 200)  # #C8C8C8
+    # WhiteCM = create_colormap(50, 50, 50)  # #323232
+    # PurpleCM = create_colormap(90, 20, 165)  # #5A14A5
+
     # Create linearly scaled colormaps
-    YellowCM = create_colormap(240, 228, 66)  # #F0E442 ['#F0E442', '#D55E00', '#56B4E9',
-    # '#009E73', '#5A14A5', '#C8C8C8', '#323232']
-    RedCM = create_colormap(213, 94, 0)  # #D55E00
-    BlueCM = create_colormap(86, 180, 233)  # #56B4E9
-    GreenCM = create_colormap(0, 158, 115)  # #009E73
-    GreyCM = create_colormap(200, 200, 200)  # #C8C8C8
-    WhiteCM = create_colormap(50, 50, 50)  # #323232
-    PurpleCM = create_colormap(90, 20, 165)  # #5A14A5
+    BlueCM = create_colormap(31, 119, 180)  #1f77b4 
+    OrangeCM = create_colormap(255, 127, 14)  #ff7f0e
+    GreenCM = create_colormap(44, 160, 44)  #2ca02c
+    RedCM = create_colormap(214, 39, 40)  #d62728
+    PurpleCM = create_colormap(148, 103, 189)  #9467bd
+    BrownCM = create_colormap(140, 86, 75)  #8c564b
+    PinkCM = create_colormap(227, 119, 194)  #e377c2
+    GreyCM = create_colormap(127, 127, 127)  #7f7f7f
+    YellowCM = create_colormap(188, 189, 34)  #bcbd22
+    LightBlueCM = create_colormap(23, 190, 207)  #17becf
+    BlackCM = create_colormap(50, 50, 50)  #323232
 
-    cmaps = [RedCM, BlueCM, YellowCM, GreenCM, PurpleCM, GreyCM, WhiteCM]
+    # cmaps = [RedCM, BlueCM, YellowCM, GreenCM, PurpleCM, GreyCM, WhiteCM]
+    cmaps = [BlueCM, OrangeCM, GreenCM, RedCM, PurpleCM, BrownCM, PinkCM, GreyCM, YellowCM, LightBlueCM, BlackCM]
 
+    reorder_cmap = range(len(cmaps))
     cmaps = [cmaps[i] for i in reorder_cmap]
 
     with mpl.style.context(style):
@@ -898,6 +1011,8 @@ def plot_spatial_general(
 
         colors = np.zeros((*counts.shape, 4))
         weights = np.zeros(counts.shape)
+        
+        max_col = tuple([np.inf for i in range(len(cmaps))])
 
         for c in c_ord:
             min_color_intensity = counts[:, c].min()

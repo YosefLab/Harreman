@@ -6,7 +6,7 @@ import scvi
 from anndata import AnnData
 from scipy.cluster.hierarchy import linkage
 from scipy.spatial.distance import squareform
-from scipy.stats import hypergeom, norm, pearsonr, spearmanr
+from scipy.stats import hypergeom, norm, pearsonr, spearmanr, zscore
 from sklearn.decomposition import PCA
 from statsmodels.stats.multitest import multipletests
 from tqdm import tqdm
@@ -70,7 +70,7 @@ def calculate_module_scores(
         else:
             raise ValueError('Invalid method: Please choose either "PCA" or "LDVAE".')
 
-        module_name = f'HOTSPOT_{module}' if 'HOTSPOT_' not in module else module
+        module_name = f'Module {module}' if 'Module' not in module else module
         module_scores[module_name] = scores
         gene_loadings[module_name] = pd.Series(loadings, index=module_genes)
         gene_modules[module_name] = module_genes
@@ -84,7 +84,7 @@ def calculate_module_scores(
     adata.varm['gene_loadings'] = gene_loadings
     adata.uns["gene_modules"] = gene_modules
 
-    print("Finished computing scores in %.3f seconds" %(time.time()-start))
+    print("Finished computing module scores in %.3f seconds" %(time.time()-start))
 
     return
 
@@ -103,10 +103,8 @@ def compute_scores_PCA(
     cc_smooth = np.zeros_like(counts_sub, dtype=np.float64)
 
     centered_row = create_centered_counts(counts_sub, model, num_umi)
-    # out = weights @ centered_row.T
-    out = (weights @ centered_row.T) + (centered_row @ weights).T # if make_weights_non_redundant is used
-    # weights_sum = np.array(weights.sum(axis=1).T)[0]
-    weights_sum = np.array(weights.sum(axis=1).T)[0] + np.array(weights.sum(axis=0))[0] # if make_weights_non_redundant is used
+    out = (weights + weights.T) @ centered_row.T
+    weights_sum = np.array(weights.sum(axis=1).T)[0] + np.array(weights.sum(axis=0))[0]
     weights_sum[weights_sum == 0] = 1
     out /= weights_sum[:, np.newaxis]
     cc_smooth = (out.T * _lambda) + ((1 - _lambda) * centered_row)
@@ -415,7 +413,7 @@ def assign_modules_core(Z, leaf_labels, offset, MIN_THRESHOLD=10, Z_THRESHOLD=3)
 
 def create_modules(
     adata: Union[str, AnnData],
-    min_gene_threshold: Optional[int] = 15,
+    min_gene_threshold: Optional[int] = 20,
     fdr_threshold: Optional[float] = 0.05,
     z_threshold: Optional[float] = None,
     core_only: bool = False,
@@ -491,7 +489,7 @@ def create_modules(
     for mod in out_clusters.unique():
         gene_modules_dict[str(mod)] = out_clusters[out_clusters == mod].index.tolist()
 
-    adata.uns["gene_modules"] = out_clusters
+    adata.uns["modules"] = out_clusters
     adata.uns["gene_modules_dict"] = gene_modules_dict
     adata.uns["linkage"] = linkage_out
 
@@ -500,13 +498,15 @@ def create_modules(
     return
 
 
-def compute_sig_mod_enrichment(adata, norm_data_key, signature_varm_key):
+def compute_sig_mod_enrichment(adata, norm_data_key, signature_varm_key, use_super_modules):
+    
+    gene_modules_key = "gene_modules_sm" if use_super_modules else "gene_modules"
 
     use_raw = norm_data_key == "use_raw"
     genes = adata.raw.var.index if use_raw else adata.var_names
 
     sig_matrix = adata.varm[signature_varm_key] if not use_raw else adata.raw.varm[signature_varm_key]
-    gene_modules = adata.uns["gene_modules_dict"]
+    gene_modules = adata.uns[gene_modules_key]
 
     signatures = {}
 
@@ -530,6 +530,11 @@ def compute_sig_mod_enrichment(adata, norm_data_key, signature_varm_key):
     stats_df = pd.DataFrame(np.nan, index=list(signatures.keys()), columns=list(gene_modules.keys()))
 
     sig_mod_df = pd.DataFrame(index=genes)
+    
+    universe = adata.var_names[adata.var['local_autocorrelation'] == True].tolist()
+    
+    # We make sure that the genes present in the signature are just the ones included in the universe
+    signatures = {sig: [gene for gene in genes if gene in universe] for sig, genes in signatures.items()}
 
     for signature in signatures.keys():
 
@@ -540,7 +545,7 @@ def compute_sig_mod_enrichment(adata, norm_data_key, signature_varm_key):
             mod_genes = gene_modules[module]
             sig_mod_genes = list(set(sig_genes) & set(mod_genes))
 
-            M = len(genes)
+            M = len(universe)
             n = len(sig_genes)
             N = len(mod_genes)
             x = len(sig_mod_genes)
@@ -566,10 +571,12 @@ def compute_sig_mod_enrichment(adata, norm_data_key, signature_varm_key):
     return pvals_df, stats_df, FDR_df
 
 
-def compute_sig_mod_correlation(adata, method):
+def compute_sig_mod_correlation(adata, method, use_super_modules):
+    
+    module_scores_key = "super_module_scores" if use_super_modules else "module_scores"
 
     signatures = adata.obsm['vision_signatures'].columns.tolist()
-    modules = adata.obsm['module_scores'].columns.tolist()
+    modules = adata.obsm[module_scores_key].columns.tolist()
 
     cor_pval_df = pd.DataFrame(index=modules)
     cor_coef_df = pd.DataFrame(index=modules)
@@ -582,7 +589,7 @@ def compute_sig_mod_correlation(adata, method):
         for module in modules:
 
             signature_df = adata.obsm['vision_signatures'][signature]
-            module_df = adata.obsm['module_scores'][module]
+            module_df = adata.obsm[module_scores_key][module]
 
             if method == 'pearson':
                 correlation_value, pval = pearsonr(signature_df, module_df)
@@ -604,9 +611,12 @@ def compute_sig_mod_correlation(adata, method):
 def integrate_vision_hotspot_results(
     adata: AnnData,
     cor_method: Optional[Union[Literal["pearson"], Literal["spearman"]]] = 'pearson',
+    use_super_modules: Optional[bool] = False,
 ):
+    
+    gene_modules_key = "gene_modules_sm" if use_super_modules else "gene_modules"
 
-    if ("vision_signatures" in adata.obsm) and (len(adata.uns["gene_modules_dict"].keys()) > 0):
+    if ("vision_signatures" in adata.obsm) and (len(adata.uns[gene_modules_key].keys()) > 0):
 
         start = time.time()
         print("Integrating VISION and Hotspot results...")
@@ -614,7 +624,7 @@ def integrate_vision_hotspot_results(
         norm_data_key = adata.uns['norm_data_key']
         signature_varm_key = adata.uns['signature_varm_key']
 
-        pvals_df, stats_df, FDR_df = compute_sig_mod_enrichment(adata, norm_data_key, signature_varm_key)
+        pvals_df, stats_df, FDR_df = compute_sig_mod_enrichment(adata, norm_data_key, signature_varm_key, use_super_modules)
         adata.uns["sig_mod_enrichment_stats"] = stats_df
         adata.uns["sig_mod_enrichment_pvals"] = pvals_df
         adata.uns["sig_mod_enrichment_FDR"] = FDR_df
@@ -624,7 +634,7 @@ def integrate_vision_hotspot_results(
         
         adata.uns['cor_method'] = cor_method
 
-        cor_coef_df, cor_pval_df, cor_FDR_df = compute_sig_mod_correlation(adata, cor_method)
+        cor_coef_df, cor_pval_df, cor_FDR_df = compute_sig_mod_correlation(adata, cor_method, use_super_modules)
         adata.uns["sig_mod_correlation_coefs"] = cor_coef_df
         adata.uns["sig_mod_correlation_pvals"] = cor_pval_df
         adata.uns["sig_mod_correlation_FDR"] = cor_FDR_df
@@ -640,5 +650,102 @@ def integrate_vision_hotspot_results(
 
     else:
         raise ValueError('Please make sure VISION has been run and Hotspot has identified at least one module.')
+
+    return
+
+
+def compute_top_scoring_modules(
+    adata: AnnData,
+    sd: Optional[float] = 1,
+    use_super_modules: Optional[bool] = False,
+):    
+    
+    MODULE_KEY = 'super_module_scores' if use_super_modules else 'module_scores'
+    
+    df = zscore(adata.obsm[MODULE_KEY], axis=0)
+
+    top_scoring_modules = pd.Series(index = df.index)
+    for mod_id, row in df.iterrows():
+        above_threshold_low = row > 0
+        above_threshold = row > sd
+        if above_threshold.sum() == 1:
+            top_scoring_modules[mod_id] = above_threshold.idxmax()
+        else:
+            highest_module = row[above_threshold].idxmax() if above_threshold.sum() > 1 else row.idxmax() if above_threshold_low.sum() > 0 else np.nan
+            top_scoring_modules[mod_id] = highest_module
+        
+    return top_scoring_modules
+
+
+def calculate_super_module_scores(
+    adata: AnnData,
+    method: Optional[Union[Literal["mean"], Literal["PCA"], Literal["LDVAE"]]] = 'PCA',
+    super_module_dict: dict = None,
+):
+
+    start = time.time()
+
+    gene_modules = adata.uns["gene_modules"]
+    
+    reverse_mapping = {value: key for key, values in super_module_dict.items() for value in values}
+    adata.uns["super_modules"] = adata.uns["modules"].replace(reverse_mapping)
+
+    if method == 'mean':
+        module_scores = adata.obsm['module_scores']
+
+        super_module_scores = pd.DataFrame(index=module_scores.index)
+        gene_modules_sm = {}
+        for sm, modules in super_module_dict.items():
+            super_module = f'Module {sm}'
+            modules = [f'Module {str(mod)}' for mod in modules]
+            super_module_scores[super_module] = module_scores[modules].mean(axis=1)
+            gene_modules_sm[super_module] = [item for key in modules for item in gene_modules.get(key, [])]
+    
+    else:
+        layer_key = adata.uns['layer_key']
+        model = adata.uns['model']
+
+        use_raw = layer_key == "use_raw"
+
+        umi_counts = adata.uns['umi_counts']
+
+        print(f"Computing scores for {len(super_module_dict.keys())} super-modules...")
+
+        super_module_scores = {}
+        gene_loadings_sm = pd.DataFrame(index=adata.var_names)
+        gene_modules_sm = {}
+        for sm, modules in tqdm(super_module_dict.items()):
+            super_module = f'Module {sm}'
+            modules = [f'Module {str(mod)}' for mod in modules]
+            super_module_genes = [item for key in modules for item in gene_modules.get(key, [])]
+            
+            if method == 'PCA':
+                scores, loadings = compute_scores_PCA(
+                    adata[:, super_module_genes],
+                    layer_key,
+                    model,
+                    umi_counts,
+                )
+            elif method == 'LDVAE':
+                scores, loadings = compute_scores_LDVAE(
+                    adata[:, super_module_genes],
+                )
+            else:
+                raise ValueError('Invalid method: Please choose either "mean", "PCA", or "LDVAE".')
+
+            super_module_scores[super_module] = scores
+            gene_loadings_sm[super_module] = pd.Series(loadings, index=super_module_genes)
+            gene_modules_sm[super_module] = super_module_genes
+
+
+        super_module_scores = pd.DataFrame(super_module_scores)
+        super_module_scores.index = adata.obs_names if not use_raw else adata.raw.obs.index
+
+        adata.varm['gene_loadings_sm'] = gene_loadings_sm
+
+    adata.obsm['super_module_scores'] = super_module_scores
+    adata.uns["gene_modules_sm"] = gene_modules_sm
+
+    print("Finished computing super-module scores in %.3f seconds" %(time.time()-start))
 
     return

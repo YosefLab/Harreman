@@ -135,9 +135,13 @@ def setup_deconv_adata(
 # The code below has been adapted from the SpatialDM package.
 
 def modify_uns_hotspot(adata):
-    if 'gene_modules' in adata.uns.keys():
-        adata.var['gene_modules'] = adata.uns['gene_modules']
-        del adata.uns['gene_modules']
+    if 'modules' in adata.uns.keys():
+        adata.var['modules'] = adata.uns['modules']
+        del adata.uns['modules']
+    
+    if 'super_modules' in adata.uns.keys():
+        adata.var['super_modules'] = adata.uns['super_modules']
+        del adata.uns['super_modules']
     
     if 'lc_zs' in adata.uns.keys():
         genes = [' - '.join(gene) if isinstance(gene, tuple) else gene for gene in adata.uns['lc_zs'].columns]
@@ -179,7 +183,7 @@ def modify_uns_harreman(adata):
     if 'gene_pairs_per_ct_pair_ind' in adata.uns.keys():
         adata.uns['gene_pairs_per_ct_pair_ind'] = {key: [(num, ' - '.join(map(str, val)) if isinstance(val, list) else val) for num, val in tuples_list] for key, tuples_list in adata.uns['gene_pairs_per_ct_pair_ind'].items()}
         adata.uns['gene_pairs_per_ct_pair_ind'] = {' - '.join(key): value for key, value in adata.uns['gene_pairs_per_ct_pair_ind'].items()}
-    
+
     if 'ccc_results' in adata.uns.keys():
         adata.uns['ccc_results']['cell_com_df'] = adata.uns['ccc_results']['cell_com_df'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
         adata.uns['ccc_results']['cell_com_df_sig'] = adata.uns['ccc_results']['cell_com_df_sig'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)

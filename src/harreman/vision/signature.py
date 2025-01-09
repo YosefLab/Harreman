@@ -145,11 +145,53 @@ def compute_sig_pvals(c_prime, i, random_c_prime, clusters, random_clusters):
     return pval
 
 
-def signatures_from_gmt(
+def list_available_signatures(
+    species: Optional[Union[Literal["mouse"], Literal["human"]]] = None,
+):
+    """List available signatures for a given species (optional).
+
+    Parameters
+    ----------
+    species
+        Species identity to list signatures belonging to it.
+
+    Returns
+    -------
+    Message listing the signatures that are included within the 
+    "signatures_from_file" function.
+
+    """
+    
+    signature_paths = {
+        'human': {
+            'BioCarta_Human': 'https://www.gsea-msigdb.org/gsea/msigdb/download_file.jsp?filePath=/msigdb/release/2023.2.Hs/c2.cp.biocarta.v2023.2.Hs.symbols.gmt',
+            'Reactome_Human': 'https://www.gsea-msigdb.org/gsea/msigdb/download_file.jsp?filePath=/msigdb/release/2023.2.Hs/c2.cp.reactome.v2023.2.Hs.symbols.gmt',
+            'KEGG_Human': 'https://www.gsea-msigdb.org/gsea/msigdb/download_file.jsp?filePath=/msigdb/release/2023.2.Hs/c2.cp.kegg_legacy.v2023.2.Hs.symbols.gmt',
+            'GO:BP_Human': 'https://www.gsea-msigdb.org/gsea/msigdb/download_file.jsp?filePath=/msigdb/release/2023.2.Hs/c5.go.bp.v2023.2.Hs.symbols.gmt',
+        },
+        'mouse': {
+            'BioCarta_Mouse': 'https://www.gsea-msigdb.org/gsea/msigdb/download_file.jsp?filePath=/msigdb/release/2023.2.Mm/m2.cp.biocarta.v2023.2.Mm.symbols.gmt',
+            'Reactome_Mouse': 'https://www.gsea-msigdb.org/gsea/msigdb/download_file.jsp?filePath=/msigdb/release/2023.2.Mm/m2.cp.reactome.v2023.2.Mm.symbols.gmt',
+            'GO:BP_Mouse': 'https://www.gsea-msigdb.org/gsea/msigdb/download_file.jsp?filePath=/msigdb/release/2023.2.Mm/m5.go.bp.v2023.2.Mm.symbols.gmt',
+        }
+    }
+    
+    if species is not None:
+        signatures = list(signature_paths[species].keys())
+    else:
+        signatures = list(signature_paths['human'].keys()) + list(signature_paths['mouse'].keys())
+        
+    print(f"Available signatures: {signatures}")
+    
+    return
+
+
+def signatures_from_file(
     adata: AnnData,
     use_raw: bool = False,
     species: Optional[Union[Literal["mouse"], Literal["human"]]] = None,
     gmt_files: Optional[Sequence[str]] = None,
+    dicts: Optional[Sequence[dict]] = None,
     sig_names: Optional[Sequence[str]] = None,
 ):
     """Compute signature scores from .gmt files.
@@ -164,6 +206,8 @@ def signatures_from_gmt(
         Species identity to select one (or more) of the signatures downloaded from MSigDB.
     gmt_files
         List of .gmt files to use for signature computation.
+    dicts
+        List of dictionaries to use for signature computation.
     sig_names
         List of signature file names downloaded from MSigDB to use for signature computation.
 
@@ -187,12 +231,19 @@ def signatures_from_gmt(
         }
     }
 
-    if species not in ['human', 'mouse'] and gmt_files is None:
+    if dicts is None and species not in ['human', 'mouse'] and gmt_files is None:
         raise ValueError(f'species type: {species} is not supported currently. You should choose either "human" or "mouse".')
 
-    if gmt_files is None and (sig_names is None or sig_names not in list(signature_paths[species].keys())):
+    if dicts is None and gmt_files is None and (sig_names is None or sig_names not in list(signature_paths[species].keys())):
         raise ValueError(f'Please provide either your own signature list or select one (or more) of: {list(signature_paths[species].keys())}')
 
+    if dicts is not None and gmt_files is not None:
+        files = dicts + gmt_files
+    elif dicts is None and gmt_files is not None:
+        files = gmt_files
+    elif dicts is not None and gmt_files is None:
+        files = dicts
+    
     if type(sig_names) is list:
         if type(gmt_files) is list:
             for sig_name in sig_names:
@@ -200,16 +251,19 @@ def signatures_from_gmt(
                     raise ValueError(f'{sig_name} is not available. Please select one (or more) of: {list(signature_paths[species].keys())}')
                 else:
                     sig_name_path = signature_paths[species][sig_name]
-                    gmt_files.append(sig_name_path)
+                    files.append(sig_name_path)
         else:
-            gmt_files = []
+            files = []
             for sig_name in sig_names:
                 sig_name_path = signature_paths[species][sig_name]
-                gmt_files.append(sig_name_path)
+                files.append(sig_name_path)
 
     sig_dict = {}
-    for gmt_file in gmt_files:
-        sig_dict.update(read_gmt(gmt_file))
+    for file in files:
+        if isinstance(file, dict):
+            sig_dict.update(read_dict(file))
+        else:
+            sig_dict.update(read_gmt(file))
     index = adata.raw.var.index if use_raw else adata.var_names
     columns = list(sig_dict.keys())
     data = np.zeros((len(index), len(columns)))
@@ -278,6 +332,41 @@ def read_gmt(
                 signed_sign[signature_name] = {direction: gene_list}
             if verbose:
                 print(i, ": ", signature_full_name)
+
+    return signed_sign
+
+
+def read_dict(
+    dict: dict,
+    up_suffix: Tuple[str] = "(_up|_plus)",
+    down_suffix: str = "(_down|_dn|_minus|_mius)",
+) -> Dict[str, Dict[str, List[str]]]:
+    """Read dictionary to extract signed genesets.
+    """
+    signed_sign = {}
+
+    pattern_down = compile(r"(\S+)" + down_suffix + "$")
+    pattern_up = compile(r"(\S+)" + up_suffix + "$")
+    
+    for signature_full_name, gene_list in dict.items():
+        
+        z = match(pattern_down, signature_full_name.lower())
+        if z:
+            signature_name = z.groups()[0]
+            direction = DOWN_SIG_KEY
+        else:
+            z = match(pattern_up, signature_full_name.lower())
+            if z:
+                signature_name = z.groups()[0]
+                direction = UP_SIG_KEY
+            else:
+                signature_name = signature_full_name
+                direction = UP_SIG_KEY
+
+        if signature_name in signed_sign.keys():
+            signed_sign[signature_name][direction] = gene_list
+        else:
+            signed_sign[signature_name] = {direction: gene_list}
 
     return signed_sign
 

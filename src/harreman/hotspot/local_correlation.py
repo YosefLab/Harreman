@@ -6,6 +6,9 @@ import sparse
 from scipy.sparse import csr_matrix
 from anndata import AnnData
 from numba import jit, njit
+from tqdm import tqdm
+from statsmodels.stats.multitest import multipletests
+from scipy.stats import norm
 
 from . import models
 from ..preprocessing.anndata import counts_from_anndata
@@ -16,6 +19,8 @@ from ..tools.knn import make_weights_non_redundant
 def compute_local_correlation(
     adata: AnnData,
     genes: Optional[list] = None,
+    permutation_test: Optional[bool] = False,
+    M: Optional[int] = 1000,
 ):
 
     start = time.time()
@@ -42,22 +47,38 @@ def compute_local_correlation(
 
     counts = create_centered_counts(counts, model, num_umi)
 
-    # eg2s = ((weights @ counts.T) ** 2).sum(axis=0)
-    eg2s = (((weights @ counts.T) + (counts @ weights).T) ** 2).sum(axis=0) # if make_weights_non_redundant is used
+    eg2s = (((weights + weights.T) @ counts.T) ** 2).sum(axis=0)
+    # The equation above is equivalent to (((weights @ counts.T) + (counts @ weights).T) ** 2).sum(axis=0)
 
-    results = compute_local_cov_pairs(counts, weights, eg2s)
-
-    lcs, lc_zs = results
-
-    lc_maxs = compute_local_cov_pairs_max(D, counts)
+    lcs = counts @ weights @ counts.T + counts @ weights.T @ counts.T
+    lc_zs = compute_cor_Z_scores(lcs, eg2s)
+    
+    lc_z_pvals = norm.sf(lc_zs)
+    
+    if permutation_test:
+        perm_array = np.zeros((counts.shape[0], counts.shape[0], M)).astype(np.float16)
+        for i in tqdm(range(M)):
+            idx = np.random.permutation(counts.shape[1])
+            counts = counts[:, idx]
+            perm_array[:, :, i] = counts @ weights @ counts.T + counts @ weights.T @ counts.T
+        
+        x = np.sum(perm_array > lcs[:, :, np.newaxis], axis=2)
+        lc_perm_pvals = (x + 1) / (M + 1)
+        
+        lc_perm_pvals = pd.DataFrame(lc_perm_pvals, index=genes, columns=genes)
+        adata.uns["lc_perm_pvals"] = lc_perm_pvals
+    
+    lc_maxs = compute_max_correlation(D, counts)
     lcs = lcs / lc_maxs
-
+    
     lcs = pd.DataFrame(lcs, index=genes, columns=genes)
     lc_zs = pd.DataFrame(lc_zs, index=genes, columns=genes)
-
+    lc_z_pvals = pd.DataFrame(lc_z_pvals, index=genes, columns=genes)
+    
     adata.uns["lcs"] = lcs
     adata.uns["lc_zs"] = lc_zs
-
+    adata.uns["lc_z_pvals"] = lc_z_pvals
+    
     print("Finished computing pair-wise local correlation in %.3f seconds" %(time.time()-start))
 
     return
@@ -213,15 +234,9 @@ def _compute_hs_pairs_inner_centered_cond_sym(
     return (lc, Z)
 
 
-def compute_local_cov_pairs(
-    counts, weights, eg2s
+def compute_cor_Z_scores(
+    lc, eg2s
 ):
-    """
-    This version assumes that the counts have already been modeled
-    and centered
-    """
-
-    lc = counts @ weights @ counts.T + counts @ weights.T @ counts.T
 
     EG, EG2 = 0, eg2s
     stdG = (EG2 - EG ** 2) ** 0.5
@@ -236,7 +251,7 @@ def compute_local_cov_pairs(
     i_upper = np.triu_indices(Z.shape[0], k=1)
     Z[i_upper] = Z.T[i_upper]
 
-    return (lc, Z)
+    return Z
 
 
 @njit
@@ -256,7 +271,7 @@ def expand_pairs(pairs, vals, N):
     return out
 
 
-def compute_local_cov_pairs_max(node_degrees, counts):
+def compute_max_correlation(node_degrees, counts):
     """
     For a Genes x Cells count matrix, compute the maximal pair-wise correlation
     between any two genes

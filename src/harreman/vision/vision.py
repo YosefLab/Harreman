@@ -9,7 +9,7 @@ from .VISION_accessor import VISION
 data_accessor = VISION()
 
 
-def start_vision(
+def analyze_vision(
     adata: Union[str, anndata.AnnData],
     norm_data_key: Optional[Union[Literal["use_raw"], str]] = None,
     compute_neighbors_on_key: Optional[str] = None,
@@ -28,7 +28,7 @@ def start_vision(
     scores_only: Optional[bool] = False,
     tree = None,
 ):
-    """Start VISION.
+    """Analyze VISION.
 
     Parameters
     ----------
