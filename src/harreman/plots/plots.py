@@ -19,6 +19,7 @@ def local_correlation_plot(
     z_cmap='RdBu_r',
     yticklabels=False,
     use_super_modules=False,
+    show=True,
 ):
     
     local_correlation_z = adata.uns["lc_zs"]
@@ -63,6 +64,8 @@ def local_correlation_plot(
     ii = leaves_list(linkage)
 
     mod_reordered = modules.iloc[ii]
+    
+    adata.uns['mod_reordered'] = [mod for mod in mod_reordered.unique() if mod != -1]
 
     mod_map = {}
     y = np.arange(modules.size)
@@ -95,6 +98,9 @@ def local_correlation_plot(
 
     min_aa.set_ylabel('Z-Scores')
     min_aa.yaxis.set_label_position("left")
+    
+    if show:
+        plt.show()
 
 
 def average_local_correlation_plot(
@@ -102,12 +108,16 @@ def average_local_correlation_plot(
     mod_cmap='tab10',
     vmin=-10,
     vmax=10,
-    z_cmap='RdBu_r',
+    cor_cmap='RdBu_r',
     yticklabels=False,
+    row_cluster=True,
+    col_cluster=True,
+    use_super_modules=False,
+    show=True,
 ):
     
     local_correlation_z = adata.uns["lc_zs"]
-    modules = adata.uns["modules"]
+    modules = adata.uns["super_modules"] if use_super_modules else adata.uns["modules"]
     
     avg_local_correlation_z = local_correlation_z.copy()
     avg_local_correlation_z['module_row'] = modules
@@ -116,6 +126,8 @@ def average_local_correlation_plot(
 
     avg_local_correlation_z = avg_local_correlation_z.groupby(level=1).mean().groupby(level=0, axis=1).mean()
     avg_local_correlation_z = avg_local_correlation_z.loc[avg_local_correlation_z.index != -1, avg_local_correlation_z.columns != -1]
+    mod_reordered = adata.uns['mod_reordered']
+    avg_local_correlation_z = avg_local_correlation_z.loc[mod_reordered, mod_reordered]
 
     row_colors = None
     colors = list(plt.get_cmap(mod_cmap).colors)
@@ -130,11 +142,13 @@ def average_local_correlation_plot(
         avg_local_correlation_z,
         vmin=vmin,
         vmax=vmax,
-        cmap=z_cmap,
+        cmap=cor_cmap,
         xticklabels=False,
         yticklabels=yticklabels,
         row_colors=row_colors,
         rasterized=True,
+        row_cluster=row_cluster,
+        col_cluster=col_cluster,
     )
 
     fig = plt.gcf()
@@ -144,8 +158,9 @@ def average_local_correlation_plot(
 
     cm.ax_row_dendrogram.remove()
 
-    reordered_indices = cm.dendrogram_row.reordered_ind
-    mod_reordered = [avg_local_correlation_z.index[i] for i in reordered_indices]
+    if row_cluster:
+        reordered_indices = cm.dendrogram_row.reordered_ind
+        mod_reordered = [avg_local_correlation_z.index[i] for i in reordered_indices]
 
     mod_map = {}
     y = np.arange(len(mod_reordered))
@@ -179,7 +194,100 @@ def average_local_correlation_plot(
     min_aa.set_ylabel('Avg. local correlation Z')
     min_aa.yaxis.set_label_position("left")
 
-    plt.show()
+    if show:
+        plt.show()
+
+
+def module_score_correlation_plot(
+    adata: AnnData,
+    mod_cmap='tab10',
+    vmin=-1,
+    vmax=1,
+    cor_cmap='RdBu_r',
+    yticklabels=False,
+    method='pearson',
+    use_super_modules=False,
+    row_cluster=True,
+    col_cluster=True,
+    show=True,
+):
+    
+    module_scores = adata.obsm['super_module_scores'] if use_super_modules else adata.obsm['module_scores']
+    modules = adata.uns["super_modules"] if use_super_modules else adata.uns["modules"]
+
+    cor_matrix = module_scores.corr(method)
+    mod_int = [int(mod.split(' ')[1]) for mod in cor_matrix.index]
+    cor_matrix.index = cor_matrix.columns = mod_int
+    mod_reordered = adata.uns['mod_reordered']
+    cor_matrix = cor_matrix.loc[mod_reordered, mod_reordered]
+
+    row_colors = None
+    colors = list(plt.get_cmap(mod_cmap).colors)
+    module_colors = {i: colors[(i-1) % len(colors)] for i in modules.unique()}
+    module_colors[-1] = '#ffffff'
+
+    row_colors = pd.DataFrame({
+        "Modules": module_colors,
+    })
+
+    cm = sns.clustermap(
+        cor_matrix,
+        vmin=vmin,
+        vmax=vmax,
+        cmap=cor_cmap,
+        xticklabels=False,
+        yticklabels=yticklabels,
+        row_colors=row_colors,
+        rasterized=True,
+        row_cluster=row_cluster,
+        col_cluster=col_cluster,
+    )
+
+    fig = plt.gcf()
+    plt.sca(cm.ax_heatmap)
+    plt.ylabel("")
+    plt.xlabel("")
+
+    cm.ax_row_dendrogram.remove()
+
+    if row_cluster:
+        reordered_indices = cm.dendrogram_row.reordered_ind
+        mod_reordered = [cor_matrix.index[i] for i in reordered_indices]
+
+    mod_map = {}
+    y = np.arange(len(mod_reordered))
+
+    for x in mod_reordered:
+        if x == -1:
+            continue
+
+        mod_map[x] = y[mod_reordered == x].mean() + 0.5
+
+    plt.sca(cm.ax_row_colors)
+    for mod, mod_y in mod_map.items():
+        plt.text(-.5, y=mod_y, s="Module {}".format(mod),
+                    horizontalalignment='right',
+                    verticalalignment='center')
+    plt.xticks([])
+
+    # Find the colorbar 'child' and modify
+    min_delta = 1e99
+    min_aa = None
+    for aa in fig.get_children():
+        try:
+            bbox = aa.get_position()
+            delta = (0-bbox.xmin)**2 + (1-bbox.ymax)**2
+            if delta < min_delta:
+                delta = min_delta
+                min_aa = aa
+        except AttributeError:
+            pass
+
+    min_aa.set_ylabel(f'{method.capitalize()} R')
+    min_aa.yaxis.set_label_position("left")
+    
+    if show:
+        plt.show()
 
 
 def plot_interacting_cell_scores(

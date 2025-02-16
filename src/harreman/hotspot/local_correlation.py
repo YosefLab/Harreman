@@ -33,6 +33,8 @@ def compute_local_correlation(
     
     layer_key = adata.uns['layer_key']
     model = adata.uns['model']
+    
+    sample_specific = 'sample_key' in adata.uns.keys()
 
     counts = counts_from_anndata(adata[:, genes], layer_key, dense=True)
 
@@ -44,8 +46,14 @@ def compute_local_correlation(
     row_degrees = np.array(weights.sum(axis=1).T)[0]
     col_degrees = np.array(weights.sum(axis=0))[0]
     D = row_degrees + col_degrees
-
-    counts = create_centered_counts(counts, model, num_umi)
+    
+    if sample_specific:
+        sample_key = adata.uns['sample_key']
+        for sample in adata.obs[sample_key].unique().tolist():
+            subset = np.where(adata.obs[sample_key] == sample)[0]
+            counts[:,subset] = create_centered_counts(counts[:,subset], model, num_umi[subset])
+    else:
+        counts = create_centered_counts(counts, model, num_umi)
 
     eg2s = (((weights + weights.T) @ counts.T) ** 2).sum(axis=0)
     # The equation above is equivalent to (((weights @ counts.T) + (counts @ weights).T) ** 2).sum(axis=0)

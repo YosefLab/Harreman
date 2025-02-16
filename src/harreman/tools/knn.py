@@ -122,16 +122,38 @@ def compute_neighbors(
 ) -> None:
 
     coords = adata.obsm[compute_neighbors_on_key]
+    
+    if sample_key is not None:
+        adata.uns['sample_key'] = sample_key
+        n_cells = adata.shape[0]
+        distances = lil_matrix((n_cells, n_cells))
+        samples = adata.obs[sample_key].unique().tolist()
+        print("Adding sample-level specificity to the neighborhood graph...")
+        for sample in tqdm(samples):
+            sample_indices = np.where(adata.obs[sample_key] == sample)[0]
+            sample_coords = coords[sample_indices]
 
-    if n_neighbors is not None:
-        nbrs = NearestNeighbors(
-            n_neighbors=n_neighbors+1,
-            algorithm='ball_tree').fit(coords)
-        distances = nbrs.kneighbors_graph(coords, mode='distance')
+            if n_neighbors is not None:
+                nbrs = NearestNeighbors(
+                    n_neighbors=n_neighbors+1,
+                    algorithm='ball_tree').fit(sample_coords)
+                sample_distances = nbrs.kneighbors_graph(sample_coords, mode='distance').todok()
+            elif neighborhood_radius is not None:
+                coords_tree = KDTree(sample_coords)
+                sample_distances = coords_tree.sparse_distance_matrix(coords_tree, neighborhood_radius)
 
+            for (i, j), sample_distance in sample_distances.items():
+                distances[sample_indices[i], sample_indices[j]] = sample_distance
     else:
-        coords_tree = KDTree(coords)
-        distances = coords_tree.sparse_distance_matrix(coords_tree, neighborhood_radius)
+        if n_neighbors is not None:
+            nbrs = NearestNeighbors(
+                n_neighbors=n_neighbors+1,
+                algorithm='ball_tree').fit(coords)
+            distances = nbrs.kneighbors_graph(coords, mode='distance')
+
+        else:
+            coords_tree = KDTree(coords)
+            distances = coords_tree.sparse_distance_matrix(coords_tree, neighborhood_radius)
 
     if 'deconv_data' in adata.uns and adata.uns['deconv_data'] is True:
         spot_diameter = adata.uns['spot_diameter']
@@ -146,24 +168,7 @@ def compute_neighbors(
             barcode_mask_pos = list(zip(*barcode_mask_ind_perm))
             distances[barcode_mask_pos[0],barcode_mask_pos[1]] = spot_diameter/2
 
-    if sample_key is not None:
-        samples = adata.obs[sample_key].unique().tolist()
-        for sample in samples:
-            sample_mask = adata.obs[sample_key] == sample
-            sample_mask = sample_mask.reset_index(drop=True)
-            sample_mask_ind = sample_mask[sample_mask].index.tolist()
-            not_sample_mask = adata.obs[sample_key] != sample
-            not_sample_mask = not_sample_mask.reset_index(drop=True)
-            not_sample_mask_ind = not_sample_mask[not_sample_mask].index.tolist()
-            subset = distances.tolil()[sample_mask_ind,:][:,not_sample_mask_ind]
-            if subset.nnz > 0:
-                distances_coo = distances.tocoo()
-                mask = np.isin(distances_coo.row, sample_mask_ind) & np.isin(distances_coo.col, not_sample_mask_ind)
-                distances_coo.data[mask] = 0
-                distances_coo = coo_matrix((distances_coo.data[distances_coo.data != 0], (distances_coo.row[distances_coo.data != 0], distances_coo.col[distances_coo.data != 0])), shape=distances_coo.shape)
-                distances = distances_coo.tocsr()
-
-    adata.obsp["distances"] = distances
+    adata.obsp["distances"] = distances.tocsr()
 
     return
 
@@ -187,9 +192,23 @@ def compute_neighbors_from_distances(
     weights:  pandas.Dataframe num_cells x n_neighbors
 
     """
-    distances = adata.obsp[distances_obsp_key]
+    distances_tmp = adata.obsp[distances_obsp_key]
+    distances_tmp = csr_matrix(distances_tmp) if type(distances_tmp) is np.array else distances_tmp
+    
+    if sample_key is not None:
+        adata.uns['sample_key'] = sample_key
+        n_cells = adata.shape[0]
+        distances = lil_matrix((n_cells, n_cells))
+        samples = adata.obs[sample_key].unique().tolist()
+        print("Adding sample-level specificity to the neighborhood graph...")
+        for sample in tqdm(samples):
+            sample_indices = np.where(adata.obs[sample_key] == sample)[0]
+            sample_distances = distances_tmp[sample_indices]
 
-    distances = csr_matrix(distances) if type(distances) is np.array else distances
+            for (i, j), sample_distance in sample_distances.items():
+                distances[sample_indices[i], sample_indices[j]] = sample_distance
+    else:
+        distances = distances_tmp
 
     if 'deconv_data' in adata.uns and adata.uns['deconv_data'] is True:
         barcodes = adata.obs['barcodes'].unique().tolist()
@@ -203,24 +222,7 @@ def compute_neighbors_from_distances(
             barcode_mask_pos = list(zip(*barcode_mask_ind_perm))
             distances[barcode_mask_pos[0],barcode_mask_pos[1]] = spot_diameter/2
 
-    if sample_key is not None:
-        samples = adata.obs[sample_key].unique().tolist()
-        for sample in samples:
-            sample_mask = adata.obs[sample_key] == sample
-            sample_mask = sample_mask.reset_index(drop=True)
-            sample_mask_ind = sample_mask[sample_mask].index.tolist()
-            not_sample_mask = adata.obs[sample_key] != sample
-            not_sample_mask = not_sample_mask.reset_index(drop=True)
-            not_sample_mask_ind = not_sample_mask[not_sample_mask].index.tolist()
-            subset = distances.tolil()[sample_mask_ind,:][:,not_sample_mask_ind]
-            if subset.nnz > 0:
-                distances_coo = distances.tocoo()
-                mask = np.isin(distances_coo.row, sample_mask_ind) & np.isin(distances_coo.col, not_sample_mask_ind)
-                distances_coo.data[mask] = 0
-                distances_coo = coo_matrix((distances_coo.data[distances_coo.data != 0], (distances_coo.row[distances_coo.data != 0], distances_coo.col[distances_coo.data != 0])), shape=distances_coo.shape)
-                distances = distances_coo.tocsr()
-
-    adata.obsp["distances"] = distances
+    adata.obsp["distances"] = distances.tocsr()
 
     return
 

@@ -101,13 +101,22 @@ def compute_scores_PCA(
     counts_sub = counts_from_anndata(adata, layer_key, dense=True)
 
     cc_smooth = np.zeros_like(counts_sub, dtype=np.float64)
+    
+    sample_specific = 'sample_key' in adata.uns.keys()
+    
+    if sample_specific:
+        sample_key = adata.uns['sample_key']
+        for sample in adata.obs[sample_key].unique().tolist():
+            subset = np.where(adata.obs[sample_key] == sample)[0]
+            counts_sub[:,subset] = create_centered_counts(counts_sub[:,subset], model, num_umi[subset])
+    else:
+        counts_sub = create_centered_counts(counts_sub, model, num_umi)
 
-    centered_row = create_centered_counts(counts_sub, model, num_umi)
-    out = (weights + weights.T) @ centered_row.T
+    out = (weights + weights.T) @ counts_sub.T
     weights_sum = np.array(weights.sum(axis=1).T)[0] + np.array(weights.sum(axis=0))[0]
     weights_sum[weights_sum == 0] = 1
     out /= weights_sum[:, np.newaxis]
-    cc_smooth = (out.T * _lambda) + ((1 - _lambda) * centered_row)
+    cc_smooth = (out.T * _lambda) + ((1 - _lambda) * counts_sub)
 
     pca_data = cc_smooth
 

@@ -19,11 +19,14 @@ def load_metabolic_genes(
 ):
 
     metabolic_genes_paths = {
-        'human': "/home/labs/nyosef/oier/Compass_data/metabolic_genes/metabolic_genes_h.csv",
-        'mouse': "/home/labs/nyosef/oier/Compass_data/metabolic_genes/metabolic_genes_m.csv"
+        # 'human': "/home/labs/nyosef/oier/Compass_data/metabolic_genes/metabolic_genes_h.csv",
+        # 'mouse': "/home/labs/nyosef/oier/Compass_data/metabolic_genes/metabolic_genes_m.csv",
+        'human': "/home/labs/nyosef/oier/Harreman_files/metabolic_genes/human_metabolic_genes.csv",
+        'mouse': "/home/labs/nyosef/oier/Harreman_files/metabolic_genes/mouse_metabolic_genes.csv"
     }
 
-    metabolic_genes = list(pd.read_csv(metabolic_genes_paths[species], index_col=0, header=None).index)
+    # metabolic_genes = list(pd.read_csv(metabolic_genes_paths[species], index_col=0, header=None).index)
+    metabolic_genes = pd.read_csv(metabolic_genes_paths[species], index_col=0)['0'].tolist()
 
     return metabolic_genes
 
@@ -47,6 +50,8 @@ def compute_local_autocorrelation(
     adata.uns['layer_key'] = layer_key
     adata.uns['model'] = model
     adata.uns['species'] = species
+    
+    sample_specific = 'sample_key' in adata.uns.keys()
 
     if use_metabolic_genes and genes is None:
         genes = load_metabolic_genes(species)
@@ -60,29 +65,46 @@ def compute_local_autocorrelation(
         genes = adata.var_names if not use_raw else adata.raw.var.index
 
     counts = counts_from_anndata(adata[:, genes], layer_key, dense=True)
-
-    weights = adata.obsp['weights'].copy()
-    genes = genes[~np.all(counts == 0, axis=1)]
-    counts = counts[~np.all(counts == 0, axis=1)]
+    
+    if sample_specific:
+        all_zero_mask = np.zeros(genes.shape[0], dtype=bool)
+        sample_key = adata.uns['sample_key']
+        for sample in adata.obs[sample_key].unique().tolist():
+            subset = np.where(adata.obs[sample_key] == sample)[0]
+            all_zero_mask |= np.all(counts[:, subset] == 0, axis=1)
+        genes = genes[~all_zero_mask]
+        counts = counts[~all_zero_mask, :]
+    else:
+        genes = genes[~np.all(counts == 0, axis=1)]
+        counts = counts[~np.all(counts == 0, axis=1)]
     num_umi = counts.sum(axis=0) if umi_counts_obs_key is None else adata.obs[umi_counts_obs_key]
     num_umi = np.array(num_umi)
-    
+
+    adata.uns['umi_counts'] = num_umi
+
+    def center_vals_f(x, num_umi):
+        return center_values_total(x, num_umi, model)
+
+    if sample_specific:
+        sample_key = adata.uns['sample_key']
+        for sample in adata.obs[sample_key].unique().tolist():
+            subset = np.where(adata.obs[sample_key] == sample)[0]
+            num_umi_subset = num_umi[subset]
+            counts[:,subset] = np.apply_along_axis(lambda x: center_vals_f(x, num_umi_subset)[np.newaxis], 1, counts[:,subset]).squeeze(axis=1)
+    else:
+        counts = np.apply_along_axis(lambda x: center_vals_f(x, num_umi)[np.newaxis], 1, counts).squeeze(axis=1)
+
     adata.var['local_autocorrelation'] = False
     adata.var['local_autocorrelation'].loc[genes] = True
 
+    weights = adata.obsp['weights'].copy()
     weights = make_weights_non_redundant(weights)
-
-    adata.uns['umi_counts'] = num_umi
 
     row_degrees = np.array(weights.sum(axis=1).T)[0]
     col_degrees = np.array(weights.sum(axis=0))[0]
     D = row_degrees + col_degrees
 
     Wtot2 = (weights.data ** 2).sum()
-
-    def center_vals_f(x):
-        return center_values_total(x, num_umi, model)
-    counts = np.apply_along_axis(lambda x: center_vals_f(x)[np.newaxis], 1, counts).squeeze(axis=1)
     
     G = (counts.T * (weights @ counts.T)).sum(axis=0)
     G_max = np.apply_along_axis(compute_local_cov_max, 1, counts, D)

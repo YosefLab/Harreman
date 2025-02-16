@@ -185,14 +185,17 @@ def modify_uns_harreman(adata):
         adata.uns['gene_pairs_per_ct_pair_ind'] = {' - '.join(key): value for key, value in adata.uns['gene_pairs_per_ct_pair_ind'].items()}
 
     if 'ccc_results' in adata.uns.keys():
-        adata.uns['ccc_results']['cell_com_df'] = adata.uns['ccc_results']['cell_com_df'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
-        adata.uns['ccc_results']['cell_com_df_sig'] = adata.uns['ccc_results']['cell_com_df_sig'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
-        adata.uns['ccc_results']['cell_com_df_sig_metab']['Gene 1'] = [list(i) if isinstance(i, tuple) else i for i in adata.uns['ccc_results']['cell_com_df_sig_metab']['Gene 1'].values]
-        adata.uns['ccc_results']['cell_com_df_sig_metab']['Gene 2'] = [list(i) if isinstance(i, tuple) else i for i in adata.uns['ccc_results']['cell_com_df_sig_metab']['Gene 2'].values]
-        adata.uns['ccc_results']['cell_com_df_sig_metab'] = adata.uns['ccc_results']['cell_com_df_sig_metab'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
-        if adata.uns['ccc_results']['cell_com_df_sig_metab'].shape[0] > 0:
-            adata.uns['ccc_results']['cell_com_df_sig_metab'][['gene_type1', 'gene_type2']] = pd.DataFrame(adata.uns['ccc_results']['cell_com_df_sig_metab']['gene_type'].tolist(), index=adata.uns['ccc_results']['cell_com_df_sig_metab'].index)
-        adata.uns['ccc_results']['cell_com_df_sig_metab'] = adata.uns['ccc_results']['cell_com_df_sig_metab'].drop(['gene_pair', 'gene_type'] ,axis=1)
+        adata.uns['ccc_results']['cell_com_df_gp'] = adata.uns['ccc_results']['cell_com_df_gp'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
+        adata.uns['ccc_results']['cell_com_df_m'] = adata.uns['ccc_results']['cell_com_df_m'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
+        if 'cell_com_df_gp_sig' in adata.uns['ccc_results'].keys():
+            adata.uns['ccc_results']['cell_com_df_sig'] = adata.uns['ccc_results']['cell_com_df_sig'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
+        if 'cell_com_df_sig_metab' in adata.uns['ccc_results'].keys():
+            adata.uns['ccc_results']['cell_com_df_sig_metab']['Gene 1'] = [list(i) if isinstance(i, tuple) else i for i in adata.uns['ccc_results']['cell_com_df_sig_metab']['Gene 1'].values]
+            adata.uns['ccc_results']['cell_com_df_sig_metab']['Gene 2'] = [list(i) if isinstance(i, tuple) else i for i in adata.uns['ccc_results']['cell_com_df_sig_metab']['Gene 2'].values]
+            adata.uns['ccc_results']['cell_com_df_sig_metab'] = adata.uns['ccc_results']['cell_com_df_sig_metab'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
+            if adata.uns['ccc_results']['cell_com_df_sig_metab'].shape[0] > 0:
+                adata.uns['ccc_results']['cell_com_df_sig_metab'][['gene_type1', 'gene_type2']] = pd.DataFrame(adata.uns['ccc_results']['cell_com_df_sig_metab']['gene_type'].tolist(), index=adata.uns['ccc_results']['cell_com_df_sig_metab'].index)
+            adata.uns['ccc_results']['cell_com_df_sig_metab'] = adata.uns['ccc_results']['cell_com_df_sig_metab'].drop(['gene_pair', 'gene_type'] ,axis=1)
 
     if 'metabolite_gene_pair_df' in adata.uns.keys():
         adata.uns['metabolite_gene_pair_df'][['gene_pair1', 'gene_pair2']] = pd.DataFrame(adata.uns['metabolite_gene_pair_df']['gene_pair'].tolist(), index=adata.uns['metabolite_gene_pair_df'].index)
