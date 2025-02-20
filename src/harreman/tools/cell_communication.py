@@ -504,7 +504,7 @@ def run_cell_communication_analysis(
     if cell_type_key:
         cell_types = adata.obs[cell_type_key] if not use_raw else adata.raw.obs[cell_type_key]
     gene_pairs = adata.uns["gene_pairs"]
-    genes = list(flatten(gene_pairs))
+    genes = list(np.unique(list(flatten(gene_pairs))))
     adata.uns["genes"] = genes
     cell_type_pairs = adata.uns["cell_type_pairs"] if "cell_type_pairs" in adata.uns.keys() else None
     gene_pairs_per_ct_pair = adata.uns["gene_pairs_per_ct_pair"] if "gene_pairs_per_ct_pair" in adata.uns.keys() else None
@@ -585,35 +585,9 @@ def run_cell_communication_analysis(
 
         print("Running the parametric test...")
 
-        if mean == 'algebraic':
-            counts_1 = np.vstack([counts_from_anndata(adata[:, gene_pair[0]], layer_key_p_test, dense=True) if type(gene_pair[0]) is not list else counts_from_anndata(adata[:, gene_pair[0]], layer_key_p_test, dense=True).mean(0) for gene_pair in gene_pairs])
-            counts_2 = np.vstack([counts_from_anndata(adata[:, gene_pair[1]], layer_key_p_test, dense=True) if type(gene_pair[1]) is not list else counts_from_anndata(adata[:, gene_pair[1]], layer_key_p_test, dense=True).mean(0) for gene_pair in gene_pairs])
-        else:
-            counts_1 = np.vstack([counts_from_anndata(adata[:, gene_pair[0]], layer_key_p_test, dense=True) if type(gene_pair[0]) is not list else gmean(counts_from_anndata(adata[:, gene_pair[0]], layer_key_p_test, dense=True), axis=0) for gene_pair in gene_pairs])
-            counts_2 = np.vstack([counts_from_anndata(adata[:, gene_pair[1]], layer_key_p_test, dense=True) if type(gene_pair[1]) is not list else gmean(counts_from_anndata(adata[:, gene_pair[1]], layer_key_p_test, dense=True), axis=0) for gene_pair in gene_pairs])
-        
-        num_umi_1 = counts_1.sum(axis=0)
-        num_umi_2 = counts_2.sum(axis=0)
-        if sample_specific:
-            sample_key = adata.uns['sample_key']
-            for sample in adata.obs[sample_key].unique().tolist():
-                subset = np.where(adata.obs[sample_key] == sample)[0]
-                counts_1[:,subset] = create_centered_counts_ct(counts_1[:,subset], model, num_umi_1[subset], cell_types[subset]) if cell_type_key else create_centered_counts(counts_1[:,subset], model, num_umi_1[subset])
-                counts_2[:,subset] = create_centered_counts_ct(counts_2[:,subset], model, num_umi_2[subset], cell_types[subset]) if cell_type_key else create_centered_counts(counts_2[:,subset], model, num_umi_2[subset])
-        else:
-            counts_1 = create_centered_counts_ct(counts_1, model, num_umi_1, cell_types) if cell_type_key else create_centered_counts(counts_1, model, num_umi_1)
-            counts_2 = create_centered_counts_ct(counts_2, model, num_umi_2, cell_types) if cell_type_key else create_centered_counts(counts_2, model, num_umi_2)
-        counts_1 = np.nan_to_num(counts_1)
-        counts_2 = np.nan_to_num(counts_2)
-        
-        cs_gp = compute_CCC_scores(counts_1, counts_2, weights_ct_pairs) if cell_type_key else compute_CCC_scores(counts_1, counts_2, weights)
-        # cs_m = compute_metabolite_cs(cs_gp, cell_type_key, gene_pair_dict, interacting_cell_scores=False)
-
         adata.uns['ccc_results']['p'] = {}
         adata.uns['ccc_results']['p']['gp'] = {}
         adata.uns['ccc_results']['p']['m'] = {}
-        # adata.uns['ccc_results']['p']['gp']['cs'] = cs_gp
-        # adata.uns['ccc_results']['p']['m']['cs'] = cs_m
 
         if cell_type_key:
             weights_ct_pairs_sq_data = weights_ct_pairs.data ** 2
@@ -621,7 +595,7 @@ def run_cell_communication_analysis(
             Wtot2 = sparse.sum(weights_ct_pairs_sq, axis=(1, 2))
         else:
             Wtot2 = (weights ** 2).sum()
-        
+
         counts = counts_from_anndata(adata[:, genes], layer_key_p_test, dense=True)
         num_umi = counts.sum(axis=0)
         if sample_specific:
@@ -635,6 +609,15 @@ def run_cell_communication_analysis(
         counts = sparse.COO.from_numpy(counts) if cell_type_key else counts
         
         eg2s_gp = conditional_eg2_cellcom_gp(counts, weights_ct_pairs) if cell_type_key else conditional_eg2_cellcom_gp(counts, weights)
+        
+        if mean == 'algebraic':
+            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else counts[gene_pair[0]].mean(0) for gene_pair in gene_pairs_ind])
+            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else counts[gene_pair[1]].mean(0) for gene_pair in gene_pairs_ind])
+        else:
+            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else gmean(counts[gene_pair[0]], axis=0) for gene_pair in gene_pairs])
+            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else gmean(counts[gene_pair[1]], axis=0) for gene_pair in gene_pairs])
+        
+        cs_gp = compute_CCC_scores(counts_1, counts_2, weights_ct_pairs, gene_pairs) if cell_type_key else compute_CCC_scores(counts_1, counts_2, weights, gene_pairs)
 
         if cell_type_key:
             compute_p_results_partial = partial(
@@ -661,15 +644,15 @@ def run_cell_communication_analysis(
             C_scores_m = p_results[2]
             Z_scores_m = p_results[3]
 
-            genes = pd.Series([gene for gene_pair in gene_pairs for gene in gene_pair]).drop_duplicates().tolist()
-            genes = [tuple(i) if isinstance(i, list) else i for i in genes]
+            genes_ = pd.Series([gene for gene_pair in gene_pairs for gene in gene_pair]).drop_duplicates().tolist()
+            genes_ = [tuple(i) if isinstance(i, list) else i for i in genes_]
             gene_pairs_ = [(tuple(gp_1) if isinstance(gp_1, list) else gp_1, tuple(gp_2) if isinstance(gp_2, list) else gp_2) for gp_1, gp_2 in gene_pairs]
 
-            lc_zs = pd.DataFrame(np.zeros((len(genes), len(genes))), index=genes, columns=genes)
+            lc_zs = pd.DataFrame(np.zeros((len(genes_), len(genes_))), index=genes_, columns=genes_)
             for i, gene_pair in enumerate(gene_pairs_):
                 gp_1, gp_2 = gene_pair
-                gp_1_ind = genes.index(gp_1)
-                gp_2_ind = genes.index(gp_2)
+                gp_1_ind = genes_.index(gp_1)
+                gp_2_ind = genes_.index(gp_2)
                 lc_zs.iloc[gp_1_ind, gp_2_ind] = Z_scores_gp[i]
             
             np.fill_diagonal(lc_zs.values, 0)
@@ -692,38 +675,37 @@ def run_cell_communication_analysis(
     if test in ["non-parametric", "both"]:
 
         print("Running the non-parametric test...")
-
-        if mean == 'algebraic':
-            counts_1 = np.vstack([counts_from_anndata(adata[:, gene_pair[0]], layer_key_np_test, dense=True) if type(gene_pair[0]) is not list else counts_from_anndata(adata[:, gene_pair[0]], layer_key_np_test, dense=True).mean(0) for gene_pair in gene_pairs])
-            counts_2 = np.vstack([counts_from_anndata(adata[:, gene_pair[1]], layer_key_np_test, dense=True) if type(gene_pair[1]) is not list else counts_from_anndata(adata[:, gene_pair[1]], layer_key_np_test, dense=True).mean(0) for gene_pair in gene_pairs])
-        else:
-            counts_1 = np.vstack([counts_from_anndata(adata[:, gene_pair[0]], layer_key_np_test, dense=True) if type(gene_pair[0]) is not list else gmean(counts_from_anndata(adata[:, gene_pair[0]], layer_key_np_test, dense=True), axis=0) for gene_pair in gene_pairs])
-            counts_2 = np.vstack([counts_from_anndata(adata[:, gene_pair[1]], layer_key_np_test, dense=True) if type(gene_pair[1]) is not list else gmean(counts_from_anndata(adata[:, gene_pair[1]], layer_key_np_test, dense=True), axis=0) for gene_pair in gene_pairs])
+        
+        adata.uns['ccc_results']['np'] = {}
+        adata.uns['ccc_results']['np']['gp'] = {}
+        adata.uns['ccc_results']['np']['m'] = {}
+        
+        counts = counts_from_anndata(adata[:, genes], layer_key_np_test, dense=True)
 
         if center_counts_for_np_test:
-            num_umi_1 = counts_1.sum(axis=0)
-            num_umi_2 = counts_2.sum(axis=0)
+            num_umi = counts.sum(axis=0)
             if sample_specific:
                 sample_key = adata.uns['sample_key']
                 for sample in adata.obs[sample_key].unique().tolist():
                     subset = np.where(adata.obs[sample_key] == sample)[0]
-                    counts_1[:,subset] = create_centered_counts_ct(counts_1[:,subset], model, num_umi_1[subset], cell_types[subset]) if cell_type_key else create_centered_counts(counts_1[:,subset], model, num_umi_1[subset])
-                    counts_2[:,subset] = create_centered_counts_ct(counts_2[:,subset], model, num_umi_2[subset], cell_types[subset]) if cell_type_key else create_centered_counts(counts_2[:,subset], model, num_umi_2[subset])
+                    counts[:,subset] = create_centered_counts_ct(counts[:,subset], model, num_umi[subset], cell_types[subset]) if cell_type_key else create_centered_counts(counts[:,subset], model, num_umi[subset])
             else:
-                counts_1 = create_centered_counts_ct(counts_1, model, num_umi_1, cell_types) if cell_type_key else create_centered_counts(counts_1, model, num_umi_1)
-                counts_2 = create_centered_counts_ct(counts_2, model, num_umi_2, cell_types) if cell_type_key else create_centered_counts(counts_2, model, num_umi_2)
-            counts_1 = np.nan_to_num(counts_1)
-            counts_2 = np.nan_to_num(counts_2)
+                counts = create_centered_counts_ct(counts, model, num_umi, cell_types) if cell_type_key else create_centered_counts(counts, model, num_umi)
+            counts = np.nan_to_num(counts)
+            counts = sparse.COO.from_numpy(counts) if cell_type_key else counts
 
-        adata.uns['ccc_results']['np'] = {}
-        adata.uns['ccc_results']['np']['gp'] = {}
-        adata.uns['ccc_results']['np']['m'] = {}
+        if mean == 'algebraic':
+            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else counts[gene_pair[0]].mean(0) for gene_pair in gene_pairs_ind])
+            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else counts[gene_pair[1]].mean(0) for gene_pair in gene_pairs_ind])
+        else:
+            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else gmean(counts[gene_pair[0]], axis=0) for gene_pair in gene_pairs])
+            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else gmean(counts[gene_pair[1]], axis=0) for gene_pair in gene_pairs])
+        
         if center_counts_for_np_test and test == 'both':
             adata.uns['ccc_results']['np']['gp']['cs'] = np.array(adata.uns['ccc_results']['p']['gp']['cs'])
             adata.uns['ccc_results']['np']['m']['cs'] = np.array(adata.uns['ccc_results']['p']['m']['cs'])
         else:            
-            cs_gp = compute_CCC_scores(counts_1, counts_2, weights_ct_pairs) if cell_type_key else compute_CCC_scores(counts_1, counts_2, weights)
-            cs_gp = account_for_same_gene_in_pair(cs_gp, gene_pairs_ind)
+            cs_gp = compute_CCC_scores(counts_1, counts_2, weights_ct_pairs, gene_pairs) if cell_type_key else compute_CCC_scores(counts_1, counts_2, weights, gene_pairs)
             cs_m = compute_metabolite_cs(cs_gp, cell_type_key, gene_pair_dict, interacting_cell_scores=False)
             adata.uns['ccc_results']['np']['gp']['cs'] = cs_gp
             adata.uns['ccc_results']['np']['m']['cs'] = cs_m
@@ -743,14 +725,12 @@ def run_cell_communication_analysis(
                 weigths_ct_pairs_perm_t = weigths_ct_pairs_perm.transpose(axes=(0, 2, 1))
                 weigths_ct_pairs_perm = weigths_ct_pairs_perm + weigths_ct_pairs_perm_t
                 
-                perm_cs_gp = compute_CCC_scores(counts_1, counts_2, weigths_ct_pairs_perm)
-                perm_cs_gp = account_for_same_gene_in_pair(perm_cs_gp, gene_pairs_ind)
+                perm_cs_gp = compute_CCC_scores(counts_1, counts_2, weigths_ct_pairs_perm, gene_pairs)
                 perm_cs_m = compute_metabolite_cs(perm_cs_gp, cell_type_key, gene_pair_dict, interacting_cell_scores=False)
                 adata.uns['ccc_results']['np']['gp']['perm_cs'][:, :, i] = perm_cs_gp
                 adata.uns['ccc_results']['np']['m']['perm_cs'][:, :, i] = perm_cs_m
             else:                
-                perm_cs_gp = compute_CCC_scores(counts_1, counts_2, weights)
-                perm_cs_gp = account_for_same_gene_in_pair(perm_cs_gp, gene_pairs_ind)
+                perm_cs_gp = compute_CCC_scores(counts_1, counts_2, weights, gene_pairs)
                 perm_cs_m = compute_metabolite_cs(perm_cs_gp, cell_type_key, gene_pair_dict, interacting_cell_scores=False)
                 adata.uns['ccc_results']['np']['gp']['perm_cs'][:, i] = perm_cs_gp
                 adata.uns['ccc_results']['np']['m']['perm_cs'][:, i] = perm_cs_m
@@ -1471,14 +1451,21 @@ def compute_CCC_scores(
     counts_1: np.array,
     counts_2: np.array,
     weights: sparse.COO,
+    gene_pairs: list,
 ):
+    same_gene_mask = np.array([pair1 == pair2 for pair1, pair2 in gene_pairs])
+    different_gene_mask = ~same_gene_mask
 
     if len(weights.shape) == 3:
         weights_t = weights.transpose(axes=(0, 2, 1))
         scores = (counts_1.T * np.tensordot(weights + weights_t, counts_2.T, axes=([2], [0]))).sum(axis=1)
     else:
-        # scores = (counts_1.T * (weights @ counts_2.T)).sum(axis=0)
-        scores = (counts_1.T * (weights @ counts_2.T)).sum(axis=0) + (counts_1.T * (weights.T @ counts_2.T)).sum(axis=0) # given that the original W and the non-redundant W give the same results for the Harreman H, we use W instead of W + W^T
+        scores_dg = (counts_1[different_gene_mask].T * (weights @ counts_2[different_gene_mask].T)).sum(axis=0) + (counts_1[different_gene_mask].T * (weights.T @ counts_2[different_gene_mask].T)).sum(axis=0)
+        scores_sg = (counts_1[same_gene_mask].T * (weights @ counts_2[same_gene_mask].T)).sum(axis=0)
+        
+        scores = np.empty(len(gene_pairs))
+        scores[same_gene_mask] = scores_sg
+        scores[different_gene_mask] = scores_dg
 
     return scores
 
@@ -1652,7 +1639,6 @@ def compute_p_results_no_ct(gene_pair_cor_gp, gene_pairs_ind, Wtot2, eg2s_gp, ce
         lc_gp = gene_pair_cor_gp[idx]
         if g1_ind == g2_ind:
             eg2_a = eg2_b = Wtot2
-            lc_gp = lc_gp/2
         else:
             eg2_a = eg2s_gp[g1_ind] if type(g1_ind) is not list else np.max(eg2s_gp[g1_ind])
             eg2_b = eg2s_gp[g2_ind] if type(g2_ind) is not list else np.max(eg2s_gp[g2_ind])
@@ -1675,6 +1661,7 @@ def compute_p_results_no_ct(gene_pair_cor_gp, gene_pairs_ind, Wtot2, eg2s_gp, ce
     Z_gp = [(C_gp[i] - EG[i]) / stdG_a[i] if np.abs((C_gp[i] - EG[i]) / stdG_a[i]) < np.abs((C_gp[i] - EG[i]) / stdG_b[i]) else (C_gp[i] - EG[i]) / stdG_b[i] for i in range(len(gene_pairs_ind))]
     
     EG2_gp = [EG2_a[i] if np.abs((C_gp[i] - EG[i]) / stdG_a[i]) < np.abs((C_gp[i] - EG[i]) / stdG_b[i]) else EG2_b[i] for i in range(len(gene_pairs_ind))]
+    
     EG2_m = compute_metabolite_cs(np.array(EG2_gp), cell_type_key, gene_pair_dict, interacting_cell_scores=False)
     
     # Metabolites
@@ -1767,20 +1754,6 @@ def compute_np_results(ct_pair, cell_type_pairs, gene_pair_cor_gp, gene_pair_cor
     p_values_gp = list(np.concatenate(p_values_gp))
 
     return (C_gp, p_values_gp, C_m, p_values_m)
-
-
-def account_for_same_gene_in_pair(gene_pair_cor_gp, gene_pairs_ind):
-    
-    C_gp = []
-    for gene_pair_ind in gene_pairs_ind:
-        idx = gene_pairs_ind.index(gene_pair_ind)
-        g1_ind, g2_ind = gene_pair_ind
-        lc_gp = gene_pair_cor_gp[idx]
-        if g1_ind == g2_ind:
-            lc_gp = lc_gp/2
-        C_gp.append(lc_gp)
-    
-    return np.array(C_gp)
 
 
 def get_cell_communication_results(
