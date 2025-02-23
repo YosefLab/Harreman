@@ -598,26 +598,24 @@ def run_cell_communication_analysis(
 
         counts = counts_from_anndata(adata[:, genes], layer_key_p_test, dense=True)
         num_umi = counts.sum(axis=0)
-        if sample_specific:
-            sample_key = adata.uns['sample_key']
-            for sample in adata.obs[sample_key].unique().tolist():
-                subset = np.where(adata.obs[sample_key] == sample)[0]
-                counts[:,subset] = create_centered_counts_ct(counts[:,subset], model, num_umi[subset], cell_types[subset]) if cell_type_key else create_centered_counts(counts[:,subset], model, num_umi[subset])
+        counts = standardize_ct_counts(adata, counts, model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts, model, num_umi, sample_specific)
+        
+        if mean == 'algebraic':
+            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else counts_from_anndata(adata[:, [genes[i] for i in gene_pair[0]]], layer_key_p_test, dense=True).mean(0) for gene_pair in gene_pairs_ind])
+            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else counts_from_anndata(adata[:, [genes[i] for i in gene_pair[1]]], layer_key_p_test, dense=True).mean(0) for gene_pair in gene_pairs_ind])
         else:
-            counts = create_centered_counts_ct(counts, model, num_umi, cell_types) if cell_type_key else create_centered_counts(counts, model, num_umi)
-        counts = np.nan_to_num(counts)
-        counts = sparse.COO.from_numpy(counts) if cell_type_key else counts
+            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else gmean(counts_from_anndata(adata[:, [genes[i] for i in gene_pair[0]]], layer_key_p_test, dense=True), axis=0) for gene_pair in gene_pairs_ind])
+            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else gmean(counts_from_anndata(adata[:, [genes[i] for i in gene_pair[1]]], layer_key_p_test, dense=True), axis=0) for gene_pair in gene_pairs_ind])
+        
+        subunits_1 = [i for i, (a, b) in enumerate(gene_pairs_ind) if isinstance(a, list)]
+        subunits_2 = [i for i, (a, b) in enumerate(gene_pairs_ind) if isinstance(b, list)]
+        counts_1[subunits_1,:] = standardize_ct_counts(adata, counts_1[subunits_1,:], model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts_1[subunits_1,:], model, num_umi, sample_specific)
+        counts_2[subunits_2,:] = standardize_ct_counts(adata, counts_2[subunits_2,:], model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts_2[subunits_2,:], model, num_umi, sample_specific)
         
         eg2s_gp = conditional_eg2_cellcom_gp(counts, weights_ct_pairs) if cell_type_key else conditional_eg2_cellcom_gp(counts, weights)
         
-        if mean == 'algebraic':
-            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else counts[gene_pair[0]].mean(0) for gene_pair in gene_pairs_ind])
-            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else counts[gene_pair[1]].mean(0) for gene_pair in gene_pairs_ind])
-        else:
-            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else gmean(counts[gene_pair[0]], axis=0) for gene_pair in gene_pairs])
-            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else gmean(counts[gene_pair[1]], axis=0) for gene_pair in gene_pairs])
-        
         cs_gp = compute_CCC_scores(counts_1, counts_2, weights_ct_pairs, gene_pairs) if cell_type_key else compute_CCC_scores(counts_1, counts_2, weights, gene_pairs)
+        cs_m = compute_metabolite_cs(cs_gp, cell_type_key, gene_pair_dict, interacting_cell_scores=False)
 
         if cell_type_key:
             compute_p_results_partial = partial(
@@ -633,16 +631,12 @@ def run_cell_communication_analysis(
             )
 
             p_results = list(map(compute_p_results_partial, cell_type_pairs))
-            C_scores_gp = np.vstack([x[0] for x in p_results])
-            Z_scores_gp = np.vstack([x[1] for x in p_results])
-            C_scores_m = np.vstack([x[2] for x in p_results])
-            Z_scores_m = np.vstack([x[3] for x in p_results])
+            Z_scores_gp = np.vstack([x[0] for x in p_results])
+            Z_scores_m = np.vstack([x[1] for x in p_results])
         else:
-            p_results = compute_p_results_no_ct(cs_gp, gene_pairs_ind, Wtot2, eg2s_gp, cell_type_key, gene_pair_dict)
-            C_scores_gp = p_results[0]
-            Z_scores_gp = p_results[1]
-            C_scores_m = p_results[2]
-            Z_scores_m = p_results[3]
+            p_results = compute_p_results_no_ct(cs_gp, cs_m, gene_pairs_ind, Wtot2, eg2s_gp, cell_type_key, gene_pair_dict)
+            Z_scores_gp = p_results[0]
+            Z_scores_m = p_results[1]
 
             genes_ = pd.Series([gene for gene_pair in gene_pairs for gene in gene_pair]).drop_duplicates().tolist()
             genes_ = [tuple(i) if isinstance(i, list) else i for i in genes_]
@@ -662,12 +656,12 @@ def run_cell_communication_analysis(
         Z_pvals_gp = norm.sf(Z_scores_gp)
         Z_pvals_m = norm.sf(Z_scores_m)
 
-        adata.uns['ccc_results']['p']['gp']['cs'] = C_scores_gp
+        adata.uns['ccc_results']['p']['gp']['cs'] = cs_gp
         adata.uns['ccc_results']['p']['gp']['Z'] = Z_scores_gp
         adata.uns['ccc_results']['p']['gp']['Z_pval'] = Z_pvals_gp
         adata.uns['ccc_results']['p']['gp']['Z_FDR'] = multipletests(Z_pvals_gp.flatten(), method="fdr_bh")[1].reshape(Z_pvals_gp.shape)
         
-        adata.uns['ccc_results']['p']['m']['cs'] = C_scores_m
+        adata.uns['ccc_results']['p']['m']['cs'] = cs_m
         adata.uns['ccc_results']['p']['m']['Z'] = Z_scores_m
         adata.uns['ccc_results']['p']['m']['Z_pval'] = Z_pvals_m
         adata.uns['ccc_results']['p']['m']['Z_FDR'] = multipletests(Z_pvals_m.flatten(), method="fdr_bh")[1].reshape(Z_pvals_m.shape)
@@ -684,22 +678,20 @@ def run_cell_communication_analysis(
 
         if center_counts_for_np_test:
             num_umi = counts.sum(axis=0)
-            if sample_specific:
-                sample_key = adata.uns['sample_key']
-                for sample in adata.obs[sample_key].unique().tolist():
-                    subset = np.where(adata.obs[sample_key] == sample)[0]
-                    counts[:,subset] = create_centered_counts_ct(counts[:,subset], model, num_umi[subset], cell_types[subset]) if cell_type_key else create_centered_counts(counts[:,subset], model, num_umi[subset])
-            else:
-                counts = create_centered_counts_ct(counts, model, num_umi, cell_types) if cell_type_key else create_centered_counts(counts, model, num_umi)
-            counts = np.nan_to_num(counts)
-            counts = sparse.COO.from_numpy(counts) if cell_type_key else counts
+            counts = standardize_ct_counts(adata, counts, model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts, model, num_umi, sample_specific)
 
         if mean == 'algebraic':
-            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else counts[gene_pair[0]].mean(0) for gene_pair in gene_pairs_ind])
-            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else counts[gene_pair[1]].mean(0) for gene_pair in gene_pairs_ind])
+            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else counts_from_anndata(adata[:, [genes[i] for i in gene_pair[0]]], layer_key_np_test, dense=True).mean(0) for gene_pair in gene_pairs_ind])
+            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else counts_from_anndata(adata[:, [genes[i] for i in gene_pair[1]]], layer_key_np_test, dense=True).mean(0) for gene_pair in gene_pairs_ind])
         else:
-            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else gmean(counts[gene_pair[0]], axis=0) for gene_pair in gene_pairs])
-            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else gmean(counts[gene_pair[1]], axis=0) for gene_pair in gene_pairs])
+            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else gmean(counts_from_anndata(adata[:, [genes[i] for i in gene_pair[0]]], layer_key_np_test, dense=True), axis=0) for gene_pair in gene_pairs_ind])
+            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else gmean(counts_from_anndata(adata[:, [genes[i] for i in gene_pair[1]]], layer_key_np_test, dense=True), axis=0) for gene_pair in gene_pairs_ind])
+        
+        if center_counts_for_np_test:
+            subunits_1 = [i for i, (a, b) in enumerate(gene_pairs_ind) if isinstance(a, list)]
+            subunits_2 = [i for i, (a, b) in enumerate(gene_pairs_ind) if isinstance(b, list)]
+            counts_1[subunits_1,:] = standardize_ct_counts(adata, counts_1[subunits_1,:], model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts_1[subunits_1,:], model, num_umi, sample_specific)
+            counts_2[subunits_2,:] = standardize_ct_counts(adata, counts_2[subunits_2,:], model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts_2[subunits_2,:], model, num_umi, sample_specific)
         
         if center_counts_for_np_test and test == 'both':
             adata.uns['ccc_results']['np']['gp']['cs'] = np.array(adata.uns['ccc_results']['p']['gp']['cs'])
@@ -772,6 +764,35 @@ def run_cell_communication_analysis(
     adata.uns["cell_types"] = cell_types.tolist() if cell_type_key else None
     
     return
+
+
+def standardize_counts(adata, counts, model, num_umi, sample_specific):
+
+    if sample_specific:
+        sample_key = adata.uns['sample_key']
+        for sample in adata.obs[sample_key].unique().tolist():
+            subset = np.where(adata.obs[sample_key] == sample)[0]
+            counts[:,subset] = create_centered_counts(counts[:,subset], model, num_umi[subset])
+    else:
+        counts = create_centered_counts(counts, model, num_umi)
+    counts = np.nan_to_num(counts)
+    
+    return counts
+
+
+def standardize_ct_counts(adata, counts, model, num_umi, sample_specific, cell_types):
+
+    if sample_specific:
+        sample_key = adata.uns['sample_key']
+        for sample in adata.obs[sample_key].unique().tolist():
+            subset = np.where(adata.obs[sample_key] == sample)[0]
+            counts[:,subset] = create_centered_counts_ct(counts[:,subset], model, num_umi[subset], cell_types[subset])
+    else:
+        counts = create_centered_counts_ct(counts, model, num_umi, cell_types)
+    counts = np.nan_to_num(counts)
+    counts = sparse.COO.from_numpy(counts)
+    
+    return counts
 
 
 def flatten(nested_list):
@@ -875,10 +896,9 @@ def compute_metabolite_scores(
 def compute_interacting_cell_scores(
     adata: Union[str, AnnData],
     center_counts_for_np_test: Optional[bool] = False,
-    test: Optional[Union[Literal["parametric"], Literal["non-parametric"]]] = None,
+    test: Optional[Union[Literal["parametric"], Literal["non-parametric"], Literal["both"]]] = "both",
     subset_gene_pairs: Optional[list] = None,
     subset_metabolites: Optional[list] = None,
-    compute_significance: Optional[bool] = False,
     only_sig_results: Optional[bool] = True,
     M: Optional[int] = 1000,
 ):
@@ -1021,11 +1041,15 @@ def compute_interacting_cell_scores(
             continue
         gene_pair_dict[metabolite] = indexes
     metabolites = list(gene_pair_dict.keys())
+    
+    adata.uns['metabolites'] = metabolites
 
     gene_pairs_sig_names = [
         "_".join("_".join(g) if isinstance(g, list) else g for g in gp) 
         for gp in gene_pairs_sig
     ]
+    
+    adata.uns['gene_pairs_sig_names'] = gene_pairs_sig_names
 
     if cell_type_key:
         weights = sparse.COO.from_scipy_sparse(weights)
@@ -1036,57 +1060,38 @@ def compute_interacting_cell_scores(
     if test in ['parametric', 'both']:
 
         print("Running the parametric test...")
-
-        if mean == 'algebraic':
-            counts_1 = np.vstack([counts_from_anndata(adata[:, gene_pair[0]], layer_key_p_test, dense=True) if type(gene_pair[0]) is not list else counts_from_anndata(adata[:, gene_pair[0]], layer_key_p_test, dense=True).mean(0) for gene_pair in gene_pairs_sig])
-            counts_2 = np.vstack([counts_from_anndata(adata[:, gene_pair[1]], layer_key_p_test, dense=True) if type(gene_pair[1]) is not list else counts_from_anndata(adata[:, gene_pair[1]], layer_key_p_test, dense=True).mean(0) for gene_pair in gene_pairs_sig])
-        else:
-            counts_1 = np.vstack([counts_from_anndata(adata[:, gene_pair[0]], layer_key_p_test, dense=True) if type(gene_pair[0]) is not list else gmean(counts_from_anndata(adata[:, gene_pair[0]], layer_key_p_test, dense=True), axis=0) for gene_pair in gene_pairs_sig])
-            counts_2 = np.vstack([counts_from_anndata(adata[:, gene_pair[1]], layer_key_p_test, dense=True) if type(gene_pair[1]) is not list else gmean(counts_from_anndata(adata[:, gene_pair[1]], layer_key_p_test, dense=True), axis=0) for gene_pair in gene_pairs_sig])
-
-        num_umi_1 = counts_1.sum(axis=0)
-        num_umi_2 = counts_2.sum(axis=0)
-        if sample_specific:
-            sample_key = adata.uns['sample_key']
-            for sample in adata.obs[sample_key].unique().tolist():
-                subset = np.where(adata.obs[sample_key] == sample)[0]
-                counts_1[:,subset] = create_centered_counts_ct(counts_1[:,subset], model, num_umi_1[subset], cell_types[subset]) if cell_type_key else create_centered_counts(counts_1[:,subset], model, num_umi_1[subset])
-                counts_2[:,subset] = create_centered_counts_ct(counts_2[:,subset], model, num_umi_2[subset], cell_types[subset]) if cell_type_key else create_centered_counts(counts_2[:,subset], model, num_umi_2[subset])
-        else:
-            counts_1 = create_centered_counts_ct(counts_1, model, num_umi_1, cell_types) if cell_type_key else create_centered_counts(counts_1, model, num_umi_1)
-            counts_2 = create_centered_counts_ct(counts_2, model, num_umi_2, cell_types) if cell_type_key else create_centered_counts(counts_2, model, num_umi_2)
-        counts_1 = np.nan_to_num(counts_1)
-        counts_2 = np.nan_to_num(counts_2)
-
-        cs_gp = counts_1.T * np.tensordot(weigths_ct_pairs, counts_2.T, axes=([2], [0])) if cell_type_key else (counts_1.T * (weights @ counts_2.T)) + (counts_1.T * (weights.T @ counts_2.T))
-        cs_m = compute_metabolite_cs(cs_gp, cell_type_key, gene_pair_dict, interacting_cell_scores=True)
-
+        
         adata.uns['interacting_cell_results']['p'] = {}
         adata.uns['interacting_cell_results']['p']['gp'] = {}
         adata.uns['interacting_cell_results']['p']['m'] = {}
-        adata.uns['interacting_cell_results']['p']['gp']['cs'] = cs_gp
-        adata.uns['interacting_cell_results']['p']['m']['cs'] = cs_m
-
+        
         if cell_type_key:
             weights_ct_pairs_sq_data = weights_ct_pairs.data ** 2
             weights_ct_pairs_sq = sparse.COO(weights_ct_pairs.coords, weights_ct_pairs_sq_data, shape=weights_ct_pairs.shape)
             Wtot2 = sparse.sum(weights_ct_pairs_sq, axis=2)
         else:
             Wtot2 = (weights ** 2).sum(axis=1).A1
-
+        
         counts = counts_from_anndata(adata[:, genes], layer_key_p_test, dense=True)
         num_umi = counts.sum(axis=0)
-        if sample_specific:
-            sample_key = adata.uns['sample_key']
-            for sample in adata.obs[sample_key].unique().tolist():
-                subset = np.where(adata.obs[sample_key] == sample)[0]
-                counts[:,subset] = create_centered_counts_ct(counts[:,subset], model, num_umi[subset], cell_types[subset]) if cell_type_key else create_centered_counts(counts[:,subset], model, num_umi[subset])
+        counts = standardize_ct_counts(adata, counts, model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts, model, num_umi, sample_specific)
+        
+        if mean == 'algebraic':
+            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else counts_from_anndata(adata[:, [genes[i] for i in gene_pair[0]]], layer_key_p_test, dense=True).mean(0) for gene_pair in gene_pairs_sig_ind])
+            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else counts_from_anndata(adata[:, [genes[i] for i in gene_pair[1]]], layer_key_p_test, dense=True).mean(0) for gene_pair in gene_pairs_sig_ind])
         else:
-            counts = create_centered_counts_ct(counts, model, num_umi, cell_types) if cell_type_key else create_centered_counts(counts, model, num_umi)
-        counts = np.nan_to_num(counts)
-        counts = sparse.COO.from_numpy(counts) if cell_type_key else counts
-
+            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else gmean(counts_from_anndata(adata[:, [genes[i] for i in gene_pair[0]]], layer_key_p_test, dense=True), axis=0) for gene_pair in gene_pairs_sig_ind])
+            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else gmean(counts_from_anndata(adata[:, [genes[i] for i in gene_pair[1]]], layer_key_p_test, dense=True), axis=0) for gene_pair in gene_pairs_sig_ind])
+        
+        subunits_1 = [i for i, (a, b) in enumerate(gene_pairs_sig_ind) if isinstance(a, list)]
+        subunits_2 = [i for i, (a, b) in enumerate(gene_pairs_sig_ind) if isinstance(b, list)]
+        counts_1[subunits_1,:] = standardize_ct_counts(adata, counts_1[subunits_1,:], model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts_1[subunits_1,:], model, num_umi, sample_specific)
+        counts_2[subunits_2,:] = standardize_ct_counts(adata, counts_2[subunits_2,:], model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts_2[subunits_2,:], model, num_umi, sample_specific)
+        
         eg2s_gp = conditional_eg2_gp_score(counts, weights_ct_pairs) if cell_type_key else conditional_eg2_gp_score(counts, weights)
+
+        cs_gp = compute_int_CCC_scores(counts_1, counts_2, weights_ct_pairs, gene_pairs_sig) if cell_type_key else compute_int_CCC_scores(counts_1, counts_2, weights, gene_pairs_sig)
+        cs_m = compute_metabolite_cs(cs_gp, cell_type_key, gene_pair_dict, interacting_cell_scores=True)
         
         if cell_type_key:
             compute_p_int_cell_results_partial = partial(
@@ -1102,64 +1107,96 @@ def compute_interacting_cell_scores(
             )
 
             p_results = list(map(compute_p_int_cell_results_partial, cell_type_pairs))
-            C_scores_gp = np.vstack([x[0] for x in p_results])
-            Z_scores_gp = np.vstack([x[1] for x in p_results])
-            C_scores_m = np.vstack([x[2] for x in p_results])
-            Z_scores_m = np.vstack([x[3] for x in p_results])
+            Z_scores_gp = np.vstack([x[0] for x in p_results])
+            Z_scores_m = np.vstack([x[1] for x in p_results])
         else:
-            p_results = compute_p_int_cell_results_no_ct(cs_gp, gene_pairs_sig_ind, Wtot2, eg2s_gp, cell_type_key, gene_pair_dict)
-            C_scores_gp = p_results[0]
-            Z_scores_gp = p_results[1]
-            C_scores_m = p_results[2]
-            Z_scores_m = p_results[3]
+            p_results = compute_p_int_cell_results_no_ct(cs_gp, cs_m, gene_pairs_sig_ind, Wtot2, eg2s_gp, cell_type_key, gene_pair_dict)
+            Z_scores_gp = p_results[0]
+            Z_scores_m = p_results[1]
 
         Z_pvals_gp = norm.sf(Z_scores_gp)
         Z_pvals_m = norm.sf(Z_scores_m)
 
-        adata.uns['interacting_cell_results']['p']['gp']['cs'] = C_scores_gp
+        adata.uns['interacting_cell_results']['p']['gp']['cs'] = cs_gp
         adata.uns['interacting_cell_results']['p']['gp']['Z'] = Z_scores_gp
         adata.uns['interacting_cell_results']['p']['gp']['Z_pval'] = Z_pvals_gp
         adata.uns['interacting_cell_results']['p']['gp']['Z_FDR'] = multipletests(Z_pvals_gp.flatten(), method="fdr_bh")[1].reshape(Z_pvals_gp.shape)
         
-        adata.uns['interacting_cell_results']['p']['m']['cs'] = C_scores_m
+        adata.uns['interacting_cell_results']['p']['m']['cs'] = cs_m
         adata.uns['interacting_cell_results']['p']['m']['Z'] = Z_scores_m
         adata.uns['interacting_cell_results']['p']['m']['Z_pval'] = Z_pvals_m
         adata.uns['interacting_cell_results']['p']['m']['Z_FDR'] = multipletests(Z_pvals_m.flatten(), method="fdr_bh")[1].reshape(Z_pvals_m.shape)
+        
+        # P-value
+        mask_gp = adata.uns['interacting_cell_results']['p']['gp']['Z_pval'] < 0.05
+        mask_m = adata.uns['interacting_cell_results']['p']['m']['Z_pval'] < 0.05
+
+        cs_gp_sig = adata.uns['interacting_cell_results']['p']['gp']['cs'].copy()
+        cs_m_sig = adata.uns['interacting_cell_results']['p']['m']['cs'].copy()
+        if cell_type_key:
+            for i, ct_pair in enumerate(cell_type_pairs):
+                cs_gp_sig[ct_pair][~mask_gp[i,:,:]] = np.nan
+                cs_m_sig[ct_pair][~mask_m[i,:,:]] = np.nan
+            adata.uns['interacting_cell_results']['p']['gp']['cs_sig_pval'] = cs_gp_sig
+            adata.uns['interacting_cell_results']['p']['m']['cs_sig_pval'] = cs_m_sig
+            
+        else:
+            cs_gp_sig[~mask_gp] = np.nan
+            cs_m_sig[~mask_m] = np.nan
+            adata.uns['interacting_cell_results']['p']['gp']['cs_sig_pval'] = cs_gp_sig
+            adata.uns['interacting_cell_results']['p']['m']['cs_sig_pval'] = cs_m_sig
+
+        # FDR
+        mask_gp = adata.uns['interacting_cell_results']['p']['gp']['Z_FDR'] < 0.05
+        mask_m = adata.uns['interacting_cell_results']['p']['m']['Z_FDR'] < 0.05
+
+        cs_gp_sig = adata.uns['interacting_cell_results']['p']['gp']['cs'].copy()
+        cs_m_sig = adata.uns['interacting_cell_results']['p']['m']['cs'].copy()
+        if cell_type_key:
+            for i, ct_pair in enumerate(cell_type_pairs):
+                cs_gp_sig[ct_pair][~mask_gp[i,:,:]] = np.nan
+                cs_m_sig[ct_pair][~mask_m[i,:,:]] = np.nan
+            adata.uns['interacting_cell_results']['p']['gp']['cs_sig_FDR'] = cs_gp_sig
+            adata.uns['interacting_cell_results']['p']['m']['cs_sig_FDR'] = cs_m_sig
+            
+        else:
+            cs_gp_sig[~mask_gp] = np.nan
+            cs_m_sig[~mask_m] = np.nan
+            adata.uns['interacting_cell_results']['p']['gp']['cs_sig_FDR'] = cs_gp_sig
+            adata.uns['interacting_cell_results']['p']['m']['cs_sig_FDR'] = cs_m_sig
         
     if test in ["non-parametric", "both"]:
 
         print("Running the non-parametric test...")
         
-        if mean == 'algebraic':
-            counts_1 = np.vstack([counts_from_anndata(adata[:, gene_pair[0]], layer_key_np_test, dense=True) if type(gene_pair[0]) is not list else counts_from_anndata(adata[:, gene_pair[0]], layer_key_p_test, dense=True).mean(0) for gene_pair in gene_pairs_sig])
-            counts_2 = np.vstack([counts_from_anndata(adata[:, gene_pair[1]], layer_key_np_test, dense=True) if type(gene_pair[1]) is not list else counts_from_anndata(adata[:, gene_pair[1]], layer_key_p_test, dense=True).mean(0) for gene_pair in gene_pairs_sig])
-        else:
-            counts_1 = np.vstack([counts_from_anndata(adata[:, gene_pair[0]], layer_key_np_test, dense=True) if type(gene_pair[0]) is not list else gmean(counts_from_anndata(adata[:, gene_pair[0]], layer_key_p_test, dense=True), axis=0) for gene_pair in gene_pairs_sig])
-            counts_2 = np.vstack([counts_from_anndata(adata[:, gene_pair[1]], layer_key_np_test, dense=True) if type(gene_pair[1]) is not list else gmean(counts_from_anndata(adata[:, gene_pair[1]], layer_key_p_test, dense=True), axis=0) for gene_pair in gene_pairs_sig])
-        
-        if center_counts_for_np_test:
-            num_umi_1 = counts_1.sum(axis=0)
-            num_umi_2 = counts_2.sum(axis=0)
-            if sample_specific:
-                sample_key = adata.uns['sample_key']
-                for sample in adata.obs[sample_key].unique().tolist():
-                    subset = np.where(adata.obs[sample_key] == sample)[0]
-                    counts_1[:,subset] = create_centered_counts_ct(counts_1[:,subset], model, num_umi_1[subset], cell_types[subset]) if cell_type_key else create_centered_counts(counts_1[:,subset], model, num_umi_1[subset])
-                    counts_2[:,subset] = create_centered_counts_ct(counts_2[:,subset], model, num_umi_2[subset], cell_types[subset]) if cell_type_key else create_centered_counts(counts_2[:,subset], model, num_umi_2[subset])
-            else:
-                counts_1 = create_centered_counts_ct(counts_1, model, num_umi_1, cell_types) if cell_type_key else create_centered_counts(counts_1, model, num_umi_1)
-                counts_2 = create_centered_counts_ct(counts_2, model, num_umi_2, cell_types) if cell_type_key else create_centered_counts(counts_2, model, num_umi_2)
-            counts_1 = np.nan_to_num(counts_1)
-            counts_2 = np.nan_to_num(counts_2)
-        
         adata.uns['interacting_cell_results']['np'] = {}
         adata.uns['interacting_cell_results']['np']['gp'] = {}
         adata.uns['interacting_cell_results']['np']['m'] = {}
+        
+        counts = counts_from_anndata(adata[:, genes], layer_key_np_test, dense=True)
+
+        if center_counts_for_np_test:
+            num_umi = counts.sum(axis=0)
+            counts = standardize_ct_counts(adata, counts, model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts, model, num_umi, sample_specific)
+        
+        if mean == 'algebraic':
+            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else counts_from_anndata(adata[:, [genes[i] for i in gene_pair[0]]], layer_key_np_test, dense=True).mean(0) for gene_pair in gene_pairs_sig_ind])
+            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else counts_from_anndata(adata[:, [genes[i] for i in gene_pair[1]]], layer_key_np_test, dense=True).mean(0) for gene_pair in gene_pairs_sig_ind])
+        else:
+            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else gmean(counts_from_anndata(adata[:, [genes[i] for i in gene_pair[0]]], layer_key_np_test, dense=True), axis=0) for gene_pair in gene_pairs_sig_ind])
+            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else gmean(counts_from_anndata(adata[:, [genes[i] for i in gene_pair[1]]], layer_key_np_test, dense=True), axis=0) for gene_pair in gene_pairs_sig_ind])
+        
+        if center_counts_for_np_test:
+            subunits_1 = [i for i, (a, b) in enumerate(gene_pairs_sig_ind) if isinstance(a, list)]
+            subunits_2 = [i for i, (a, b) in enumerate(gene_pairs_sig_ind) if isinstance(b, list)]
+            counts_1[subunits_1,:] = standardize_ct_counts(adata, counts_1[subunits_1,:], model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts_1[subunits_1,:], model, num_umi, sample_specific)
+            counts_2[subunits_2,:] = standardize_ct_counts(adata, counts_2[subunits_2,:], model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts_2[subunits_2,:], model, num_umi, sample_specific)
+        
         if center_counts_for_np_test and test == 'both':
             adata.uns['interacting_cell_results']['np']['gp']['cs'] = np.array(adata.uns['interacting_cell_results']['p']['gp']['cs'])
             adata.uns['interacting_cell_results']['np']['m']['cs'] = np.array(adata.uns['interacting_cell_results']['p']['m']['cs'])
         else:
-            cs_gp = counts_1.T * np.tensordot(weigths_ct_pairs, counts_2.T, axes=([2], [0])) if cell_type_key else (counts_1.T * (weights @ counts_2.T)) + (counts_1.T * (weights.T @ counts_2.T))
+            cs_gp = compute_int_CCC_scores(counts_1, counts_2, weights_ct_pairs, gene_pairs_sig) if cell_type_key else compute_int_CCC_scores(counts_1, counts_2, weights, gene_pairs_sig)
             cs_m = compute_metabolite_cs(cs_gp, cell_type_key, gene_pair_dict, interacting_cell_scores=True)
             adata.uns['interacting_cell_results']['np']['gp']['cs'] = cs_gp
             adata.uns['interacting_cell_results']['np']['m']['cs'] = cs_m
@@ -1179,12 +1216,12 @@ def compute_interacting_cell_scores(
                 weigths_ct_pairs_perm_t = weigths_ct_pairs_perm.transpose(axes=(0, 2, 1))
                 weigths_ct_pairs_perm = weigths_ct_pairs_perm + weigths_ct_pairs_perm_t
                 
-                perm_cs_gp = counts_1.T * np.tensordot(weigths_ct_pairs_perm, counts_2.T, axes=([2], [0]))
+                perm_cs_gp = compute_int_CCC_scores(counts_1, counts_2, weigths_ct_pairs_perm, gene_pairs_sig)
                 perm_cs_m = compute_metabolite_cs(perm_cs_gp, cell_type_key, gene_pair_dict, interacting_cell_scores=True)
                 adata.uns['interacting_cell_results']['np']['gp']['perm_cs'][:, :, :, i] = perm_cs_gp
                 adata.uns['interacting_cell_results']['np']['m']['perm_cs'][:, :, :, i] = perm_cs_m
             else:
-                perm_cs_gp = (counts_1.T * (weights @ counts_2.T)) + (counts_1.T * (weights.T @ counts_2.T))
+                perm_cs_gp = compute_int_CCC_scores(counts_1, counts_2, weights, gene_pairs_sig)
                 perm_cs_m = compute_metabolite_cs(perm_cs_gp, cell_type_key, gene_pair_dict, interacting_cell_scores=True)
                 adata.uns['interacting_cell_results']['np']['gp']['perm_cs'][:, :, i] = perm_cs_gp
                 adata.uns['interacting_cell_results']['np']['m']['perm_cs'][:, :, i] = perm_cs_m
@@ -1203,75 +1240,44 @@ def compute_interacting_cell_scores(
         
         adata.uns['interacting_cell_results']['np']['m']['pval'] = pvals_m
         adata.uns['interacting_cell_results']['np']['m']['FDR'] = multipletests(pvals_m.flatten(), method="fdr_bh")[1].reshape(pvals_m.shape)
-
-        # axis = 3 if cell_type_key else 2
-        
-        # mean_gp = np.mean(adata.uns['interacting_cell_results']['np']['gp']['perm_cs'], axis=axis)
-        # std_gp = np.std(adata.uns['interacting_cell_results']['np']['gp']['perm_cs'], axis=axis)
-        # z_scored_cs_gp = (cs_gp - mean_gp) / std_gp
-        
-        # mean_m = np.mean(adata.uns['interacting_cell_results']['np']['m']['perm_cs'], axis=axis)
-        # std_m = np.std(adata.uns['interacting_cell_results']['np']['m']['perm_cs'], axis=axis)
-        # z_scored_cs_m = (cs_m - mean_m) / std_m
-        
-        # interacting_cell_scores_gp_zscore = pd.DataFrame(z_scored_cs_gp, index = cells, columns = gene_pairs_sig_names) if cell_type_key is None else {ct_pair: pd.DataFrame(z_scored_cs_gp[i,:,:], index = cells, columns = gene_pairs_sig_names) for i, ct_pair in enumerate(gene_pairs_per_ct_pair_sig.keys())}
-        # adata.uns['interacting_cell_scores_gp_zscore'] = interacting_cell_scores_gp_zscore
-
-        # interacting_cell_scores_m_zscore = pd.DataFrame(z_scored_cs_m, index = cells, columns = metabolites) if cell_type_key is None else {ct_pair: pd.DataFrame(z_scored_cs_m[i,:,:], index = cells, columns = metabolites) for i, ct_pair in enumerate(gene_pairs_per_ct_pair_sig.keys())}
-        # if cell_type_key:
-        #     adata.uns['interacting_cell_scores_m_zscore'] = {ct_pair: interacting_cell_scores_m_zscore[ct_pair][subset_metabolites] for ct_pair in cell_type_pairs} if subset_metabolites else interacting_cell_scores_m_zscore
-        # else:
-        #     adata.uns['interacting_cell_scores_m_zscore'] = interacting_cell_scores_m_zscore[subset_metabolites] if subset_metabolites else interacting_cell_scores_m_zscore
-    
-
-    interacting_cell_scores_gp = pd.DataFrame(cs_gp, index = cells, columns = gene_pairs_sig_names) if cell_type_key is None else {ct_pair: pd.DataFrame(cs_gp[i,:,:], index = cells, columns = gene_pairs_sig_names) for i, ct_pair in enumerate(gene_pairs_per_ct_pair_sig.keys())}
-    adata.uns['interacting_cell_scores_gp'] = interacting_cell_scores_gp
-
-    interacting_cell_scores_m = pd.DataFrame(cs_m, index = cells, columns = metabolites) if cell_type_key is None else {ct_pair: pd.DataFrame(cs_m[i,:,:], index = cells, columns = metabolites) for i, ct_pair in enumerate(gene_pairs_per_ct_pair_sig.keys())}
-    if cell_type_key:
-        adata.uns['interacting_cell_scores_m'] = {ct_pair: interacting_cell_scores_m[ct_pair][subset_metabolites] for ct_pair in cell_type_pairs} if subset_metabolites else interacting_cell_scores_m
-    else:
-        adata.uns['interacting_cell_scores_m'] = interacting_cell_scores_m[subset_metabolites] if subset_metabolites else interacting_cell_scores_m
-    
-    if compute_significance:
         
         # P-value
         mask_gp = adata.uns['interacting_cell_results']['np']['gp']['pval'] < 0.05
         mask_m = adata.uns['interacting_cell_results']['np']['m']['pval'] < 0.05
         
-        interacting_cell_scores_gp_sig = interacting_cell_scores_gp.copy()
-        interacting_cell_scores_m_sig = interacting_cell_scores_m.copy()
+        cs_gp_sig = adata.uns['interacting_cell_results']['np']['gp']['cs'].copy()
+        cs_m_sig = adata.uns['interacting_cell_results']['np']['m']['cs'].copy()
         if cell_type_key:
             for i, ct_pair in enumerate(cell_type_pairs):
-                interacting_cell_scores_gp_sig[ct_pair][~mask_gp[i,:,:]] = 0
-                interacting_cell_scores_m_sig[ct_pair][~mask_m[i,:,:]] = 0
-            adata.uns['interacting_cell_scores_gp_sig_pval'] = interacting_cell_scores_gp_sig
-            adata.uns['interacting_cell_scores_m_sig_pval'] = {ct_pair: interacting_cell_scores_m_sig[ct_pair][subset_metabolites] for ct_pair in cell_type_pairs} if subset_metabolites else interacting_cell_scores_m_sig
+                cs_gp_sig[ct_pair][~mask_gp[i,:,:]] = np.nan
+                cs_m_sig[ct_pair][~mask_m[i,:,:]] = np.nan
+            adata.uns['interacting_cell_results']['np']['gp']['cs_sig_pval'] = cs_gp_sig
+            adata.uns['interacting_cell_results']['np']['m']['cs_sig_pval'] = cs_m_sig
             
         else:
-            interacting_cell_scores_gp_sig[~mask_gp] = 0
-            interacting_cell_scores_m_sig[~mask_m] = 0
-            adata.uns['interacting_cell_scores_gp_sig_pval'] = interacting_cell_scores_gp_sig
-            adata.uns['interacting_cell_scores_m_sig_pval'] = interacting_cell_scores_m_sig[subset_metabolites] if subset_metabolites else interacting_cell_scores_m_sig   
+            cs_gp_sig[~mask_gp] = np.nan
+            cs_m_sig[~mask_m] = np.nan
+            adata.uns['interacting_cell_results']['np']['gp']['cs_sig_pval'] = cs_gp_sig
+            adata.uns['interacting_cell_results']['np']['m']['cs_sig_pval'] = cs_m_sig
         
         # FDR
         mask_gp = adata.uns['interacting_cell_results']['np']['gp']['FDR'] < 0.05
         mask_m = adata.uns['interacting_cell_results']['np']['m']['FDR'] < 0.05
         
-        interacting_cell_scores_gp_sig = interacting_cell_scores_gp.copy()
-        interacting_cell_scores_m_sig = interacting_cell_scores_m.copy()
+        cs_gp_sig = adata.uns['interacting_cell_results']['np']['gp']['cs'].copy()
+        cs_m_sig = adata.uns['interacting_cell_results']['np']['m']['cs'].copy()
         if cell_type_key:
             for i, ct_pair in enumerate(cell_type_pairs):
-                interacting_cell_scores_gp_sig[ct_pair][~mask_gp[i,:,:]] = 0
-                interacting_cell_scores_m_sig[ct_pair][~mask_m[i,:,:]] = 0
-            adata.uns['interacting_cell_scores_gp_sig_FDR'] = interacting_cell_scores_gp_sig
-            adata.uns['interacting_cell_scores_m_sig_FDR'] = {ct_pair: interacting_cell_scores_m_sig[ct_pair][subset_metabolites] for ct_pair in cell_type_pairs} if subset_metabolites else interacting_cell_scores_m_sig
+                cs_gp_sig[ct_pair][~mask_gp[i,:,:]] = np.nan
+                cs_m_sig[ct_pair][~mask_m[i,:,:]] = np.nan
+            adata.uns['interacting_cell_results']['np']['gp']['cs_sig_FDR'] = cs_gp_sig
+            adata.uns['interacting_cell_results']['np']['m']['cs_sig_FDR'] = cs_m_sig
             
         else:
-            interacting_cell_scores_gp_sig[~mask_gp] = 0
-            interacting_cell_scores_m_sig[~mask_m] = 0
-            adata.uns['interacting_cell_scores_gp_sig_FDR'] = interacting_cell_scores_gp_sig
-            adata.uns['interacting_cell_scores_m_sig_FDR'] = interacting_cell_scores_m_sig[subset_metabolites] if subset_metabolites else interacting_cell_scores_m_sig   
+            cs_gp_sig[~mask_gp] = np.nan
+            cs_m_sig[~mask_m] = np.nan
+            adata.uns['interacting_cell_results']['np']['gp']['cs_sig_FDR'] = cs_gp_sig
+            adata.uns['interacting_cell_results']['np']['m']['cs_sig_FDR'] = cs_m_sig
             
     print("Finished computing gene pair and metabolite scores in %.3f seconds" %(time.time()-start))
     
@@ -1296,155 +1302,8 @@ def compute_metabolite_cs(cs_gp, cell_type_key, gene_pair_dict, interacting_cell
     return cs_m
 
 
-# def get_metabolite_scores(results, metabolite_gene_pair_df, gene_pairs, cells):
-
-#     results = pd.DataFrame(results, index = cells, columns = gene_pairs)
-    
-#     metabolite_gene_pair_df = metabolite_gene_pair_df[metabolite_gene_pair_df.gene_pair.isin(results.columns)]
-
-#     results_transposed = results.T
-#     results_transposed.index = ['-'.join('-'.join(elem) if isinstance(elem, list) else elem for elem in tup) for tup in results_transposed.index]
-#     df_metabolites_grouped = pd.DataFrame(index=results.index)
-
-#     for metabolite, group in metabolite_gene_pair_df.groupby('metabolite'):
-#         gene_pairs = group['gene_pair'].tolist()
-#         gene_pairs = ['-'.join('-'.join(elem) if isinstance(elem, list) else elem for elem in tup) for tup in gene_pairs]
-#         df_metabolites_grouped[metabolite] = results_transposed.loc[gene_pairs].sum()
-
-#     unique_ind = len(df_metabolites_grouped.index.unique()) == df_metabolites_grouped.shape[0]
-#     interacting_cell_scores = df_metabolites_grouped.groupby(df_metabolites_grouped.index).sum() if not unique_ind else df_metabolites_grouped
-
-#     return interacting_cell_scores
-
-
 def ensure_tuple(x):
     return tuple(tuple(i) if isinstance(i, list) else i for i in x)
-
-
-# def extract_ct_pair_interacting_scores(
-#     ct_pair, gene_pairs_per_ct_pair_sig, metabolite_gene_pair_df, counts, weights, cell_types, cells, genes, func
-# ):
-    
-#     gene_pairs = gene_pairs_per_ct_pair_sig[ct_pair]
-
-#     compute_interacting_cell_scores_row_partial = partial(
-#         compute_interacting_cell_scores_row,
-#         ct_pair=ct_pair,
-#         counts=counts,
-#         weights=weights,
-#         cell_types=cell_types,
-#         cells=cells,
-#         genes=genes,
-#         func=func,
-#     )
-#     results = pd.concat(list(map(compute_interacting_cell_scores_row_partial, gene_pairs)), axis=1)
-
-#     metabolite_gene_pair_df = metabolite_gene_pair_df[metabolite_gene_pair_df.gene_pair.isin(results.columns)]
-
-#     results_transposed = results.T
-#     results_transposed.index = ['-'.join('-'.join(elem) if isinstance(elem, list) else elem for elem in tup) for tup in results_transposed.index]
-#     df_metabolites_grouped = pd.DataFrame(index=results.index)
-
-#     for metabolite, group in metabolite_gene_pair_df.groupby('metabolite'):
-#         gene_pairs = group['gene_pair'].tolist()
-#         gene_pairs = ['-'.join('-'.join(elem) if isinstance(elem, list) else elem for elem in tup) for tup in gene_pairs]
-#         df_metabolites_grouped[metabolite] = results_transposed.loc[gene_pairs].sum()
-
-#     unique_ind = len(df_metabolites_grouped.index.unique()) == df_metabolites_grouped.shape[0]
-#     df_metabolites_grouped = df_metabolites_grouped.groupby(df_metabolites_grouped.index).sum() if not unique_ind else df_metabolites_grouped
-    
-#     ct_pair_results_dict = {ct_pair: df_metabolites_grouped}
-
-#     return ct_pair_results_dict
-
-
-# def compute_interacting_cell_scores_row(
-#     gene_pair, ct_pair, counts, weights, cell_types, cells, genes, func,
-# ):
-
-#     ct_t, ct_u = ct_pair
-#     gene_a, gene_b = gene_pair
-#     gene_a_ind = genes.index(gene_a) if isinstance(gene_a, str) else [genes.index(g_a) for g_a in gene_a]
-#     gene_b_ind = genes.index(gene_b) if isinstance(gene_b, str) else [genes.index(g_b) for g_b in gene_b]
-#     cell_type_t_mask = cell_types == ct_t
-#     cell_type_t_mask = cell_type_t_mask.reset_index(drop=True)
-#     cell_type_u_mask = cell_types == ct_u
-#     cell_type_u_mask = cell_type_u_mask.reset_index(drop=True)
-
-#     weights_ct = weights[cell_type_t_mask,][:,cell_type_u_mask]
-#     cells_t = list(cells[cell_type_t_mask])
-#     cells_u = list(cells[cell_type_u_mask])
-#     counts_t = counts[:,cell_type_t_mask]
-#     counts_u = counts[:,cell_type_u_mask]
-
-#     interacting_cells = {"cells": [], "scores": []}
-#     interacting_cell_scores = pd.DataFrame({'scores': 0}, index = cells.tolist())
-
-#     rows, cols = weights_ct.nonzero()
-#     for i, j in zip(rows, cols):
-#         w_ij = weights_ct[i, j]
-
-#         ai = counts_t[gene_a_ind, i] if isinstance(gene_a, str) else gmean(counts_t[gene_a_ind, i])
-#         cell_i = cells_t[i]
-#         bj = counts_u[gene_b_ind, j] if isinstance(gene_b, str) else gmean(counts_u[gene_b_ind, j])
-#         cell_j = cells_u[j]
-#         cell_pair = (cell_i, cell_j)
-
-#         if ai > 0 or bj > 0:
-#             interacting_cells["cells"].append(cell_pair)
-#             if func == 'mean':
-#                 f_ai_jb = (ai+bj)/2
-#             elif func == 'min':
-#                 f_ai_jb = ai if ai <= bj else bj
-#             elif func == 'max':
-#                 f_ai_jb = ai if ai >= bj else bj
-#             elif func == 'prod':
-#                 f_ai_jb = ai * bj
-#             interacting_cells["scores"].append(w_ij * f_ai_jb)
-#             interacting_cell_scores.loc[cell_i] += w_ij * f_ai_jb
-    
-#     interacting_cell_scores.columns = [gene_pair]
-
-#     return interacting_cell_scores
-
-
-# def compute_interacting_cell_scores_no_ct_row(
-#     gene_pair, counts, weights, cells, genes, func,
-# ):
-
-#     gene_a, gene_b = gene_pair
-#     gene_a_ind = genes.index(gene_a) if isinstance(gene_a, str) else [genes.index(g_a) for g_a in gene_a]
-#     gene_b_ind = genes.index(gene_b) if isinstance(gene_b, str) else [genes.index(g_b) for g_b in gene_b]
-
-#     interacting_cells = {"cells": [], "scores": []}
-#     interacting_cell_scores = pd.DataFrame({'scores': 0}, index = cells.tolist())
-
-#     rows, cols = weights.nonzero()
-#     for i, j in zip(rows, cols):
-#         w_ij = weights[i, j]
-
-#         ai = counts[gene_a_ind, i] if isinstance(gene_a, str) else gmean(counts[gene_a_ind, i])
-#         cell_i = cells[i]
-#         bj = counts[gene_b_ind, j] if isinstance(gene_b, str) else gmean(counts[gene_b_ind, j])
-#         cell_j = cells[j]
-#         cell_pair = (cell_i, cell_j)
-
-#         if ai > 0 or bj > 0:
-#             interacting_cells["cells"].append(cell_pair)
-#             if func == 'mean':
-#                 f_ai_jb = (ai+bj)/2
-#             elif func == 'min':
-#                 f_ai_jb = ai if ai <= bj else bj
-#             elif func == 'max':
-#                 f_ai_jb = ai if ai >= bj else bj
-#             elif func == 'prod':
-#                 f_ai_jb = ai * bj
-#             interacting_cells["scores"].append(w_ij * f_ai_jb)
-#             interacting_cell_scores.loc[cell_i] += w_ij * f_ai_jb
-    
-#     interacting_cell_scores.columns = [gene_pair]
-
-#     return interacting_cell_scores
 
 
 def compute_CCC_scores(
@@ -1453,19 +1312,31 @@ def compute_CCC_scores(
     weights: sparse.COO,
     gene_pairs: list,
 ):
-    same_gene_mask = np.array([pair1 == pair2 for pair1, pair2 in gene_pairs])
-    different_gene_mask = ~same_gene_mask
 
     if len(weights.shape) == 3:
         weights_t = weights.transpose(axes=(0, 2, 1))
         scores = (counts_1.T * np.tensordot(weights + weights_t, counts_2.T, axes=([2], [0]))).sum(axis=1)
     else:
-        scores_dg = (counts_1[different_gene_mask].T * (weights @ counts_2[different_gene_mask].T)).sum(axis=0) + (counts_1[different_gene_mask].T * (weights.T @ counts_2[different_gene_mask].T)).sum(axis=0)
-        scores_sg = (counts_1[same_gene_mask].T * (weights @ counts_2[same_gene_mask].T)).sum(axis=0)
-        
-        scores = np.empty(len(gene_pairs))
-        scores[same_gene_mask] = scores_sg
-        scores[different_gene_mask] = scores_dg
+        same_gene_mask = np.array([pair1 == pair2 for pair1, pair2 in gene_pairs])
+        scores = (counts_1.T * (weights @ counts_2.T)).sum(axis=0) + (counts_1.T * (weights.T @ counts_2.T)).sum(axis=0)
+        scores[same_gene_mask] = scores[same_gene_mask]/2
+
+    return scores
+
+
+def compute_int_CCC_scores(
+    counts_1: np.array,
+    counts_2: np.array,
+    weights: sparse.COO,
+    gene_pairs: list,
+):
+    
+    if len(weights.shape) == 3:
+        scores = counts_1.T * np.tensordot(weights, counts_2.T, axes=([2], [0]))
+    else:
+        same_gene_mask = np.array([pair1 == pair2 for pair1, pair2 in gene_pairs])
+        scores = (counts_1.T * (weights @ counts_2.T)) + (counts_1.T * (weights.T @ counts_2.T))
+        scores[:, same_gene_mask] = scores[:, same_gene_mask]/2
 
     return scores
 
@@ -1628,26 +1499,20 @@ def compute_p_results(ct_pair, cell_type_pairs, gene_pair_cor_gp, gene_pairs_ind
     return (C_gp, Z_gp, C_m, Z_m)
 
 
-def compute_p_results_no_ct(gene_pair_cor_gp, gene_pairs_ind, Wtot2, eg2s_gp, cell_type_key, gene_pair_dict):
+def compute_p_results_no_ct(C_gp, C_m, gene_pairs_ind, Wtot2, eg2s_gp, cell_type_key, gene_pair_dict):
 
-    C_gp = []
     EG2_a = []
     EG2_b = []
     for gene_pair_ind in gene_pairs_ind:
-        idx = gene_pairs_ind.index(gene_pair_ind)
         g1_ind, g2_ind = gene_pair_ind
-        lc_gp = gene_pair_cor_gp[idx]
         if g1_ind == g2_ind:
             eg2_a = eg2_b = Wtot2
         else:
             eg2_a = eg2s_gp[g1_ind] if type(g1_ind) is not list else np.max(eg2s_gp[g1_ind])
             eg2_b = eg2s_gp[g2_ind] if type(g2_ind) is not list else np.max(eg2s_gp[g2_ind])
-        C_gp.append(lc_gp)
         EG2_a.append(eg2_a)
         EG2_b.append(eg2_b)
-    
-    C_m = compute_metabolite_cs(np.array(C_gp), cell_type_key, gene_pair_dict, interacting_cell_scores=False)
-    
+        
     # Gene pairs
 
     EG = [0 for i in range(len(gene_pairs_ind))]
@@ -1673,33 +1538,25 @@ def compute_p_results_no_ct(gene_pair_cor_gp, gene_pairs_ind, Wtot2, eg2s_gp, ce
 
     Z_m = [(C_m[i] - EG[i]) / stdG[i] for i in range(len(gene_pair_dict.keys()))]
 
-    return (C_gp, Z_gp, C_m, Z_m)
+    return (Z_gp, Z_m)
 
 
-def compute_p_int_cell_results_no_ct(gene_pair_cor_gp, gene_pairs_ind, Wtot2, eg2s_gp, cell_type_key, gene_pair_dict):
+def compute_p_int_cell_results_no_ct(C_gp, C_m, gene_pairs_ind, Wtot2, eg2s_gp, cell_type_key, gene_pair_dict):
 
-    C_gp = []
     EG2_a = []
     EG2_b = []
     for gene_pair_ind in gene_pairs_ind:
-        idx = gene_pairs_ind.index(gene_pair_ind)
         g1_ind, g2_ind = gene_pair_ind
-        lc_gp = gene_pair_cor_gp[:, idx]
         if g1_ind == g2_ind:
             eg2_a = eg2_b = Wtot2
-            lc_gp = lc_gp/2
         else:
             eg2_a = eg2s_gp[:, g1_ind] if type(g1_ind) is not list else np.max(eg2s_gp[:, g1_ind], axis=1)
             eg2_b = eg2s_gp[:, g2_ind] if type(g2_ind) is not list else np.max(eg2s_gp[:, g2_ind], axis=1)
-        C_gp.append(lc_gp)
         EG2_a.append(eg2_a)
         EG2_b.append(eg2_b)
 
-    C_gp = np.column_stack(C_gp)
     EG2_a = np.column_stack(EG2_a)
     EG2_b = np.column_stack(EG2_b)
-    
-    C_m = compute_metabolite_cs(C_gp, cell_type_key, gene_pair_dict, interacting_cell_scores=True)
     
     # Gene pairs
 
@@ -1714,6 +1571,7 @@ def compute_p_int_cell_results_no_ct(gene_pair_cor_gp, gene_pairs_ind, Wtot2, eg
     Z_gp = np.where(np.abs((C_gp - EG) / stdG_a) < np.abs((C_gp - EG) / stdG_b), (C_gp - EG) / stdG_a, (C_gp - EG) / stdG_b)
 
     EG2_gp = np.where(np.abs((C_gp - EG) / stdG_a) < np.abs((C_gp - EG) / stdG_b), EG2_a, EG2_b)
+    
     EG2_m = compute_metabolite_cs(EG2_gp, cell_type_key, gene_pair_dict, interacting_cell_scores=True)
     
     # Metabolites
@@ -1725,7 +1583,7 @@ def compute_p_int_cell_results_no_ct(gene_pair_cor_gp, gene_pairs_ind, Wtot2, eg
 
     Z_m = (C_m - EG) / stdG
 
-    return (C_gp, Z_gp, C_m, Z_m)
+    return (Z_gp, Z_m)
 
 
 def compute_np_results(ct_pair, cell_type_pairs, gene_pair_cor_gp, gene_pair_cor_m, pvals_gp, pvals_m, gene_pairs_ind, gene_pairs_per_ct_pair_ind):
@@ -2565,20 +2423,25 @@ def compute_score_autocorrelation(
 def compute_interaction_module_correlation(
     adata: AnnData,
     cor_method: Optional[Union[Literal["pearson"], Literal["spearman"]]] = 'pearson',
-    interaction_type: Optional[Union[Literal["metabolite"], Literal["gene_pair"], Literal["both"]]] = "both",
+    test: Optional[Union[Literal["parametric"], Literal["non-parametric"]]] = None,
+    interaction_type: Optional[Union[Literal["metabolite"], Literal["gene_pair"]]] = "metabolite",
     only_sig_values: Optional[bool] = False,
     normalize_values: Optional[bool] = False,
-    use_zscored_values: Optional[bool] = False,
     use_FDR: Optional[bool] = True,
-    use_meta_modules: Optional[bool] = False,
+    use_super_modules: Optional[bool] = False,
 ):
     
-    MODULE_KEY = 'meta_module_scores' if use_meta_modules else 'module_scores'
+    MODULE_KEY = 'super_module_scores' if use_super_modules else 'module_scores'
     
     if cor_method not in ['pearson', 'spearman']:
         raise ValueError(f'Invalid method: {cor_method}. Choose either "pearson" or "spearman".')
     
     adata.uns['cor_method'] = cor_method
+    
+    if test not in ['parametric', 'non-parametric']:
+        raise ValueError('The "test" variable should be one of ["parametric", "non-parametric"].')
+    
+    test_str = 'p' if test == 'parametric' else 'np'
     
     if interaction_type not in ["metabolite", "gene_pair"]:
         raise ValueError('The "interaction_type" variable should be one of ["metabolite", "gene_pair"].')
@@ -2587,14 +2450,15 @@ def compute_interaction_module_correlation(
 
     if only_sig_values:
         sig_str = 'FDR' if use_FDR else 'pval'
-        interaction_scores = adata.uns[f'interacting_cell_scores_{interaction_type_str}_sig_{sig_str}']
+        interaction_scores = adata.uns['interacting_cell_results'][test_str][interaction_type_str][f'cs_sig_{sig_str}']
     else:
-        interaction_scores = adata.uns[f'interacting_cell_scores_{interaction_type_str}_zscore'] if use_zscored_values else adata.uns[f'interacting_cell_scores_{interaction_type_str}']
+        interaction_scores = adata.uns['interacting_cell_results'][test_str][interaction_type_str]['cs']
 
-    if normalize_values and use_zscored_values:
-        raise ValueError('Choose either "normalize_values" or "use_zscored_values".') 
-    elif normalize_values and not use_zscored_values:
+    if normalize_values:
         interaction_scores = interaction_scores.apply(lambda x: (x - x.min()) / (x.max() - x.min()), axis=0) #We apply min-max normalization
+    
+    interaction_type_names_key = 'metabolites' if interaction_type == 'metabolite' else 'gene_pairs_sig_names'
+    interaction_scores = pd.DataFrame(interaction_scores, index=adata.obs_names, columns=adata.uns[interaction_type_names_key])
     
     metabolites = interaction_scores.columns.tolist()
     modules = adata.obsm[MODULE_KEY].columns.tolist()

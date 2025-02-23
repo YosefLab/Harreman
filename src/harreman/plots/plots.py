@@ -296,10 +296,11 @@ def plot_interacting_cell_scores(
     cell_type_pair: Optional[list] = None,
     interactions: Optional[list] = None,
     coords_obsm_key: Optional[str] = None,
+    test: Optional[Union[Literal["parametric"], Literal["non-parametric"]]] = None,
     only_sig_values: Optional[bool] = False,
     use_FDR: Optional[bool] = True,
     normalize_values: Optional[bool] = False,
-    use_zscored_values: Optional[bool] = False,
+    sample_specific: Optional[bool] = False,
     s: Optional[float] = None,
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
@@ -314,31 +315,32 @@ def plot_interacting_cell_scores(
     if isinstance(vmax, str) and 'p' not in vmax:
         raise ValueError('"vmax" needs to be either a numeric value or a percentile: e.g. "p95".')
     
+    if test not in ['parametric', 'non-parametric']:
+        raise ValueError('The "test" variable should be one of ["parametric", "non-parametric"].')
+    
+    test_str = 'p' if test == 'parametric' else 'np'
+    
+    if sample_specific and 'sample_key' not in adata.uns.keys():
+        raise ValueError('Sample information not found. Run Harreman using the "sample_key" parameter.')
+    
     if deconv_adata is not None:
-        adata.uns['interacting_cell_scores_gp'] = deconv_adata.uns['interacting_cell_scores_gp']
-        adata.uns['interacting_cell_scores_m'] = deconv_adata.uns['interacting_cell_scores_m']
-        adata.uns['interacting_cell_scores_gp_zscore'] = deconv_adata.uns['interacting_cell_scores_gp_zscore']
-        adata.uns['interacting_cell_scores_m_zscore'] = deconv_adata.uns['interacting_cell_scores_m_zscore']
-        if only_sig_values:
-            adata.uns['interacting_cell_scores_gp_sig'] = deconv_adata.uns['interacting_cell_scores_gp_sig']
-            adata.uns['interacting_cell_scores_m_sig'] = deconv_adata.uns['interacting_cell_scores_m_sig']
+        adata.uns['interacting_cell_results'] = deconv_adata.uns['interacting_cell_results']
     
     if only_sig_values:
-        if use_FDR:
-            interacting_cell_scores_gp = adata.uns['interacting_cell_scores_gp_sig_FDR']
-            interacting_cell_scores_m = adata.uns['interacting_cell_scores_m_sig_FDR']
-        else:
-            interacting_cell_scores_gp = adata.uns['interacting_cell_scores_gp_sig_pval']
-            interacting_cell_scores_m = adata.uns['interacting_cell_scores_m_sig_pval']
+        sig_str = 'FDR' if use_FDR else 'pval'
+        interacting_cell_scores_gp = adata.uns['interacting_cell_results'][test_str]['gp'][f'cs_sig_{sig_str}']
+        interacting_cell_scores_m = adata.uns['interacting_cell_results'][test_str]['m'][f'cs_sig_{sig_str}']
     else:
-        interacting_cell_scores_gp = adata.uns['interacting_cell_scores_gp_zscore'] if use_zscored_values else adata.uns['interacting_cell_scores_gp']
-        interacting_cell_scores_m = adata.uns['interacting_cell_scores_m_zscore'] if use_zscored_values else adata.uns['interacting_cell_scores_m']
+        interacting_cell_scores_gp = adata.uns['interacting_cell_results'][test_str]['gp']['cs']
+        interacting_cell_scores_m = adata.uns['interacting_cell_results'][test_str]['m']['cs']
     
     if interactions is None:
         raise ValueError("Please provide a LR pair or a metabolite.")
     
-    gene_pairs = [inter for inter in interactions if inter in interacting_cell_scores_gp.columns]
-    metabs = [inter for inter in interactions if inter in interacting_cell_scores_m.columns]
+    interacting_cell_scores_gp = pd.DataFrame(interacting_cell_scores_gp, index=adata.obs_names, columns=adata.uns['gene_pairs_sig_names'])
+    interacting_cell_scores_m = pd.DataFrame(interacting_cell_scores_m, index=adata.obs_names, columns=adata.uns['metabolites'])
+    gene_pairs = [inter for inter in interactions if inter in adata.uns['gene_pairs_sig_names']]
+    metabs = [inter for inter in interactions if inter in adata.uns['metabolites']]
     if len(gene_pairs) > 0 and len(metabs) > 0:
         interacting_cell_scores = pd.concat([interacting_cell_scores_gp, interacting_cell_scores_m], axis=1)
     elif len(gene_pairs) == 0 and len(metabs) == 0:
@@ -371,9 +373,7 @@ def plot_interacting_cell_scores(
     else:
         scores = interacting_cell_scores[ct_pair][interactions]
     
-    if normalize_values and use_zscored_values:
-        raise ValueError('Choose either "normalize_values" or "use_zscored_values".') 
-    elif normalize_values and not use_zscored_values:
+    if normalize_values:
         scores = scores.apply(lambda x: (x - x.min()) / (x.max() - x.min()), axis=0) #We apply min-max normalization
     
     for interaction in interactions:
@@ -388,9 +388,19 @@ def plot_interacting_cell_scores(
         else:
             vmax_new = vmax
         
-        plot_interaction(adata, scores, interaction, ct_pair, coords_obsm_key, s, vmin_new, vmax_new, figsize, cmap, colorbar, swap_y_axis)
-        plt.show()
-        plt.close()
+        if sample_specific:
+            sample_key = adata.uns['sample_key']
+            for sample in adata.obs[sample_key].unique().tolist():
+                print(sample)
+                adata_sample = adata[adata.obs[sample_key] == sample].copy()
+                scores_sample = scores.loc[adata.obs[sample_key] == sample].copy()
+                plot_interaction(adata_sample, scores_sample, interaction, ct_pair, coords_obsm_key, s, vmin_new, vmax_new, figsize, cmap, colorbar, swap_y_axis)
+                plt.show()
+                plt.close()
+        else:
+            plot_interaction(adata, scores, interaction, ct_pair, coords_obsm_key, s, vmin_new, vmax_new, figsize, cmap, colorbar, swap_y_axis)
+            plt.show()
+            plt.close()
 
 
 def sum_ct_pair_scores(adata):
@@ -425,7 +435,7 @@ def plot_interaction(adata, scores, interaction, ct_pair, coords_obsm_key, s, vm
         plt.scatter(coords[:,0], -coords[:,1], c=scores[interaction], cmap=cmap, s=s, vmin=vmin, vmax=vmax)
     else:
         plt.scatter(coords[:,0], coords[:,1], c=scores[interaction], cmap=cmap, s=s, vmin=vmin, vmax=vmax)
-    plt.title(f'Communication score: {interaction}; {ct_pair[0]} and {ct_pair[1]}') if ct_pair is not None else plt.title(f'Communication score: {interaction}')
+    plt.title(f'{interaction}; {ct_pair[0]} and {ct_pair[1]}') if ct_pair is not None else plt.title(f'{interaction}')
     if colorbar:
         plt.colorbar()
 
