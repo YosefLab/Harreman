@@ -392,9 +392,7 @@ def plot_interacting_cell_scores(
             sample_key = adata.uns['sample_key']
             for sample in adata.obs[sample_key].unique().tolist():
                 print(sample)
-                adata_sample = adata[adata.obs[sample_key] == sample].copy()
-                scores_sample = scores.loc[adata.obs[sample_key] == sample].copy()
-                plot_interaction(adata_sample, scores_sample, interaction, ct_pair, coords_obsm_key, s, vmin_new, vmax_new, figsize, cmap, colorbar, swap_y_axis)
+                plot_interaction(adata[adata.obs[sample_key] == sample], scores.loc[adata.obs[sample_key] == sample], interaction, ct_pair, coords_obsm_key, s, vmin_new, vmax_new, figsize, cmap, colorbar, swap_y_axis)
                 plt.show()
                 plt.close()
         else:
