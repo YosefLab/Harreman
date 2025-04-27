@@ -734,13 +734,13 @@ def run_cell_communication_analysis(
 
             if cell_type_key:
                 cell_types_perm = pd.Series(cell_types[idx])
-                weigths_ct_pairs_perm = get_ct_pair_weights(
+                weights_ct_pairs_perm = get_ct_pair_weights(
                     weights, cell_type_pairs, cell_types_perm, spatial
                 )
-                weigths_ct_pairs_perm_t = weigths_ct_pairs_perm.transpose(axes=(0, 2, 1))
-                weigths_ct_pairs_perm = weigths_ct_pairs_perm + weigths_ct_pairs_perm_t
+                # weights_ct_pairs_perm_t = weights_ct_pairs_perm.transpose(axes=(0, 2, 1))
+                # weights_ct_pairs_perm = weights_ct_pairs_perm + weights_ct_pairs_perm_t
                 
-                perm_cs_gp = compute_CCC_scores(counts_1, counts_2, weigths_ct_pairs_perm, gene_pairs)
+                perm_cs_gp = compute_CCC_scores(counts_1, counts_2, weights_ct_pairs_perm, gene_pairs)
                 perm_cs_m = compute_metabolite_cs(perm_cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_ind, ct_specific_gene_pairs, interacting_cell_scores=False)
                 adata.uns['ccc_results']['np']['gp']['perm_cs'][:, :, i] = perm_cs_gp
                 adata.uns['ccc_results']['np']['m']['perm_cs'][:, :, i] = perm_cs_m
@@ -1017,15 +1017,32 @@ def compute_interacting_cell_scores(
                 gene_pairs_per_ct_pair_sig[ct_pair].append(gene_pair)
 
         gene_pairs_per_ct_pair_sig_ind = {}
+        gene_pairs_ind_per_ct_pair_sig = {}
         for ct_pair in gene_pairs_per_ct_pair_sig.keys():
             gene_pairs = gene_pairs_per_ct_pair_sig[ct_pair]
             gene_pairs_per_ct_pair_sig_ind[ct_pair] = []
+            gene_pairs_ind_per_ct_pair_sig[ct_pair] = []
             for pair in gene_pairs_sig:
                 var1, var2 = pair
                 var1_ind = genes.index(var1) if type(var1) is not list else [genes.index(var) for var in var1 if var in genes]
                 var2_ind = genes.index(var2) if type(var2) is not list else [genes.index(var) for var in var2 if var in genes]
                 pair_tuple = (var1_ind, var2_ind)
-                gene_pairs_per_ct_pair_sig_ind[ct_pair].append(pair_tuple)
+                gene_pairs_ind_per_ct_pair_sig[ct_pair].append(pair_tuple)
+                idx = gene_pairs_sig_ind.index(pair_tuple)
+                gene_pairs_per_ct_pair_sig_ind[ct_pair].append(idx)
+        
+        def make_hashable(pair):
+            return tuple(tuple(x) if isinstance(x, list) else x for x in pair)
+        
+        gene_pairs_sig_ind_set = {make_hashable(pair) for pair in gene_pairs_sig_ind}
+        ct_specific_gene_pairs = [
+            i for i, pairs in enumerate(gene_pairs_ind_per_ct_pair_sig.values())
+            if {make_hashable(pair) for pair in pairs} < gene_pairs_sig_ind_set
+        ]
+    else:
+        gene_pairs_per_ct_pair_sig_ind = None
+        gene_pairs_ind_per_ct_pair_sig = None
+        ct_specific_gene_pairs = None
 
     if 'barcode_key' in adata.uns:
         barcode_key = adata.uns['barcode_key']
@@ -1042,11 +1059,9 @@ def compute_interacting_cell_scores(
         cell_type_pairs = [ct_pair for ct_pair in cell_type_pairs if ct_pair in gene_pairs_per_ct_pair_sig.keys()] if cell_type_pairs is not None else None
 
         weights = sparse.COO.from_scipy_sparse(weights)
-        weigths_ct_pairs = get_ct_pair_weights(
+        weights_ct_pairs = get_ct_pair_weights(
             weights, cell_type_pairs, cell_types, spatial = True,
         )
-        weigths_ct_pairs_t = weigths_ct_pairs.transpose(axes=(0, 2, 1))
-        weigths_ct_pairs = weigths_ct_pairs + weigths_ct_pairs_t
 
     if 'LR_database' in adata.uns.keys():
         LR_database = adata.uns['LR_database']
@@ -1074,12 +1089,6 @@ def compute_interacting_cell_scores(
     ]
     
     adata.uns['gene_pairs_sig_names'] = gene_pairs_sig_names
-
-    if cell_type_key:
-        weights = sparse.COO.from_scipy_sparse(weights)
-        weights_ct_pairs = get_ct_pair_weights(
-            weights, cell_type_pairs, cell_types, spatial = True,
-        )
     
     if test in ['parametric', 'both']:
 
@@ -1115,15 +1124,16 @@ def compute_interacting_cell_scores(
         eg2s_gp = conditional_eg2_gp_score(counts, weights_ct_pairs) if cell_type_key else conditional_eg2_gp_score(counts, weights)
 
         cs_gp = compute_int_CCC_scores(counts_1, counts_2, weights_ct_pairs, gene_pairs_sig) if cell_type_key else compute_int_CCC_scores(counts_1, counts_2, weights, gene_pairs_sig)
-        cs_m = compute_metabolite_cs(cs_gp, cell_type_key, gene_pair_dict, interacting_cell_scores=True)
+        cs_m = compute_metabolite_cs(cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_sig_ind, ct_specific_gene_pairs, interacting_cell_scores=True)
         
         if cell_type_key:
             compute_p_int_cell_results_partial = partial(
                 compute_p_int_cell_results,
                 cell_type_pairs=cell_type_pairs,
-                gene_pair_cor_gp=adata.uns['interacting_cell_results']['p']['gp']['cs'],
+                cs_gp=cs_gp,
+                cs_m=cs_m,
                 gene_pairs_sig_ind=gene_pairs_sig_ind,
-                gene_pairs_per_ct_pair_sig_ind=gene_pairs_per_ct_pair_sig_ind,
+                gene_pairs_ind_per_ct_pair_sig=gene_pairs_ind_per_ct_pair_sig,
                 Wtot2=Wtot2,
                 eg2s_gp=eg2s_gp,
                 cell_type_key=cell_type_key,
@@ -1131,8 +1141,10 @@ def compute_interacting_cell_scores(
             )
 
             p_results = list(map(compute_p_int_cell_results_partial, cell_type_pairs))
-            Z_scores_gp = np.vstack([x[0] for x in p_results])
-            Z_scores_m = np.vstack([x[1] for x in p_results])
+            cs_gp = np.vstack([x[0] for x in p_results])
+            Z_scores_gp = np.vstack([x[1] for x in p_results])
+            cs_m = np.vstack([x[2] for x in p_results])
+            Z_scores_m = np.vstack([x[3] for x in p_results])
         else:
             p_results = compute_p_int_cell_results_no_ct(cs_gp, cs_m, gene_pairs_sig_ind, Wtot2, eg2s_gp, cell_type_key, gene_pair_dict)
             Z_scores_gp = p_results[0]
@@ -1221,7 +1233,7 @@ def compute_interacting_cell_scores(
             adata.uns['interacting_cell_results']['np']['m']['cs'] = np.array(adata.uns['interacting_cell_results']['p']['m']['cs'])
         else:
             cs_gp = compute_int_CCC_scores(counts_1, counts_2, weights_ct_pairs, gene_pairs_sig) if cell_type_key else compute_int_CCC_scores(counts_1, counts_2, weights, gene_pairs_sig)
-            cs_m = compute_metabolite_cs(cs_gp, cell_type_key, gene_pair_dict, interacting_cell_scores=True)
+            cs_m = compute_metabolite_cs(cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_sig_ind, ct_specific_gene_pairs, interacting_cell_scores=True)
             adata.uns['interacting_cell_results']['np']['gp']['cs'] = cs_gp
             adata.uns['interacting_cell_results']['np']['m']['cs'] = cs_m
         
@@ -1234,19 +1246,19 @@ def compute_interacting_cell_scores(
 
             if cell_type_key:
                 cell_types_perm = pd.Series(cell_types[idx])
-                weigths_ct_pairs_perm = get_ct_pair_weights(
+                weights_ct_pairs_perm = get_ct_pair_weights(
                     weights, cell_type_pairs, cell_types_perm, spatial = True,
                 )
-                weigths_ct_pairs_perm_t = weigths_ct_pairs_perm.transpose(axes=(0, 2, 1))
-                weigths_ct_pairs_perm = weigths_ct_pairs_perm + weigths_ct_pairs_perm_t
+                # weights_ct_pairs_perm_t = weights_ct_pairs_perm.transpose(axes=(0, 2, 1))
+                # weights_ct_pairs_perm = weights_ct_pairs_perm + weights_ct_pairs_perm_t
                 
-                perm_cs_gp = compute_int_CCC_scores(counts_1, counts_2, weigths_ct_pairs_perm, gene_pairs_sig)
-                perm_cs_m = compute_metabolite_cs(perm_cs_gp, cell_type_key, gene_pair_dict, interacting_cell_scores=True)
+                perm_cs_gp = compute_int_CCC_scores(counts_1, counts_2, weights_ct_pairs_perm, gene_pairs_sig)
+                perm_cs_m = compute_metabolite_cs(perm_cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_sig_ind, ct_specific_gene_pairs, interacting_cell_scores=True)
                 adata.uns['interacting_cell_results']['np']['gp']['perm_cs'][:, :, :, i] = perm_cs_gp
                 adata.uns['interacting_cell_results']['np']['m']['perm_cs'][:, :, :, i] = perm_cs_m
             else:
                 perm_cs_gp = compute_int_CCC_scores(counts_1, counts_2, weights, gene_pairs_sig)
-                perm_cs_m = compute_metabolite_cs(perm_cs_gp, cell_type_key, gene_pair_dict, interacting_cell_scores=True)
+                perm_cs_m = compute_metabolite_cs(perm_cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_sig_ind, ct_specific_gene_pairs, interacting_cell_scores=True)
                 adata.uns['interacting_cell_results']['np']['gp']['perm_cs'][:, :, i] = perm_cs_gp
                 adata.uns['interacting_cell_results']['np']['m']['perm_cs'][:, :, i] = perm_cs_m
         
@@ -1393,9 +1405,9 @@ def get_ct_pair_weights(weights, cell_type_pairs, cell_types, spatial):
     w_new_coords_3d_all = np.hstack(w_new_coords_3d_all)
     w_new_data_all = np.concatenate(w_new_data_all)
 
-    weigths_ct_pairs = sparse.COO(w_new_coords_3d_all, w_new_data_all, shape=(n_ct_pairs, w_nrow, w_ncol))
+    weights_ct_pairs = sparse.COO(w_new_coords_3d_all, w_new_data_all, shape=(n_ct_pairs, w_nrow, w_ncol))
 
-    return weigths_ct_pairs
+    return weights_ct_pairs
 
 
 def extract_ct_pair_weights(ct_pair, weights, cell_type_pairs, cell_types, spatial):
@@ -1466,8 +1478,8 @@ def conditional_eg2_gp_score(counts, weights):
 
     counts_sq = counts ** 2
     if len(weights.shape) == 3:
-        weights_t = weights.transpose(axes=(0, 2, 1))
-        weights = weights + weights_t
+        # weights_t = weights.transpose(axes=(0, 2, 1))
+        # weights = weights + weights_t
         weights_sq_data = weights.data ** 2
         weights_sq = sparse.COO(weights.coords, weights_sq_data, shape=weights.shape)
         out_eg2_a = np.tensordot(counts_sq, weights_sq, axes=([1], [1])).todense().T
@@ -1573,6 +1585,62 @@ def compute_p_results_no_ct(C_gp, C_m, gene_pairs_ind, Wtot2, eg2s_gp, cell_type
     Z_m = [(C_m[i] - EG[i]) / stdG[i] for i in range(len(gene_pair_dict.keys()))]
 
     return (Z_gp, Z_m)
+
+
+def compute_p_int_cell_results(ct_pair, cell_type_pairs, cs_gp, cs_m, gene_pairs_ind, gene_pairs_ind_per_ct_pair, Wtot2, eg2s_gp, cell_type_key, gene_pair_dict):
+    i = cell_type_pairs.index(ct_pair)
+    gene_pair_cor_ct = cs_gp[i, :, :]
+    C_m = cs_m[i, :, :]
+    gene_pairs_ind_ct_pair = gene_pairs_ind_per_ct_pair[
+        ct_pair
+    ]  # If we consider all the gene pairs (irrespective of the cell type pair) use 'gene_pairs_ind' directly
+
+    eg2s_a, eg2s_b = eg2s_gp
+    C_gp = []
+    EG2_a = []
+    EG2_b = []
+    for gene_pair_ind_ct_pair in gene_pairs_ind_ct_pair:
+        idx = gene_pairs_ind.index(gene_pair_ind_ct_pair)
+        g1_ind, g2_ind = gene_pair_ind_ct_pair
+        lc_gp = gene_pair_cor_ct[idx, :]
+        if g1_ind == g2_ind:
+            eg2_a = eg2_b = Wtot2[i, :]
+        else:
+            eg2_a = eg2s_a[i, :, g1_ind] if type(g1_ind) is not list else np.max(eg2s_a[i, :, g1_ind], axis=1)
+            eg2_b = eg2s_b[i, :, g2_ind] if type(g2_ind) is not list else np.max(eg2s_b[i, :, g2_ind], axis=1)
+        C_gp.append(lc_gp)
+        EG2_a.append(eg2_a)
+        EG2_b.append(eg2_b)
+    C_gp = np.column_stack(C_gp)
+    EG2_a = np.column_stack(EG2_a)
+    EG2_b = np.column_stack(EG2_b)
+    
+    # Gene pairs
+
+    EG = np.zeros(C_gp.shape)
+
+    stdG_a = (EG2_a - EG ** 2) ** 0.5
+    stdG_a[stdG_a == 0] = 1
+
+    stdG_b = (EG2_b - EG ** 2) ** 0.5
+    stdG_b[stdG_b == 0] = 1
+
+    Z_gp = np.where(np.abs((C_gp - EG) / stdG_a) < np.abs((C_gp - EG) / stdG_b), (C_gp - EG) / stdG_a, (C_gp - EG) / stdG_b)
+
+    EG2_gp = np.where(np.abs((C_gp - EG) / stdG_a) < np.abs((C_gp - EG) / stdG_b), EG2_a, EG2_b)
+    
+    EG2_m = compute_metabolite_cs(EG2_gp, cell_type_key, gene_pair_dict, interacting_cell_scores=True)
+    
+    # Metabolites
+
+    EG = np.zeros(C_m.shape)
+
+    stdG = (EG2_m - EG ** 2) ** 0.5
+    stdG[stdG == 0] = 1
+
+    Z_m = (C_m - EG) / stdG
+
+    return (C_gp, Z_gp, C_m, Z_m)
 
 
 def compute_p_int_cell_results_no_ct(C_gp, C_m, gene_pairs_ind, Wtot2, eg2s_gp, cell_type_key, gene_pair_dict):
@@ -1681,6 +1749,8 @@ def get_cell_communication_results(
 
     ct_pair_metab = list(itertools.product(gene_pairs_ind_per_ct_pair.keys(), gene_pair_dict.keys()))
     cell_com_df_m = pd.DataFrame(ct_pair_metab, columns=["cell_type_pair", "metabolite"])
+    cell_com_df_m["Cell Type 1"], cell_com_df_m["Cell Type 2"] = zip(*cell_com_df_m["cell_type_pair"])
+    cell_com_df_m = cell_com_df_m.drop(["cell_type_pair"], axis=1)
 
     if test in ["parametric", "both"]:
         # Gene pair
@@ -2114,26 +2184,6 @@ def compute_local_cov_max(vals, node_degrees):
 
 def get_ct_pair_counts_and_weights(counts, weights, cell_type_pairs, cell_types, gene_pairs_per_ct_pair_ind):
 
-    # counts_ct_pairs_t = sparse.stack([counts for _ in range(depth)], axis=0)
-    # weigths_ct_pairs = sparse.stack([weights for _ in range(depth)], axis=0)
-
-    # counts = torch.stack([torch.tensor(counts)] * len(cell_type_pairs), dim=0) # We create a 3D tensor where the counts matrix is repeated len(cell_type_pairs) times
-    # weigths_ct_pairs = torch.stack([torch.tensor(weights)] * len(cell_type_pairs), dim=0)
-
-    # counts_ct_pairs_t = counts.clone()
-    # counts_ct_pairs_u = counts.clone()
-
-    # n_cell_type_pairs = len(cell_type_pairs)
-
-
-
-    # counts_ct_pairs_t, counts_ct_pairs_u = get_ct_pair_counts(
-    #     counts, cell_type_pairs, cell_types, gene_pairs_per_ct_pair_ind
-    # )
-    # weigths_ct_pairs = get_ct_pair_weights(weights, cell_type_pairs, cell_types)
-
-
-
     c_nrow, c_ncol = counts.shape
     w_nrow, w_ncol = weights.shape
     n_ct_pairs = len(cell_type_pairs)
@@ -2165,10 +2215,10 @@ def get_ct_pair_counts_and_weights(counts, weights, cell_type_pairs, cell_types,
 
     counts_ct_pairs_t = sparse.COO(c_new_coords_3d_t_all, c_new_data_t_all, shape=(n_ct_pairs, c_nrow, c_ncol))
     counts_ct_pairs_u = sparse.COO(c_new_coords_3d_u_all, c_new_data_u_all, shape=(n_ct_pairs, c_nrow, c_ncol))
-    weigths_ct_pairs = sparse.COO(w_new_coords_3d_all, w_new_data_all, shape=(n_ct_pairs, w_nrow, w_ncol))
+    weights_ct_pairs = sparse.COO(w_new_coords_3d_all, w_new_data_all, shape=(n_ct_pairs, w_nrow, w_ncol))
 
 
-    return counts_ct_pairs_t, counts_ct_pairs_u, weigths_ct_pairs
+    return counts_ct_pairs_t, counts_ct_pairs_u, weights_ct_pairs
 
 
 def get_ct_pair_counts_and_weights_null(counts_ct_pairs_t, counts_ct_pairs_u, weights, cell_type_pairs, cell_types, M):
@@ -2207,10 +2257,10 @@ def get_ct_pair_counts_and_weights_null(counts_ct_pairs_t, counts_ct_pairs_u, we
 
     counts_ct_pairs_t_null = sparse.COO(c_null_coords_4d_t_all, c_null_data_t_all, shape=(M, n_ct_pairs, c_nrow, c_ncol))
     counts_ct_pairs_u_null = sparse.COO(c_null_coords_4d_u_all, c_null_data_u_all, shape=(M, n_ct_pairs, c_nrow, c_ncol))
-    weigths_ct_pairs_null = sparse.COO(w_null_coords_4d_all, w_null_data_all, shape=(M, n_ct_pairs, w_nrow, w_ncol))
+    weights_ct_pairs_null = sparse.COO(w_null_coords_4d_all, w_null_data_all, shape=(M, n_ct_pairs, w_nrow, w_ncol))
 
 
-    return counts_ct_pairs_t_null, counts_ct_pairs_u_null, weigths_ct_pairs_null
+    return counts_ct_pairs_t_null, counts_ct_pairs_u_null, weights_ct_pairs_null
 
 
 def extract_ct_pair_counts_weights(ct_pair, counts, weights, cell_type_pairs, cell_types, gene_pairs_per_ct_pair_ind):
@@ -2538,8 +2588,8 @@ def compute_interaction_module_correlation(
 
     cor_pval_df = cor_pval_df.replace(np.nan,1)
     cor_coef_df = cor_coef_df.replace(np.nan,0)
-    cor_FDR_values = multipletests(cor_pval_df.unstack().values, method='fdr_bh')[1]
-    cor_FDR_df = pd.Series(cor_FDR_values, index=cor_pval_df.stack().index).unstack()
+    cor_FDR_values = multipletests(cor_pval_df.values.flatten(), method='fdr_bh')[1]
+    cor_FDR_df = pd.DataFrame(cor_FDR_values.reshape(cor_pval_df.shape), index=cor_pval_df.index, columns=cor_pval_df.columns)
 
     adata.uns["interaction_module_correlation_coefs"] = cor_coef_df
     adata.uns["interaction_module_correlation_pvals"] = cor_pval_df
@@ -2760,87 +2810,6 @@ def compute_communication_scores(
 
 
         adata.obsm[f"{v}_scores"] = v_scores_df.fillna(0)
-
-
-
-    # ct_pair_gene_pair_metab_df = ct_pair_gene_pair_metab_df.explode('metabolite').reset_index(drop=True)
-    # ct_pair_gene_pair_metab_df = ct_pair_gene_pair_metab_df.explode('cell_type_pair').reset_index(drop=True)
-
-    # use_raw = layer_key == "use_raw"
-    # index = adata.raw.obs.index if use_raw else adata.obs_names
-    # gene_pair_scores_df = pd.DataFrame(index=index, columns=gene_pairs_dict.keys(), data=np.zeros((len(index), len(gene_pairs_dict.keys()))))
-    # metab_scores_df = pd.DataFrame(index=index, columns=metabolites, data=np.zeros((len(index), len(metabolites))))
-
-    # adata.uns["ct_pair_gene_pair_metab_df"] = ct_pair_gene_pair_metab_df
-
-    # # Compute gene pair scores
-    # print(f"Computing gene pair scores for {len(gene_pairs_dict.keys())} gene pairs...")
-
-
-
-    # for gene_pair in tqdm(gene_pairs_dict.keys()):
-    #     ct_pair_gene_pair_metab_df_tmp = ct_pair_gene_pair_metab_df[
-    #         ct_pair_gene_pair_metab_df.gene_pair.isin(gene_pairs_dict[gene_pair])
-    #     ].copy()
-
-    #     gene_pair_scores_df[gene_pair] = ct_pair_gene_pair_metab_df_tmp.groupby("cells")["scores"].sum()
-
-    #     cell_types = list(np.unique(ct_pair_gene_pair_metab_df_tmp['Cell Type 1'].unique().tolist() + ct_pair_gene_pair_metab_df_tmp['Cell Type 2'].unique().tolist()))
-    #     gene_pair_ct_scores_df = pd.DataFrame(
-    #         index=index, columns=cell_types, data=np.zeros((len(index), len(cell_types)))
-    #     )
-    #     gene_pair_ct_scores_df_tmp = (
-    #         ct_pair_gene_pair_metab_df_tmp.groupby(["cells", "cell_types"])["scores"].sum().unstack(level=1)
-    #     )
-    #     for ct in cell_types:
-    #         gene_pair_ct_scores_df[ct] = gene_pair_ct_scores_df_tmp[ct]
-    #     adata.obsm[f"{gene_pair}_ct_scores"] = gene_pair_ct_scores_df.fillna(0)
-
-    #     cell_type_pairs = ct_pair_gene_pair_metab_df_tmp.cell_type_pair.unique()
-    #     gene_pair_ct_pair_scores_df = pd.DataFrame(
-    #         index=index, columns=cell_type_pairs, data=np.zeros((len(index), len(cell_type_pairs)))
-    #     )
-    #     gene_pair_ct_pair_scores_df_tmp = (
-    #         ct_pair_gene_pair_metab_df_tmp.groupby(["cells", "cell_type_pair"])["scores"].sum().unstack(level=1)
-    #     )
-    #     for ct_pair in cell_type_pairs:
-    #         gene_pair_ct_pair_scores_df[ct_pair] = gene_pair_ct_pair_scores_df_tmp[ct_pair]
-    #     adata.obsm[f"{gene_pair}_ct_pair_scores"] = gene_pair_ct_pair_scores_df.fillna(0)
-
-    # # Compute metabolite scores
-    # print(f"Computing metabolite scores for {len(metabolites)} metabolites...")
-
-    # for metabolite in tqdm(metabolites):
-    #     ct_pair_gene_pair_metab_df_tmp = ct_pair_gene_pair_metab_df[
-    #         ct_pair_gene_pair_metab_df.metabolite == metabolite
-    #     ].copy()
-
-    #     metab_scores_df[metabolite] = ct_pair_gene_pair_metab_df_tmp.groupby("cells")["scores"].sum()
-
-    #     cell_types = ct_pair_gene_pair_metab_df_tmp.cell_types.unique()
-    #     metab_ct_scores_df = pd.DataFrame(
-    #         index=index, columns=cell_types, data=np.zeros((len(index), len(cell_types)))
-    #     )
-    #     metab_ct_scores_df_tmp = (
-    #         ct_pair_gene_pair_metab_df_tmp.groupby(["cells", "cell_types"])["scores"].sum().unstack(level=1)
-    #     )
-    #     for ct in cell_types:
-    #         metab_ct_scores_df[ct] = metab_ct_scores_df_tmp[ct]
-    #     adata.obsm[f"{metabolite}_ct_scores"] = metab_ct_scores_df.fillna(0)
-
-    #     cell_type_pairs = ct_pair_gene_pair_metab_df_tmp.cell_type_pair.unique()
-    #     metab_ct_pair_scores_df = pd.DataFrame(
-    #         index=index, columns=cell_type_pairs, data=np.zeros((len(index), len(cell_type_pairs)))
-    #     )
-    #     metab_ct_pair_scores_df_tmp = (
-    #         ct_pair_gene_pair_metab_df_tmp.groupby(["cells", "cell_type_pair"])["scores"].sum().unstack(level=1)
-    #     )
-    #     for ct_pair in cell_type_pairs:
-    #         metab_ct_pair_scores_df[ct_pair] = metab_ct_pair_scores_df_tmp[ct_pair]
-    #     adata.obsm[f"{metabolite}_ct_pair_scores"] = metab_ct_pair_scores_df.fillna(0)
-
-    # adata.obsm["metabolite_scores"] = metab_scores_df.fillna(0)
-    # adata.obsm["gene_pair_scores"] = gene_pair_scores_df.fillna(0)
 
 
 def compute_communication_modules(adata, layer_key, height=0.15):

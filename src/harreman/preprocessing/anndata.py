@@ -156,6 +156,11 @@ def modify_uns_harreman(adata):
     for uns_key in uns_keys:
         if uns_key in adata.uns.keys():
             adata.uns[uns_key] = adata.uns[uns_key].fillna('NA')
+    
+    if 'LR_database' in adata.uns.keys():
+        adata.uns['LR_database'].columns = [col.replace('.', '_') for col in adata.uns['LR_database'].columns]
+        adata.uns['LR_database']['ligand_transmembrane'] = adata.uns['LR_database']['ligand_transmembrane'].astype(str)
+        adata.uns['LR_database']['receptor_transmembrane'] = adata.uns['LR_database']['receptor_transmembrane'].astype(str)
 
     if 'gene_pairs' in adata.uns.keys():
         gene_pairs_tmp = [(x, ' - '.join(y) if isinstance(y, list) else y) for x, y in adata.uns['gene_pairs']]
@@ -169,7 +174,7 @@ def modify_uns_harreman(adata):
     
     if 'gene_pairs_per_metabolite' in adata.uns.keys():
         adata.uns['gene_pairs_per_metabolite'] = {key: {
-            'gene_pair': [(' - '.join(gp_1), gp_2 if isinstance(gp_1, list) else gp_1) for gp_1, gp_2 in subdict['gene_pair']],
+            'gene_pair': [(' - '.join(gp_1) if isinstance(gp_1, list) else gp_1, gp_2) for gp_1, gp_2 in subdict['gene_pair']],
             'gene_type': subdict['gene_type']
         } for key, subdict in adata.uns['gene_pairs_per_metabolite'].items()}
         adata.uns['gene_pairs_per_metabolite'] = {key: {
@@ -178,17 +183,22 @@ def modify_uns_harreman(adata):
         } for key, subdict in adata.uns['gene_pairs_per_metabolite'].items()}
     
     if 'gene_pairs_per_ct_pair' in adata.uns.keys():
-        adata.uns['gene_pairs_per_ct_pair'] = {key: [(num, ' - '.join(val) if isinstance(val, list) else val) for num, val in tuples_list] for key, tuples_list in adata.uns['gene_pairs_per_ct_pair'].items()}
+        adata.uns['gene_pairs_per_ct_pair'] = {key: [(x, ' - '.join(y) if isinstance(y, list) else y) for x, y in tuples_list] for key, tuples_list in adata.uns['gene_pairs_per_ct_pair'].items()}
+        adata.uns['gene_pairs_per_ct_pair'] = {key: [(' - '.join(x) if isinstance(x, list) else x, y) for x, y in tuples_list] for key, tuples_list in adata.uns['gene_pairs_per_ct_pair'].items()}
         adata.uns['gene_pairs_per_ct_pair'] = {' - '.join(key): value for key, value in adata.uns['gene_pairs_per_ct_pair'].items()}
     if 'gene_pairs_per_ct_pair_ind' in adata.uns.keys():
-        adata.uns['gene_pairs_per_ct_pair_ind'] = {key: [(num, ' - '.join(map(str, val)) if isinstance(val, list) else val) for num, val in tuples_list] for key, tuples_list in adata.uns['gene_pairs_per_ct_pair_ind'].items()}
         adata.uns['gene_pairs_per_ct_pair_ind'] = {' - '.join(key): value for key, value in adata.uns['gene_pairs_per_ct_pair_ind'].items()}
+    if 'gene_pairs_ind_per_ct_pair' in adata.uns.keys():
+        adata.uns['gene_pairs_ind_per_ct_pair'] = {key: [(x, ' - '.join(map(str, y)) if isinstance(y, list) else y) for x, y in tuples_list] for key, tuples_list in adata.uns['gene_pairs_ind_per_ct_pair'].items()}
+        adata.uns['gene_pairs_ind_per_ct_pair'] = {key: [(' - '.join(map(str, x)) if isinstance(x, list) else x, y) for x, y in tuples_list] for key, tuples_list in adata.uns['gene_pairs_ind_per_ct_pair'].items()}
+        adata.uns['gene_pairs_ind_per_ct_pair'] = {' - '.join(key): value for key, value in adata.uns['gene_pairs_ind_per_ct_pair'].items()}
 
     if 'ccc_results' in adata.uns.keys():
         adata.uns['ccc_results']['cell_com_df_gp'] = adata.uns['ccc_results']['cell_com_df_gp'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
         adata.uns['ccc_results']['cell_com_df_m'] = adata.uns['ccc_results']['cell_com_df_m'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
         if 'cell_com_df_gp_sig' in adata.uns['ccc_results'].keys():
-            adata.uns['ccc_results']['cell_com_df_sig'] = adata.uns['ccc_results']['cell_com_df_sig'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
+            adata.uns['ccc_results']['cell_com_df_gp_sig'] = adata.uns['ccc_results']['cell_com_df_gp_sig'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
+            adata.uns['ccc_results']['cell_com_df_m_sig'] = adata.uns['ccc_results']['cell_com_df_m_sig'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
         if 'cell_com_df_sig_metab' in adata.uns['ccc_results'].keys():
             adata.uns['ccc_results']['cell_com_df_sig_metab']['Gene 1'] = [list(i) if isinstance(i, tuple) else i for i in adata.uns['ccc_results']['cell_com_df_sig_metab']['Gene 1'].values]
             adata.uns['ccc_results']['cell_com_df_sig_metab']['Gene 2'] = [list(i) if isinstance(i, tuple) else i for i in adata.uns['ccc_results']['cell_com_df_sig_metab']['Gene 2'].values]
@@ -240,5 +250,10 @@ def read_h5ad(filename):
         gene_pairs_ind_tmp = [tuple(gp.split('_')) for gp in adata.uns['gene_pairs_ind']]
         gene_pairs_ind_tmp = [(x, list(int(val) for val in y.split(' - ')) if ' - ' in y else int(y)) for x, y in gene_pairs_ind_tmp]
         adata.uns['gene_pairs_ind'] = [(list(int(val) for val in x.split(' - ')) if ' - ' in x else int(x), y) for x, y in gene_pairs_ind_tmp]
+    
+    uns_keys = ['ligand', 'receptor', 'LR_database', 'import_export']
+    for uns_key in uns_keys:
+        if uns_key in adata.uns.keys():
+            adata.uns[uns_key] = adata.uns[uns_key].replace("NA", np.nan)
 
     return adata

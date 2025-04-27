@@ -135,6 +135,8 @@ def extract_transporter_info(
         database_df = pd.read_csv(database_info[species]['all'], index_col=0)
     
     heterodimer_info = pd.read_csv(database_info[species]['heterodimer'], index_col=0)
+    
+    database_df["Metabolite"] = database_df["Metabolite"].str.replace("/", "_", regex=False)
 
     directional_metabs = {}
     metab_genes_dir = {}

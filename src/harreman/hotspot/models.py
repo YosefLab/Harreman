@@ -40,6 +40,8 @@ def ct_danb_model(gene_counts, umi_counts, cell_types):
     var_ct = np.zeros(len(cell_types))
     x2_ct = np.zeros(len(cell_types))
     
+    min_size = 10**(-10)
+    
     for cell_type in np.unique(cell_types):
 
         gene_counts_ct = gene_counts[cell_types == cell_type]
@@ -50,11 +52,9 @@ def ct_danb_model(gene_counts, umi_counts, cell_types):
         total = tis.sum()
 
         N = gene_counts_ct.size
-
-        min_size = 10**(-10)
-
+        
         mu = tj*tis/total
-        vv = (gene_counts_ct - mu).var()*(N/(N-1))
+        vv = (gene_counts_ct - mu).var()*(N/(N-1)) if N>1 else (gene_counts_ct - mu).var()
         my_rowvar = vv
 
         size = ((tj**2) / total) * ((tis**2).sum() / total) / ((N-1)*my_rowvar-tj)
