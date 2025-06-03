@@ -2,6 +2,7 @@ from typing import Literal, Optional, Union
 import time
 import numpy as np
 import pandas as pd
+import torch
 from anndata import AnnData
 from numba import jit, njit
 from scipy.stats import norm
@@ -17,15 +18,24 @@ from ..tools.knn import make_weights_non_redundant
 def load_metabolic_genes(
     species: Optional[Union[Literal["mouse"], Literal["human"]]] = None,
 ):
+    """
+    Load the list of metabolic genes for a given species.
+
+    Parameters
+    ----------
+    species : {"mouse", "human"}, optional (default: "mouse")
+        Species used to select the correct metabolic gene list .
+
+    Returns
+    -------
+    List of metabolic genes.
+    """
 
     metabolic_genes_paths = {
-        # 'human': "/home/labs/nyosef/oier/Compass_data/metabolic_genes/metabolic_genes_h.csv",
-        # 'mouse': "/home/labs/nyosef/oier/Compass_data/metabolic_genes/metabolic_genes_m.csv",
-        'human': "/home/labs/nyosef/oier/Harreman_files/metabolic_genes/human_metabolic_genes.csv",
-        'mouse': "/home/labs/nyosef/oier/Harreman_files/metabolic_genes/mouse_metabolic_genes.csv"
+        'human': "/home/projects/nyosef/oier/Harreman_files/metabolic_genes/human_metabolic_genes.csv",
+        'mouse': "/home/projects/nyosef/oier/Harreman_files/metabolic_genes/mouse_metabolic_genes.csv"
     }
 
-    # metabolic_genes = list(pd.read_csv(metabolic_genes_paths[species], index_col=0, header=None).index)
     metabolic_genes = pd.read_csv(metabolic_genes_paths[species], index_col=0)['0'].tolist()
 
     return metabolic_genes
@@ -42,103 +52,277 @@ def compute_local_autocorrelation(
     umi_counts_obs_key: Optional[str] = None,
     permutation_test: Optional[bool] = False,
     M: Optional[int] = 1000,
+    check_analytic_null: Optional[bool] = False,
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    verbose: Optional[bool] = False,
 ):
+    """
+    Computes gene-level local spatial autocorrelation statistics (G, G_max, Z-score, p-value, FDR)
+    for a given AnnData object using spatial weights and centered gene expression values.
+
+    Parameters
+    ----------
+    adata : AnnData
+        Annotated data object (AnnData). Requires `obsp["weights"]` for the spatial graph.
+    layer_key : str or "use_raw", optional
+        Key in `adata.layers` to use for expression data. Use "use_raw" to access `adata.raw`.
+    database_varm_key : str, optional
+        Key in `adata.varm` used for filtering genes that are part of the transporter or ligand-receptor database.
+    model : str, optional
+        Normalization model to use for centering gene expression. Options include "none", "normal", "bernoulli", or "danb".
+    genes : list, optional
+        List of gene names to include in the analysis. If `None`, all genes are used or selected via metabolic/pathway filters.
+    use_metabolic_genes : bool, optional (default: False)
+        If `True`, restricts analysis to metabolic genes as defined for the selected species.
+    species : {"mouse", "human"}, optional (default: "mouse")
+        Species used to select the correct metabolic gene list if `use_metabolic_genes=True`.
+    umi_counts_obs_key : str, optional
+        Key in `adata.obs` with total UMI counts per cell. If `None`, inferred from the expression matrix.
+    permutation_test : bool, optional (default: False)
+        Whether to compute an empirical p-value and null distribution by permuting the data.
+    M : int, optional (default: 1000)
+        Number of permutations to perform if `permutation_test` is True.
+    check_analytic_null : bool, optional (default: False)
+        Whether to evaluate Z-scores under an analytic null distribution using permutation Z-scores.
+    device : torch.device, optional
+        Device to use for computation (e.g., CUDA or CPU). Defaults to GPU if available.
+    verbose : bool, optional (default: False)
+        Whether to print progress and status messages.
+
+    Returns
+    -------
+    None
+        The results are stored in `adata.uns["gene_autocorrelation_results"]` as a DataFrame.
+    """
 
     start = time.time()
-    print("Computing local autocorrelation...")
+    if verbose:
+        print("Computing local autocorrelation...")
 
     adata.uns['layer_key'] = layer_key
     adata.uns['model'] = model
     adata.uns['species'] = species
     
-    sample_specific = 'sample_key' in adata.uns.keys()
-
-    if use_metabolic_genes and genes is None:
-        genes = load_metabolic_genes(species)
-        genes = adata.var_names[adata.var_names.isin(genes)]
-
-    use_raw = layer_key == "use_raw"
-    if (database_varm_key is not None) and (genes is None):
-        metab_matrix = adata.varm[database_varm_key] if not use_raw else adata.raw.varm[database_varm_key]
-        genes = metab_matrix.loc[(metab_matrix!=0).any(axis=1)].index
-    elif (database_varm_key is None) and (genes is None):
-        genes = adata.var_names if not use_raw else adata.raw.var.index
-
-    counts = counts_from_anndata(adata[:, genes], layer_key, dense=True)
+    sample_specific = 'sample_key' in adata.uns
     
-    if sample_specific:
-        all_zero_mask = np.zeros(genes.shape[0], dtype=bool)
-        sample_key = adata.uns['sample_key']
-        for sample in adata.obs[sample_key].unique().tolist():
-            subset = np.where(adata.obs[sample_key] == sample)[0]
-            all_zero_mask |= np.all(counts[:, subset] == 0, axis=1)
-        genes = genes[~all_zero_mask]
-        counts = counts[~all_zero_mask, :]
+    # Gene selection
+    if use_metabolic_genes and genes is None:
+        genes = pd.Index(load_metabolic_genes(species)).intersection(adata.var_names)
+    elif database_varm_key is not None and genes is None:
+        source = adata.raw if (layer_key == "use_raw") else adata
+        metab_matrix = source.varm[database_varm_key]
+        genes = metab_matrix.loc[(metab_matrix != 0).any(axis=1)].index
+    elif genes is None:
+        genes = adata.raw.var.index if layer_key == "use_raw" else adata.var_names
     else:
-        genes = genes[~np.all(counts == 0, axis=1)]
-        counts = counts[~np.all(counts == 0, axis=1)]
-    num_umi = counts.sum(axis=0) if umi_counts_obs_key is None else adata.obs[umi_counts_obs_key]
-    num_umi = np.array(num_umi)
+        genes = pd.Index(genes)
+    
+    # Load counts
+    counts = counts_from_anndata(adata[:, genes], layer_key, dense=True)
 
+    # Gene filtering
+    if sample_specific:
+        sample_key = adata.uns['sample_key']
+        sample_arr = adata.obs[sample_key].to_numpy()
+        mask = np.zeros(counts.shape[0], dtype=bool)
+        for sample in np.unique(sample_arr):
+            sample_idx = np.where(sample_arr == sample)[0]
+            mask |= np.all(counts[:, sample_idx] == 0, axis=1)
+    else:
+        mask = np.all(counts == 0, axis=1)
+
+    counts = counts[~mask]
+    genes = genes[~mask]
+
+    # UMI counts
+    num_umi = counts.sum(axis=0) if umi_counts_obs_key is None else np.asarray(adata.obs[umi_counts_obs_key])
     adata.uns['umi_counts'] = num_umi
 
-    def center_vals_f(x, num_umi):
-        return center_values_total(x, num_umi, model)
+    # Center values
+    # def center_vals_f(x, num_umi):
+    #     return center_values_total(x, num_umi, model)
 
+    # if sample_specific:
+    #     sample_key = adata.uns['sample_key']
+    #     sample_labels = adata.obs[sample_key].values
+    #     unique_samples = np.unique(sample_labels)
+    #     for sample in unique_samples:
+    #         subset = np.where(sample_labels == sample)[0]
+    #         num_umi_subset = num_umi[subset]
+    #         counts[:,subset] = np.apply_along_axis(
+    #             lambda x: center_vals_f(x, num_umi_subset)[np.newaxis], 1, counts[:,subset]
+    #         ).squeeze(axis=1)
+    # else:
+    #     counts = np.apply_along_axis(
+    #         lambda x: center_vals_f(x, num_umi)[np.newaxis], 1, counts
+    #     ).squeeze(axis=1)
+
+    # Convert to tensors
+    num_umi = torch.tensor(adata.uns["umi_counts"], dtype=torch.float64, device=device)
+    counts = torch.tensor(counts, dtype=torch.float64, device=device)
+
+    # Center values
     if sample_specific:
         sample_key = adata.uns['sample_key']
-        for sample in adata.obs[sample_key].unique().tolist():
+        for sample in adata.obs[sample_key].unique():
             subset = np.where(adata.obs[sample_key] == sample)[0]
-            num_umi_subset = num_umi[subset]
-            counts[:,subset] = np.apply_along_axis(lambda x: center_vals_f(x, num_umi_subset)[np.newaxis], 1, counts[:,subset]).squeeze(axis=1)
+            counts[:, subset] = center_counts_torch(counts[:, subset], num_umi[subset], model)
     else:
-        counts = np.apply_along_axis(lambda x: center_vals_f(x, num_umi)[np.newaxis], 1, counts).squeeze(axis=1)
+        counts = center_counts_torch(counts, num_umi, model)
 
     adata.var['local_autocorrelation'] = False
-    adata.var['local_autocorrelation'].loc[genes] = True
-
-    weights = adata.obsp['weights'].copy()
-    weights = make_weights_non_redundant(weights)
-
-    row_degrees = np.array(weights.sum(axis=1).T)[0]
-    col_degrees = np.array(weights.sum(axis=0))[0]
+    adata.var.loc[genes, 'local_autocorrelation'] = True
+    
+    # Compute weights
+    weights = make_weights_non_redundant(adata.obsp["weights"]).tocoo()
+    Wtot2 = torch.tensor((weights.data ** 2).sum(), device=device)
+    weights = torch.sparse_coo_tensor(
+        torch.tensor(np.vstack((weights.row, weights.col)), dtype=torch.long, device=device),
+        torch.tensor(weights.data, dtype=torch.float64, device=device),
+        torch.Size(weights.shape), 
+        device=device)
+    
+    # Compute node degree
+    row_degrees = torch.sparse.sum(weights, dim=1).to_dense()
+    col_degrees = torch.sparse.sum(weights, dim=0).to_dense()
     D = row_degrees + col_degrees
+    
+    # Autocorrelation
+    WXt = torch.sparse.mm(weights, counts.T)
+    G = (counts.T * WXt).sum(dim=0)
+    G_max = 0.5 * torch.sum((counts ** 2) * D[None, :], dim=1)
+    
+    # Results
+    results = compute_gene_autocorrelation_results(
+        counts=counts,
+        weights=weights,
+        G=G,
+        G_max=G_max,
+        Wtot2=Wtot2,
+        genes=genes,
+        D=D,
+        M=M,
+        permutation_test=permutation_test,
+        check_analytic_null=check_analytic_null,
+        device=device,
+    )
 
-    Wtot2 = (weights.data ** 2).sum()
+    # Save results
+    if isinstance(results, tuple):
+        results_df, zs_perm, pvals_perm = results
+        adata.uns['analytic_null_ac_zs_perm'] = zs_perm
+        adata.uns['analytic_null_ac_pvals_perm'] = pvals_perm
+        if verbose:
+            print("Analytic null results are stored in adata.uns with the following keys: ['analytic_null_ac_zs_perm', 'analytic_null_ac_pvals_perm']")
+    else:
+        results_df = results
+
+    results_df = results_df.sort_values("Z", ascending=False)
+    results_df.index.name = "Gene"
+    cols = ["C", "Z", "Z_Pval", "Z_FDR"]
+    if "Perm_Pval" in results_df.columns:
+        cols += ["Perm_Pval", "Perm_FDR"]
+    adata.uns["gene_autocorrelation_results"] = results_df[cols]
+    if verbose:
+        print("Local autocorrelation results are stored in adata.uns['gene_autocorrelation_results']")
     
-    G = (counts.T * (weights @ counts.T)).sum(axis=0)
-    G_max = np.apply_along_axis(compute_local_cov_max, 1, counts, D)
+    # results = compute_autocor_Z_scores(G, G_max, Wtot2)
+    # variables = ["G", "G_max", "EG", "stdG", "Z", "C"]
+    # results = pd.DataFrame(results, index=variables, columns=genes).T
     
-    results = compute_autocor_Z_scores(G, G_max, Wtot2)
-    variables = ["G", "G_max", "EG", "stdG", "Z", "C"]
-    results = pd.DataFrame(results, index=variables, columns=genes).T
+    # results["Z_Pval"] = norm.sf(results["Z"].values)
+    # results["Z_FDR"] = multipletests(results["Z_Pval"], method="fdr_bh")[1]
     
-    results["Z_Pval"] = norm.sf(results["Z"].values)
-    results["Z_FDR"] = multipletests(results["Z_Pval"], method="fdr_bh")[1]
-    
-    if permutation_test:
-        perm_array = np.zeros((counts.shape[0], M)).astype(np.float16)
-        for i in tqdm(range(M)):
-            idx = np.random.permutation(counts.shape[1])
-            counts = counts[:, idx]
-            perm_array[:, i] = (counts.T * (weights @ counts.T)).sum(axis=0)
+    # if permutation_test:
+    #     perm_array = np.zeros((counts.shape[0], M)).astype(np.float16)
+    #     if check_analytic_null:
+    #         ac_zs_perm_array = np.zeros((counts.shape[0], M)).astype(np.float16)
+    #         ac_pvals_perm_array = np.zeros((counts.shape[0], M)).astype(np.float16)
+    #     for i in tqdm(range(M)):
+    #         idx = np.random.permutation(counts.shape[1])
+    #         G_perm = (counts[:, idx].T * (weights @ counts[:, idx].T)).sum(axis=0)
+    #         perm_array[:, i] = G_perm
+            
+    #         if check_analytic_null:
+    #             G_perm_max = np.apply_along_axis(compute_local_cov_max, 1, counts[:, idx], D)
+    #             results_perm = compute_autocor_Z_scores(G_perm, G_perm_max, Wtot2)
+    #             results_perm = pd.DataFrame(results_perm, index=variables, columns=genes).T
+    #             ac_zs_perm_array[:, i] = results_perm["Z"].values
+    #             ac_pvals_perm_array[:, i] = norm.sf(results_perm["Z"].values)
         
-        x = np.sum(perm_array > G[:, np.newaxis], axis=1)
-        pvals = (x + 1) / (M + 1)
+    #     x = np.sum(perm_array > G[:, np.newaxis], axis=1)
+    #     pvals = (x + 1) / (M + 1)
         
-        results["Perm_Pval"] = pvals
-        results["Perm_FDR"] = multipletests(results["Perm_Pval"], method="fdr_bh")[1]
+    #     results["Perm_Pval"] = pvals
+    #     results["Perm_FDR"] = multipletests(results["Perm_Pval"], method="fdr_bh")[1]
+        
+    #     if check_analytic_null:
+    #         adata.uns['analytic_null_ac_zs_perm'] = ac_zs_perm_array
+    #         adata.uns['analytic_null_ac_pvals_perm'] = ac_pvals_perm_array
 
-    results = results.sort_values("Z", ascending=False)
-    results.index.name = "Gene"
+    # results = results.sort_values("Z", ascending=False)
+    # results.index.name = "Gene"
 
-    results = results[["C", "Z", "Z_Pval", "Z_FDR", "Perm_Pval", "Perm_FDR"]] if permutation_test else results[["C", "Z", "Z_Pval", "Z_FDR"]]
+    # results = results[["C", "Z", "Z_Pval", "Z_FDR", "Perm_Pval", "Perm_FDR"]] if permutation_test else results[["C", "Z", "Z_Pval", "Z_FDR"]]
 
-    adata.uns['gene_autocorrelation_results'] = results
+    # adata.uns['gene_autocorrelation_results'] = results
 
-    print("Finished computing local autocorrelation in %.3f seconds" %(time.time()-start))
+    if verbose:
+        print("Finished computing local autocorrelation in %.3f seconds" %(time.time()-start))
 
     return
+
+
+def compute_gene_autocorrelation_results(
+    counts, weights, G, G_max, Wtot2, genes, D, M, permutation_test, check_analytic_null, device
+):
+    # Step 1: Compute core stats
+    stats = compute_autocor_Z_scores_torch(G, G_max, Wtot2)
+
+    # Step 2: Build DataFrame
+    results = pd.DataFrame({k: v.cpu().numpy() for k, v in stats.items()}, index=genes)
+
+    # Z P-values and FDR
+    results["Z_Pval"] = norm.sf(results["Z"])
+    results["Z_FDR"] = multipletests(results["Z_Pval"], method="fdr_bh")[1]
+
+    # Step 3: Permutation test
+    if permutation_test:
+        n_genes, n_cells = counts.shape
+        perm_array = torch.zeros((n_genes, M), dtype=torch.float16, device=device)
+
+        if check_analytic_null:
+            ac_zs_perm_array = torch.zeros((n_genes, M), dtype=torch.float16, device=device)
+            ac_pvals_perm_array = torch.zeros((n_genes, M), dtype=torch.float16, device=device)
+
+        for i in tqdm(range(M), desc="Permutation test"):
+            idx = torch.randperm(n_cells, device=device)
+            X_perm = counts[:, idx]  # (genes x cells)
+            WXt_perm = torch.sparse.mm(weights, X_perm.T)  # (cells x genes)
+            G_perm = (X_perm.T * WXt_perm).sum(dim=0)  # (genes,)
+            perm_array[:, i] = G_perm.half()
+
+            if check_analytic_null:
+                # Compute G_max for permuted data
+                G_perm_max = 0.5 * torch.sum(X_perm**2 * D.unsqueeze(0), dim=1)
+                stats_perm = compute_autocor_Z_scores_torch(G_perm, G_perm_max, Wtot2)
+                ac_zs_perm_array[:, i] = stats_perm["Z"].half()
+                ac_pvals_perm_array[:, i] = torch.tensor(
+                    norm.sf(stats_perm["Z"].cpu().numpy()), device=device
+                ).half()
+
+        # Step 4: Compute empirical permutation p-values
+        G_expanded = G.unsqueeze(1)  # (genes, 1)
+        x = torch.sum(perm_array > G_expanded, dim=1)
+        pvals = ((x + 1) / (M + 1)).cpu().numpy()
+        results["Perm_Pval"] = pvals
+        results["Perm_FDR"] = multipletests(pvals, method="fdr_bh")[1]
+
+        # Save optional nulls
+        if check_analytic_null:
+            return results, ac_zs_perm_array.cpu().numpy(), ac_pvals_perm_array.cpu().numpy()
+
+    return results
 
 
 @jit(nopython=True)
@@ -250,6 +434,38 @@ def center_values_total(vals, num_umi, model):
     return centered_vals
 
 
+def center_counts_torch(counts, num_umi, model):
+    """
+    counts: Tensor [genes, cells]
+    num_umi: Tensor [cells]
+    model: 'bernoulli', 'danb', 'normal', or 'none'
+    
+    Returns:
+        Centered counts: Tensor [genes, cells]
+    """
+    # Binarize if using Bernoulli
+    if model == 'bernoulli':
+        counts = (counts > 0).double()
+        mu, var, _ = models.bernoulli_model_torch(counts, num_umi)
+    elif model == 'danb':
+        mu, var, _ = models.danb_model_torch(counts, num_umi)
+    elif model == 'normal':
+        mu, var, _ = models.normal_model_torch(counts, num_umi)
+    elif model == 'none':
+        mu, var, _ = none_model_batch(counts, num_umi)
+    else:
+        raise ValueError(f"Unsupported model type: {model}")
+    
+    # Avoid division by zero
+    std = torch.sqrt(var)
+    std[std == 0] = 1.0
+
+    centered = (counts - mu) / std
+    centered[centered == 0] = 0  # Optional: to match old behavior
+    
+    return centered
+
+
 def compute_autocor_Z_scores(G, G_max, Wtot2):
 
     EG, EG2 = 0, Wtot2
@@ -264,6 +480,31 @@ def compute_autocor_Z_scores(G, G_max, Wtot2):
     stdG = [stdG for i in range(len(G))]
 
     return [G, G_max, EG, stdG, Z, C]
+
+
+def compute_autocor_Z_scores_torch(G, G_max, Wtot2):
+    """
+    G, G_max: torch tensors of shape (genes,)
+    Wtot2: float scalar (already computed)
+    Returns a dict with tensors: G, G_max, EG, stdG, Z, C
+    """
+    EG = 0.0
+    stdG = (Wtot2 - EG**2)**0.5
+
+    Z = (G - EG) / stdG  # (genes,)
+    C = (G - EG) / G_max  # (genes,)
+
+    EG_tensor = torch.full_like(G, EG)
+    stdG_tensor = torch.full_like(G, stdG)
+
+    return {
+        "G": G,
+        "G_max": G_max,
+        "EG": EG_tensor,
+        "stdG": stdG_tensor,
+        "Z": Z,
+        "C": C,
+    }
 
 
 def compute_communication_autocorrelation(adata, spatial_coords_obsm_key):

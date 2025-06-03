@@ -13,15 +13,15 @@ import sparse
 from anndata import AnnData
 from numba import jit
 from pynndescent import NNDescent
-from scipy.sparse import csr_matrix, triu, lil_matrix, coo_matrix
+from scipy.sparse import csr_matrix, triu, lil_matrix, coo_matrix, vstack
 from scipy.spatial import KDTree
-from sklearn.neighbors import NearestNeighbors
+from sklearn.neighbors import NearestNeighbors, radius_neighbors_graph
 from sklearn.preprocessing import normalize
 from tqdm import tqdm
 
 
 def compute_knn_graph(
-    adata: Union[str, AnnData],
+    adata: AnnData,
     compute_neighbors_on_key: Optional[str] = None,
     distances_obsp_key: Optional[str] = None,
     weighted_graph: Optional[bool] = False,
@@ -30,6 +30,7 @@ def compute_knn_graph(
     neighborhood_factor: Optional[int] = 3,
     sample_key: Optional[str] = None,
     tree = None,
+    verbose: Optional[bool] = False,
 ):
     """Compute KNN graph.
 
@@ -53,9 +54,16 @@ def compute_knn_graph(
         Sample information in case the data contains different samples or samples from different conditions. Input is key in `adata.obs`.
     tree
         Root tree node. Can be created using ete3.Tree
+    verbose : bool, optional (default: False)
+        Whether to print progress and status messages.
 
     """
     start = time.time()
+    
+    if n_neighbors is None and neighborhood_radius is None:
+        raise ValueError(
+            "Either 'n_neighbors' or 'neighborhood_radius' needs to be provided."
+        )
 
     if tree is not None:
         try:
@@ -82,91 +90,181 @@ def compute_knn_graph(
         )
 
     if compute_neighbors_on_key is not None:
-        print("Computing the neighborhood graph...")
+        if verbose:
+            print("Computing the neighborhood graph...")
         compute_neighbors(
             adata=adata,
             compute_neighbors_on_key=compute_neighbors_on_key,
             n_neighbors=n_neighbors,
             neighborhood_radius=neighborhood_radius,
             sample_key=sample_key,
+            verbose=verbose,
         )
     else:
         if distances_obsp_key is not None and distances_obsp_key in adata.obsp:
-            print("Computing the neighborhood graph from distances...")
+            if verbose:
+                print("Computing the neighborhood graph from distances...")
             compute_neighbors_from_distances(
                 adata,
                 distances_obsp_key,
                 n_neighbors,
                 sample_key,
+                verbose,
             )
 
     if 'distances' in adata.obsp:
-        print("Computing the weights...")
+        if verbose:
+            print("Computing the weights...")
         compute_weights(
             adata,
             weighted_graph,
             neighborhood_factor,
         )
 
-    print("Finished computing the KNN graph in %.3f seconds" %(time.time()-start))
+    if verbose:
+        print("Finished computing the KNN graph in %.3f seconds" %(time.time()-start))
 
     return
 
 
 def compute_neighbors(
-        adata: Union[str, AnnData],
-        compute_neighbors_on_key: Optional[str] = None,
+        adata: AnnData,
+        compute_neighbors_on_key: str = None,
         n_neighbors: Optional[int] = None,
         neighborhood_radius: Optional[int] = None,
         sample_key: Optional[str] = None,
+        verbose: Optional[bool] = False,
 ) -> None:
+    """
+    Computes a nearest-neighbors graph on the AnnData object using either
+    radius-based or k-nearest neighbors.
 
-    coords = adata.obsm[compute_neighbors_on_key]
+    Parameters
+    ----------
+    adata : AnnData
+        Annotated data object (AnnData).
+    compute_neighbors_on_key : str, optional
+        Key in `adata.obsm` to compute neighbors on (e.g., spatial coordinates or PCA).
+        If None, defaults to 'spatial'.
+    n_neighbors : int, optional
+        Number of nearest neighbors to compute (for kNN graph).
+    neighborhood_radius : int, optional
+        Radius to use for radius-based graph computation (in Euclidean space).
+        Only used if `n_neighbors` is not provided.
+    sample_key : str, optional
+        Key in `adata.obs` indicating batch/sample identity.
+        Ensures neighbors are only computed within each sample.
+    verbose : bool, optional (default: False)
+        Whether to print progress and status messages.
+    """
+
+    # coords = adata.obsm[compute_neighbors_on_key]
     
+    # if sample_key is not None:
+    #     print("Adding sample-level specificity to the neighborhood graph...")
+    #     adata.uns['sample_key'] = sample_key
+    #     n_cells = adata.shape[0]
+    #     distances = lil_matrix((n_cells, n_cells))
+    #     samples = adata.obs[sample_key].unique().tolist()
+        
+    #     for sample in tqdm(samples):
+    #         sample_indices = np.where(adata.obs[sample_key] == sample)[0]
+    #         sample_coords = coords[sample_indices]
+
+    #         if n_neighbors is not None:
+    #             nbrs = NearestNeighbors(
+    #                 n_neighbors=n_neighbors+1,
+    #                 algorithm='ball_tree').fit(sample_coords)
+    #             sample_distances = nbrs.kneighbors_graph(sample_coords, mode='distance').todok()
+    #         elif neighborhood_radius is not None:
+    #             coords_tree = KDTree(sample_coords)
+    #             sample_distances = coords_tree.sparse_distance_matrix(coords_tree, neighborhood_radius)
+
+    #         for (i, j), sample_distance in sample_distances.items():
+    #             distances[sample_indices[i], sample_indices[j]] = sample_distance
+    # else:
+    #     if n_neighbors is not None:
+    #         nbrs = NearestNeighbors(
+    #             n_neighbors=n_neighbors+1,
+    #             algorithm='ball_tree').fit(coords)
+    #         distances = nbrs.kneighbors_graph(coords, mode='distance')
+
+    #     else:
+    #         coords_tree = KDTree(coords)
+    #         distances = coords_tree.sparse_distance_matrix(coords_tree, neighborhood_radius)
+
+    # if 'deconv_data' in adata.uns and adata.uns['deconv_data'] is True:
+    #     spot_diameter = adata.uns['spot_diameter']
+    #     barcodes = adata.obs['barcodes'].unique().tolist()
+    #     for barcode in barcodes:
+    #         barcode_mask = adata.obs['barcodes'] == barcode
+    #         barcode_mask = barcode_mask.reset_index(drop=True)
+    #         barcode_mask_ind = barcode_mask[barcode_mask].index.tolist()
+    #         if len(barcode_mask_ind) == 1:
+    #             continue
+    #         barcode_mask_ind_perm = list(itertools.permutations(barcode_mask_ind, 2))
+    #         barcode_mask_pos = list(zip(*barcode_mask_ind_perm))
+    #         distances[barcode_mask_pos[0],barcode_mask_pos[1]] = spot_diameter/2
+
+    # adata.obsp["distances"] = distances.tocsr()
+    
+    
+    # Optimized version
+    
+    if compute_neighbors_on_key not in adata.obsm:
+        raise ValueError(f"{compute_neighbors_on_key} not found in adata.obsm")
+    
+    coords = adata.obsm[compute_neighbors_on_key]
+    n_cells = adata.n_obs
+    distances = lil_matrix((n_cells, n_cells))
+
     if sample_key is not None:
+        if verbose:
+            print(f"Restricting graph within samples using '{sample_key}'...")
         adata.uns['sample_key'] = sample_key
-        n_cells = adata.shape[0]
-        distances = lil_matrix((n_cells, n_cells))
-        samples = adata.obs[sample_key].unique().tolist()
-        print("Adding sample-level specificity to the neighborhood graph...")
+        samples = adata.obs[sample_key].unique()
         for sample in tqdm(samples):
-            sample_indices = np.where(adata.obs[sample_key] == sample)[0]
-            sample_coords = coords[sample_indices]
-
+            sample_mask = adata.obs[sample_key] == sample
+            sample_indices = np.where(sample_mask)[0]
+            sample_coords = coords[sample_mask]
+            if len(sample_indices) == 0:
+                continue
             if n_neighbors is not None:
-                nbrs = NearestNeighbors(
-                    n_neighbors=n_neighbors+1,
-                    algorithm='ball_tree').fit(sample_coords)
-                sample_distances = nbrs.kneighbors_graph(sample_coords, mode='distance').todok()
+                nn = NearestNeighbors(n_neighbors=n_neighbors+1, algorithm='ball_tree').fit(sample_coords)
+                dist = nn.kneighbors_graph(sample_coords, mode='distance')
             elif neighborhood_radius is not None:
-                coords_tree = KDTree(sample_coords)
-                sample_distances = coords_tree.sparse_distance_matrix(coords_tree, neighborhood_radius)
-
-            for (i, j), sample_distance in sample_distances.items():
-                distances[sample_indices[i], sample_indices[j]] = sample_distance
+                dist = radius_neighbors_graph(sample_coords, radius=neighborhood_radius, mode='distance', include_self=False)
+            else:
+                raise ValueError("Either n_neighbors or neighborhood_radius must be specified.")
+            dist = dist.tocoo()
+            distances[sample_indices[dist.row], sample_indices[dist.col]] = dist.data
     else:
         if n_neighbors is not None:
-            nbrs = NearestNeighbors(
-                n_neighbors=n_neighbors+1,
-                algorithm='ball_tree').fit(coords)
-            distances = nbrs.kneighbors_graph(coords, mode='distance')
-
+            nn = NearestNeighbors(n_neighbors=n_neighbors+1, algorithm='ball_tree').fit(coords)
+            distances = nn.kneighbors_graph(coords, mode='distance')
+        elif neighborhood_radius is not None:
+            distances = radius_neighbors_graph(coords, radius=neighborhood_radius, mode='distance', include_self=False)
         else:
-            coords_tree = KDTree(coords)
-            distances = coords_tree.sparse_distance_matrix(coords_tree, neighborhood_radius)
+            raise ValueError("Either n_neighbors or neighborhood_radius must be specified.")
 
-    if 'deconv_data' in adata.uns and adata.uns['deconv_data'] is True:
+    # Deconvolution-aware neighborhood
+    if adata.uns.get('deconv_data', False):
+        if verbose:
+            print("Adding intra-spot connections...")
         spot_diameter = adata.uns['spot_diameter']
-        barcodes = adata.obs['barcodes'].unique().tolist()
-        for barcode in barcodes:
-            barcode_mask = adata.obs['barcodes'] == barcode
-            barcode_mask = barcode_mask.reset_index(drop=True)
-            barcode_mask_ind = barcode_mask[barcode_mask].index.tolist()
-            if len(barcode_mask_ind) == 1:
+        idx = adata.obs.groupby('barcodes').indices
+        rows, cols = [], []
+        for barcode, inds in idx.items():
+            if len(inds) < 2:
                 continue
-            barcode_mask_ind_perm = list(itertools.permutations(barcode_mask_ind, 2))
-            barcode_mask_pos = list(zip(*barcode_mask_ind_perm))
-            distances[barcode_mask_pos[0],barcode_mask_pos[1]] = spot_diameter/2
+            # Efficient pairwise combinations without permutations
+            inds = np.array(inds)
+            i, j = np.meshgrid(inds, inds, indexing='ij')
+            mask = i != j
+            rows.extend(i[mask])
+            cols.extend(j[mask])
+        extra_distances = csr_matrix((np.full(len(rows), spot_diameter / 2), (rows, cols)), shape=(n_cells, n_cells))
+        distances += extra_distances
 
     adata.obsp["distances"] = distances.tocsr()
 
@@ -175,52 +273,55 @@ def compute_neighbors(
 
 def compute_neighbors_from_distances(
         adata: AnnData,
-        distances_obsp_key: str,
-        spot_diameter: int,
-        sample_key: str,
+        distances_obsp_key: str = "distances",
+        sample_key: Optional[str] = None,
+        verbose: Optional[bool] = False,
 ) -> None:
-    """Computes nearest neighbors and associated weights using
-    provided distance matrix directly.
+    """
+    Builds a neighborhood graph using a precomputed distance matrix.
 
     Parameters
     ----------
-    distances: pandas.Dataframe num_cells x num_cells
-
-    Returns
-    -------
-    neighbors:      pandas.Dataframe num_cells x n_neighbors
-    weights:  pandas.Dataframe num_cells x n_neighbors
-
+    adata : AnnData
+        Annotated data object containing a full distance matrix in `obsp`.
+    distances_obsp_key : str
+        Key in `adata.obsp` with the full distance matrix.
+    sample_key : str, optional
+        Key in `adata.obs` to enforce neighbors only within samples.
+    verbose : bool, optional (default: False)
+        Whether to print progress and status messages.
     """
-    distances_tmp = adata.obsp[distances_obsp_key]
-    distances_tmp = csr_matrix(distances_tmp) if type(distances_tmp) is np.array else distances_tmp
     
+    if distances_obsp_key not in adata.obsp:
+        raise ValueError(f"{distances_obsp_key} not found in adata.obsp")
+    
+    distances_raw = adata.obsp[distances_obsp_key]
+    distances_raw = csr_matrix(distances_raw) if isinstance(distances_raw, np.ndarray) else distances_raw
+    
+    n_cells = adata.shape[0]
+    distances = lil_matrix((n_cells, n_cells))
+    
+    # Restrict by sample
     if sample_key is not None:
+        if verbose:
+            print(f"Restricting graph within samples using '{sample_key}'...")
         adata.uns['sample_key'] = sample_key
-        n_cells = adata.shape[0]
-        distances = lil_matrix((n_cells, n_cells))
         samples = adata.obs[sample_key].unique().tolist()
-        print("Adding sample-level specificity to the neighborhood graph...")
-        for sample in tqdm(samples):
-            sample_indices = np.where(adata.obs[sample_key] == sample)[0]
-            sample_distances = distances_tmp[sample_indices]
-
-            for (i, j), sample_distance in sample_distances.items():
-                distances[sample_indices[i], sample_indices[j]] = sample_distance
+        for sample in tqdm(adata.obs[sample_key].unique(), desc="Samples"):
+            idx = np.where(adata.obs[sample_key] == sample)[0]
+            sub_dist = distances_raw[idx, :][:, idx]
+            distances[np.ix_(idx, idx)] = sub_dist
     else:
-        distances = distances_tmp
+        distances = distances_raw.copy().tolil()
 
-    if 'deconv_data' in adata.uns and adata.uns['deconv_data'] is True:
-        barcodes = adata.obs['barcodes'].unique().tolist()
-        for barcode in barcodes:
-            barcode_mask = adata.obs['barcodes'] == barcode
-            barcode_mask = barcode_mask.reset_index(drop=True)
-            barcode_mask_ind = barcode_mask[barcode_mask].index.tolist()
-            if len(barcode_mask_ind) == 1:
+    if adata.uns.get("deconv_data", False) and "barcodes" in adata.obs:
+        if verbose:
+            print("Adding intra-spot connections...")
+        for barcode, inds in adata.obs.groupby("barcodes").indices.items():
+            if len(inds) <= 1:
                 continue
-            barcode_mask_ind_perm = list(itertools.permutations(barcode_mask_ind, 2))
-            barcode_mask_pos = list(zip(*barcode_mask_ind_perm))
-            distances[barcode_mask_pos[0],barcode_mask_pos[1]] = spot_diameter/2
+            for i, j in itertools.permutations(inds, 2):
+                distances[i, j] = spot_diameter / 2
 
     adata.obsp["distances"] = distances.tocsr()
 
@@ -256,47 +357,92 @@ def compute_weights(
         weighted_graph: bool,
         neighborhood_factor: int,
 ) -> None:
-    """Computes weights on the nearest neighbors based on a
+    """
+    Computes weights on the neighbors based on a
     gaussian kernel and their distances.
 
-    Kernel width is set to the num_neighbors / neighborhood_factor's distance
+    Parameters
+    ----------
+    adata : AnnData
+        Annotated data object containing a full distance matrix in `obsp`.
+    weighted_graph : bool
+        Whether or not to create a weighted graph.
+    neighborhood_factor : int
+        Used when creating a weighted graph.  Sets how quickly weights decay relative to the distances within the neighborhood. 
+        The weight for a cell with a distance d will decay as exp(-d^2/D) where D is the distance to the `n_neighbors`/`neighborhood_factor`-th neighbor.
+    """
+    
+    # distances = sparse.COO.from_scipy_sparse(adata.obsp['distances'])
 
-    distances:  cells x neighbors ndarray
-    neighborhood_factor: float
+    # if not weighted_graph:
+    #     weights = distances.copy()
+    #     weights_mask = distances != 0
 
-    returns weights:  cells x neighbors ndarray
+    #     weights.data = np.where(weights_mask.data, 1, 0)
+    #     weights.coords = weights_mask.coords
+    #     adata.obsp["weights"] = weights.tocsr()
+    # else:
+    #     k_neighbors = [distances[i].nnz for i in range(distances.shape[0])]
 
-    """    
+    #     if len(np.unique(k_neighbors)) != 1:
+    #         radius_ii = [ceil(k_neighbor / neighborhood_factor) for k_neighbor in k_neighbors]
+    #         sigma = np.array([[sorted(distances[i].data)[radius_ii[i]-1]] if k_neighbors[i] != 0 else [0] for i in range(distances.shape[0])], dtype=float)
+
+    #     else:
+    #         radius_ii = ceil(np.unique(k_neighbors) / neighborhood_factor)
+    #         sigma = np.array([[sorted(distances[i].data)[radius_ii-1]] for i in range(distances.shape[0])], dtype=float)
+
+    #     sigma[sigma == 0] = 1
+
+    #     weights = -1 * distances**2 / sigma**2
+    #     weights.data = np.exp(weights.data)
+
+    #     weights_csr = weights.tocsr()
+    #     weights_norm = normalize(weights_csr, norm="l1", axis=1)
+    #     adata.obsp["weights"] = weights_norm
+
+    #     return
+    
+    # Optimized version
+    
+    # Load distance matrix and remove diagonal entries
     distances = sparse.COO.from_scipy_sparse(adata.obsp['distances'])
+    i, j = distances.coords
+    non_diag_mask = i != j
+    i, j, data = i[non_diag_mask], j[non_diag_mask], distances.data[non_diag_mask]
+    distances = sparse.COO(coords=[i, j], data=data, shape=distances.shape)
 
     if not weighted_graph:
-        weights = distances.copy()
-        weights_mask = distances != 0
-
-        weights.data = np.where(weights_mask.data, 1, 0)
-        weights.coords = weights_mask.coords
+        # Unweighted: convert all non-zero distances to 1
+        weights = sparse.COO(coords=[i, j], data=np.ones_like(data), shape=distances.shape)
         adata.obsp["weights"] = weights.tocsr()
-    else:
-        k_neighbors = [distances[i].nnz for i in range(distances.shape[0])]
-
-        if len(np.unique(k_neighbors)) != 1:
-            radius_ii = [ceil(k_neighbor / neighborhood_factor) for k_neighbor in k_neighbors]
-            sigma = np.array([[sorted(distances[i].data)[radius_ii[i]-1]] if k_neighbors[i] != 0 else [0] for i in range(distances.shape[0])], dtype=float)
-
-        else:
-            radius_ii = ceil(np.unique(k_neighbors) / neighborhood_factor)
-            sigma = np.array([[sorted(distances[i].data)[radius_ii-1]] for i in range(distances.shape[0])], dtype=float)
-
-        sigma[sigma == 0] = 1
-
-        weights = -1 * distances**2 / sigma**2
-        weights.data = np.exp(weights.data)
-
-        weights_csr = weights.tocsr()
-        weights_norm = normalize(weights_csr, norm="l1", axis=1)
-        adata.obsp["weights"] = weights_norm
-
         return
+    
+    # Weighted: Gaussian kernel
+    n_cells = distances.shape[0]
+    row_starts = np.searchsorted(i, np.arange(n_cells), side="left")
+    row_ends = np.searchsorted(i, np.arange(n_cells) + 1, side="left")
+
+    sigmas = np.ones(n_cells, dtype=float)
+    for idx in range(n_cells):
+        start, end = row_starts[idx], row_ends[idx]
+        row_data = data[start:end]
+        if row_data.size == 0:
+            continue
+        radius_idx = ceil(len(row_data) / neighborhood_factor) - 1
+        sigmas[idx] = np.partition(row_data, radius_idx)[radius_idx]
+
+    # Build exp(-d^2 / sigma^2) weights
+    sigma_lookup = sigmas[i]  # map sigma per row
+    gaussian_weights = np.exp(-1.0 * data**2 / sigma_lookup**2)
+
+    weights = sparse.COO(coords=[i, j], data=gaussian_weights, shape=distances.shape)
+    weights_csr = weights.tocsr()
+    weights_norm = normalize(weights_csr, norm="l1", axis=1)
+
+    adata.obsp["weights"] = weights_norm
+    
+    return
 
 
 def make_weights_non_redundant(weights):
@@ -314,24 +460,24 @@ def make_weights_non_redundant(weights):
     return w_no_redundant
 
 
-@jit(nopython=True)
-def make_weights_non_redundant_orig(neighbors, weights):
-    w_no_redundant = weights.copy()
+# @jit(nopython=True)
+# def make_weights_non_redundant_orig(neighbors, weights):
+#     w_no_redundant = weights.copy()
 
-    for i in range(neighbors.shape[0]):
-        for k in range(neighbors.shape[1]):
-            j = neighbors[i, k]
+#     for i in range(neighbors.shape[0]):
+#         for k in range(neighbors.shape[1]):
+#             j = neighbors[i, k]
 
-            if j < i:
-                continue
+#             if j < i:
+#                 continue
 
-            for k2 in range(neighbors.shape[1]):
-                if neighbors[j, k2] == i:
-                    w_ji = w_no_redundant[j, k2]
-                    w_no_redundant[j, k2] = 0
-                    w_no_redundant[i, k] += w_ji
+#             for k2 in range(neighbors.shape[1]):
+#                 if neighbors[j, k2] == i:
+#                     w_ji = w_no_redundant[j, k2]
+#                     w_no_redundant[j, k2] = 0
+#                     w_no_redundant[i, k] += w_ji
 
-    return w_no_redundant
+#     return w_no_redundant
 
 
 def tree_neighbors_and_weights(adata, tree, n_neighbors):
@@ -470,21 +616,6 @@ def compute_node_degree_ct(weights_ct, cell_type_mask_ind):
 
 
 def compute_node_degree_ct_pair(weights, cell_type_pairs, cell_types):
-
-    # D = np.zeros(weights_ct.shape[0])
-
-    # for i in range(weights_ct.shape[0]):
-    #     col_indices_ct_i = np.nonzero(weights_ct[i])[0]
-    #     col_indices_ct_i = [col_index_ct_i for col_index_ct_i in col_indices_ct_i if col_index_ct_i in cell_type_mask_u_ind]
-    #     if len(col_indices_ct_i) == 0:
-    #         continue
-    #     for j in col_indices_ct_i:
-    #         ind_i = cell_type_mask_t_ind[i]
-    #         j = int(j)
-    #         w_ij = weights_ct[i, j]
-
-    #         D[ind_i] += w_ij
-    #         D[j] += w_ij
 
     w_nrow, w_ncol = weights.shape
     n_ct_pairs = len(cell_type_pairs)

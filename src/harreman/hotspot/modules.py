@@ -3,6 +3,7 @@ import time
 import numpy as np
 import pandas as pd
 import scvi
+import torch
 from anndata import AnnData
 from scipy.cluster.hierarchy import linkage
 from scipy.spatial.distance import squareform
@@ -13,26 +14,41 @@ from tqdm import tqdm
 
 from ..vision.signature import compute_signatures_anndata
 from ..preprocessing.anndata import counts_from_anndata
+from .local_autocorrelation import center_counts_torch
 from .local_correlation import create_centered_counts_row, create_centered_counts
 from ..tools.knn import make_weights_non_redundant
 
 
 def calculate_module_scores(
     adata: AnnData,
-    method: Optional[Union[Literal["PCA"], Literal["LDVAE"]]] = 'PCA',
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    verbose: Optional[bool] = False,
 ):
-    """Calculate Module Scores.
+    """
+    Calculate module scores for gene modules across cells.
 
-    In addition to returning its result, this method stores
-    its output in the object at `self.module_scores`
+    Parameters
+    ----------
+    adata : AnnData
+        Annotated data object (AnnData). Required fields in `adata.uns`:
+        - 'layer_key': name of the layer from which to extract the expression matrix
+        - 'model': statistical model used to normalize expression (e.g., 'DANB', 'normal')
+        - 'umi_counts': total UMI counts per cell
+        - 'gene_modules_dict': dictionary mapping module IDs (as strings) to lists of gene names
+    device : torch.device, optional
+        Device to use for computation (e.g., CUDA or CPU). Defaults to GPU if available.
+    verbose : bool, optional (default: False)
+        Whether to print progress and status messages.
 
     Returns
     -------
-    module_scores: pandas.DataFrame
-        Scores for each module for each gene
-        Dimensions are genes x modules
-
+    None
+        The following results are stored in the `AnnData` object:
+        - `adata.obsm['module_scores']`: (cells x modules) DataFrame with per-cell module activity scores
+        - `adata.varm['gene_loadings']`: (genes x modules) DataFrame with gene loadings for each module
+        - `adata.uns['gene_modules']`: dictionary mapping module names to gene lists
     """
+    
     start = time.time()
 
     layer_key = adata.uns['layer_key']
@@ -48,7 +64,8 @@ def calculate_module_scores(
     mod_list.sort()
     modules_to_compute = [str(mod) for mod in mod_list]
 
-    print(f"Computing scores for {len(modules_to_compute)} modules...")
+    if verbose:
+        print(f"Computing scores for {len(modules_to_compute)} modules...")
 
     module_scores = {}
     gene_loadings = pd.DataFrame(index=adata.var_names)
@@ -56,19 +73,13 @@ def calculate_module_scores(
     for module in tqdm(modules_to_compute):
         module_genes = modules[module]
 
-        if method == 'PCA':
-            scores, loadings = compute_scores_PCA(
-                adata[:, module_genes],
-                layer_key,
-                model,
-                umi_counts,
-            )
-        elif method == 'LDVAE':
-            scores, loadings = compute_scores_LDVAE(
-                adata[:, module_genes],
-            )
-        else:
-            raise ValueError('Invalid method: Please choose either "PCA" or "LDVAE".')
+        scores, loadings = compute_scores(
+            adata[:, module_genes],
+            layer_key,
+            model,
+            umi_counts,
+            device,
+        )
 
         module_name = f'Module {module}' if 'Module' not in module else module
         module_scores[module_name] = scores
@@ -84,75 +95,64 @@ def calculate_module_scores(
     adata.varm['gene_loadings'] = gene_loadings
     adata.uns["gene_modules"] = gene_modules
 
-    print("Finished computing module scores in %.3f seconds" %(time.time()-start))
+    if verbose:
+        print("Finished computing module scores in %.3f seconds" %(time.time()-start))
 
     return
 
 
-def compute_scores_PCA(
-        adata, layer_key, model, num_umi, _lambda=.9):
+def compute_scores(
+        adata, layer_key, model, num_umi, device, _lambda=.9):
     """
     counts_sub: row-subset of counts matrix with genes in the module
     """
 
-    weights = adata.obsp['weights']
-    weights = make_weights_non_redundant(weights)
-
+    # Get the weights matrix    
+    weights = make_weights_non_redundant(adata.obsp["weights"]).tocoo()
+    weights = torch.sparse_coo_tensor(
+        torch.tensor(np.vstack((weights.row, weights.col)), dtype=torch.long, device=device),
+        torch.tensor(weights.data, dtype=torch.float64, device=device),
+        torch.Size(weights.shape), 
+        device=device)
+    
+    # Get gene expression counts for the module (dense)
     counts_sub = counts_from_anndata(adata, layer_key, dense=True)
+    
+    # Convert to tensors
+    num_umi = torch.tensor(num_umi, dtype=torch.float64, device=device)
+    counts_sub = torch.tensor(counts_sub, dtype=torch.float64, device=device)
 
-    cc_smooth = np.zeros_like(counts_sub, dtype=np.float64)
-    
+    # Center values
     sample_specific = 'sample_key' in adata.uns.keys()
-    
     if sample_specific:
         sample_key = adata.uns['sample_key']
-        for sample in adata.obs[sample_key].unique().tolist():
+        for sample in adata.obs[sample_key].unique():
             subset = np.where(adata.obs[sample_key] == sample)[0]
-            counts_sub[:,subset] = create_centered_counts(counts_sub[:,subset], model, num_umi[subset])
+            counts_sub[:,subset] = center_counts_torch(counts_sub[:,subset], num_umi[subset], model)
     else:
-        counts_sub = create_centered_counts(counts_sub, model, num_umi)
+        counts_sub = center_counts_torch(counts_sub, num_umi, model)
 
-    out = (weights + weights.T) @ counts_sub.T
-    weights_sum = np.array(weights.sum(axis=1).T)[0] + np.array(weights.sum(axis=0))[0]
-    weights_sum[weights_sum == 0] = 1
-    out /= weights_sum[:, np.newaxis]
-    cc_smooth = (out.T * _lambda) + ((1 - _lambda) * counts_sub)
+    # counts_sub = torch.tensor(counts_sub, dtype=torch.float64, device=device)
+    
+    # Smooth the counts using weights
+    out = torch.matmul(weights + weights.transpose(0, 1), counts_sub.T)  # (cells x cells) @ (cells x genes)^T = (cells x genes)^T
+    weights_sum = torch.sparse.sum(weights, dim=0).to_dense() + torch.sparse.sum(weights, dim=1).to_dense()  # shape (cells,)
+    weights_sum[weights_sum == 0] = 1.0
+    out = out / weights_sum[:, None]  # normalize
+    cc_smooth = _lambda * out.T + (1 - _lambda) * counts_sub  # (genes x cells)
+    
+    # Perform PCA on cells (transpose to cells x genes)
+    pca_data = cc_smooth.T.cpu().numpy()
+    pca = PCA(n_components=1)
+    scores = pca.fit_transform(pca_data)
+    loadings = pca.components_.T
 
-    pca_data = cc_smooth
-
-    model = PCA(n_components=1)
-    scores = model.fit_transform(pca_data.T)
-    loadings = model.components_.T
-
-    sign = model.components_.mean()  # may need to flip
-    if sign < 0:
-        scores = scores * -1
-        loadings = loadings * -1
-
+    # Flip sign if needed
+    if pca.components_.mean() < 0:
+        scores *= -1
+        loadings *= -1
     scores = scores[:, 0]
     loadings = loadings[:, 0]
-
-    return scores, loadings
-
-
-def compute_scores_LDVAE(
-        adata):
-    """
-    counts_sub: row-subset of counts matrix with genes in the module
-    """
-
-    scvi.model.LinearSCVI.setup_anndata(adata, layer="counts")
-    model = scvi.model.LinearSCVI(adata, n_latent=1)
-
-    model.train(max_epochs=250, plan_kwargs={"lr": 5e-3}, check_val_every_n_epoch=10)
-
-    Z_hat = model.get_latent_representation()
-    Z_hat_list = Z_hat.tolist()
-
-    scores = np.array([x for xs in Z_hat_list for x in xs])
-
-    loadings = model.get_loadings()
-    loadings = loadings['Z_0']
 
     return scores, loadings
 
@@ -421,33 +421,37 @@ def assign_modules_core(Z, leaf_labels, offset, MIN_THRESHOLD=10, Z_THRESHOLD=3)
 
 
 def create_modules(
-    adata: Union[str, AnnData],
+    adata: AnnData,
     min_gene_threshold: Optional[int] = 20,
     fdr_threshold: Optional[float] = 0.05,
     z_threshold: Optional[float] = None,
     core_only: bool = False,
 ):
-    """Assigns modules from the gene pair-wise Z-scores.
+    """
+    Perform hierarchical clustering on gene-gene local correlation Z-scores to assign gene modules.
 
     Parameters
     ----------
-    Z_scores: pandas.DataFrame
-        local correlations between genes
-    min_gene_threshold: int, optional
-        minimum number of genes to create a module
-    fdr_threshold: float, optional
-        used to determine minimally significant z_score
-    core_only: bool, optional
-        whether or not to assign unassigned genes to a module
+    adata : AnnData
+        Annotated data object (AnnData) containing the local correlation Z-scores in `adata.uns['lc_zs']`.
+    min_gene_threshold : int, optional (default: 20)
+        Minimum number of genes required to define a module.
+    fdr_threshold : float, optional (default: 0.05)
+        FDR threshold used to determine the minimum Z-score significance if `z_threshold` is not provided.
+    z_threshold : float, optional
+        If provided, uses this Z-score as the cutoff for module inclusion instead of computing it from FDR.
+    core_only : bool, optional (default: False)
+        If True, assigns only tightly correlated (core) genes to modules and leaves others unassigned.
 
     Returns
     -------
-    modules: pandas.Series
-        maps gene id to module id
-    linkage: numpy.ndarray
-        Linkage matrix in the format used by scipy.cluster.hierarchy.linkage
-
+    None
+        The function modifies the `AnnData` object in place by adding the following to `adata.uns`:
+        - `modules`: pandas Series mapping each gene to a module ID (integer, as string)
+        - `gene_modules_dict`: dictionary mapping module IDs (as strings) to lists of gene names
+        - `linkage`: linkage matrix from hierarchical clustering (for visualization or tree operations)
     """
+    
     start = time.time()
     print("Creating modules...")
 
@@ -688,7 +692,7 @@ def compute_top_scoring_modules(
 
 def calculate_super_module_scores(
     adata: AnnData,
-    method: Optional[Union[Literal["mean"], Literal["PCA"], Literal["LDVAE"]]] = 'PCA',
+    method: Optional[Union[Literal["mean"], Literal["PCA"]]] = 'PCA',
     super_module_dict: dict = None,
 ):
 
@@ -729,18 +733,14 @@ def calculate_super_module_scores(
             super_module_genes = [item for key in modules for item in gene_modules.get(key, [])]
             
             if method == 'PCA':
-                scores, loadings = compute_scores_PCA(
+                scores, loadings = compute_scores(
                     adata[:, super_module_genes],
                     layer_key,
                     model,
                     umi_counts,
                 )
-            elif method == 'LDVAE':
-                scores, loadings = compute_scores_LDVAE(
-                    adata[:, super_module_genes],
-                )
             else:
-                raise ValueError('Invalid method: Please choose either "mean", "PCA", or "LDVAE".')
+                raise ValueError('Invalid method: Please choose either "mean" or "PCA".')
 
             super_module_scores[super_module] = scores
             gene_loadings_sm[super_module] = pd.Series(loadings, index=super_module_genes)

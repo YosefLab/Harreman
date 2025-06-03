@@ -114,7 +114,7 @@ def extract_transporter_info(
 ) -> Dict[str, Dict[str, List[str]]]:
     """Read csv file to extract the metabolite database."""
 
-    BASE_PATH = '/home/labs/nyosef/oier/Harreman/data/HarremanDB'
+    BASE_PATH = '/home/projects/nyosef/oier/Harreman/data/HarremanDB'
     
     database_info = {
         'mouse': {
@@ -212,7 +212,7 @@ def extract_transporter_info(
 def extract_lr_pairs(adata, species):
     """Extracting LR pairs from CellChatDB."""
 
-    BASE_PATH = '/home/labs/nyosef/oier/Harreman/data/CellChatDB'
+    BASE_PATH = '/home/projects/nyosef/oier/Harreman/data/CellChatDB'
 
     database_info = {
         'mouse': {

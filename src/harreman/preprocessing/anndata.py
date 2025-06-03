@@ -6,7 +6,7 @@ import pandas as pd
 from scipy.sparse import issparse
 
 
-def counts_from_anndata(adata, layer_key, dense=False):
+def counts_from_anndata_original(adata, layer_key, dense=False):
 
     if layer_key is None:
         counts = adata.X
@@ -23,6 +23,31 @@ def counts_from_anndata(adata, layer_key, dense=False):
 
     if dense:
         counts = counts.A if is_sparse else counts
+
+    return counts
+
+
+def counts_from_anndata(adata, layer_key=None, dense=False):
+    # 1. Extract matrix
+    if layer_key is None:
+        counts = adata.X
+    elif layer_key == "use_raw":
+        counts = adata.raw.X
+    else:
+        counts = adata.layers[layer_key]
+
+    # 2. Transpose efficiently
+    if issparse(counts):
+        counts = counts.transpose().tocsr(copy=False)  # keep CSR format for efficient row slicing
+    else:
+        counts = counts.T  # transpose numpy array directly
+
+    # 3. Convert to dense if requested
+    if dense:
+        if issparse(counts):
+            counts = counts.toarray()
+        else:
+            counts = np.asarray(counts)
 
     return counts
 
