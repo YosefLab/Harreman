@@ -30,6 +30,8 @@ def local_correlation_plot(
     colors = list(plt.get_cmap(mod_cmap).colors)
     module_colors = {i: colors[(i-1) % len(colors)] for i in modules.unique()}
     module_colors[-1] = '#ffffff'
+    
+    modules = modules[local_correlation_z.index]
 
     row_colors1 = pd.Series(
         [module_colors[i] for i in modules],
@@ -113,6 +115,7 @@ def average_local_correlation_plot(
     row_cluster=True,
     col_cluster=True,
     use_super_modules=False,
+    super_module_dict=None,
     show=True,
 ):
     
@@ -131,7 +134,14 @@ def average_local_correlation_plot(
 
     row_colors = None
     colors = list(plt.get_cmap(mod_cmap).colors)
-    module_colors = {i: colors[(i-1) % len(colors)] for i in modules.unique()}
+    if super_module_dict:
+        module_colors = {
+            mod: colors[(sm-1) % len(colors)]
+            for sm, mods in super_module_dict.items()
+            for mod in mods
+        }
+    else:
+        module_colors = {mod: colors[(mod-1) % len(colors)] for mod in modules.unique()}
     module_colors[-1] = '#ffffff'
 
     row_colors = pd.DataFrame({
@@ -207,6 +217,7 @@ def module_score_correlation_plot(
     yticklabels=False,
     method='pearson',
     use_super_modules=False,
+    super_module_dict=None,
     row_cluster=True,
     col_cluster=True,
     show=True,
@@ -223,7 +234,14 @@ def module_score_correlation_plot(
 
     row_colors = None
     colors = list(plt.get_cmap(mod_cmap).colors)
-    module_colors = {i: colors[(i-1) % len(colors)] for i in modules.unique()}
+    if super_module_dict:
+        module_colors = {
+            mod: colors[(sm-1) % len(colors)]
+            for sm, mods in super_module_dict.items()
+            for mod in mods
+        }
+    else:
+        module_colors = {mod: colors[(mod-1) % len(colors)] for mod in modules.unique()}
     module_colors[-1] = '#ffffff'
 
     row_colors = pd.DataFrame({
@@ -292,7 +310,6 @@ def module_score_correlation_plot(
 
 def plot_interacting_cell_scores(
     adata: AnnData,
-    deconv_adata: Optional[AnnData] = None,
     cell_type_pair: Optional[list] = None,
     interactions: Optional[list] = None,
     coords_obsm_key: Optional[str] = None,
@@ -323,9 +340,6 @@ def plot_interacting_cell_scores(
     if sample_specific and 'sample_key' not in adata.uns.keys():
         raise ValueError('Sample information not found. Run Harreman using the "sample_key" parameter.')
     
-    if deconv_adata is not None:
-        adata.uns['interacting_cell_results'] = deconv_adata.uns['interacting_cell_results']
-    
     if only_sig_values:
         sig_str = 'FDR' if use_FDR else 'pval'
         interacting_cell_scores_gp = adata.uns['interacting_cell_results'][test_str]['gp'][f'cs_sig_{sig_str}']
@@ -348,30 +362,7 @@ def plot_interacting_cell_scores(
     else:
         interacting_cell_scores = interacting_cell_scores_gp if len(gene_pairs) > 0 else interacting_cell_scores_m
     
-    if isinstance(cell_type_pair, list):
-        if len(cell_type_pair) != 2:
-            raise ValueError("Please provide two cell types.")
-        else:
-            ct_1, ct_2 = cell_type_pair
-        
-        if (ct_1, ct_2) in interacting_cell_scores.keys():
-            ct_pair = (ct_1, ct_2)
-        elif (ct_2, ct_1) in interacting_cell_scores.keys():
-            ct_pair = (ct_2, ct_1)
-        else:
-            raise ValueError(f"Cell types {ct_1} and {ct_2} don't have significant interactions. Please provide another cell type pair.")
-    else:
-        ct_pair = cell_type_pair
-    
-    if ct_pair is None:
-        if isinstance(interacting_cell_scores, pd.DataFrame):
-            scores = interacting_cell_scores[interactions]
-        else:
-            if 'combined_cell_scores' not in adata.uns:
-                sum_ct_pair_scores(adata)
-            scores = adata.uns['combined_cell_scores'][interactions]
-    else:
-        scores = interacting_cell_scores[ct_pair][interactions]
+    scores = interacting_cell_scores[interactions]
     
     if normalize_values:
         scores = scores.apply(lambda x: (x - x.min()) / (x.max() - x.min()), axis=0) #We apply min-max normalization
@@ -392,60 +383,25 @@ def plot_interacting_cell_scores(
             sample_key = adata.uns['sample_key']
             for sample in adata.obs[sample_key].unique().tolist():
                 print(sample)
-                plot_interaction(adata[adata.obs[sample_key] == sample], scores.loc[adata.obs[sample_key] == sample], interaction, ct_pair, coords_obsm_key, s, vmin_new, vmax_new, figsize, cmap, colorbar, swap_y_axis)
+                plot_interaction(adata[adata.obs[sample_key] == sample], scores.loc[adata.obs[sample_key] == sample], interaction, coords_obsm_key, s, vmin_new, vmax_new, figsize, cmap, colorbar, swap_y_axis)
                 plt.show()
                 plt.close()
         else:
-            plot_interaction(adata, scores, interaction, ct_pair, coords_obsm_key, s, vmin_new, vmax_new, figsize, cmap, colorbar, swap_y_axis)
+            plot_interaction(adata, scores, interaction, coords_obsm_key, s, vmin_new, vmax_new, figsize, cmap, colorbar, swap_y_axis)
             plt.show()
             plt.close()
 
 
-def sum_ct_pair_scores(adata):
-
-    interacting_cell_scores = adata.uns['interacting_cell_scores']
-
-    df_list = []
-    for key in interacting_cell_scores.keys():
-        df = interacting_cell_scores[key].copy()
-        df_list.append(df)
-    
-    combined_df = pd.concat(df_list, axis=1)
-    combined_scores = combined_df.T.groupby(level=0).sum().T
-
-    adata.uns['combined_cell_scores'] = combined_scores
-
-    return
-
-
-def plot_interaction(adata, scores, interaction, ct_pair, coords_obsm_key, s, vmin, vmax, figsize, cmap, colorbar, swap_y_axis):
-
-    if isinstance(adata.obsm[coords_obsm_key], pd.DataFrame):
-        coords = adata.obsm[coords_obsm_key].values
-    else:
-        coords = adata.obsm[coords_obsm_key]
-    
-    # plt.figure(figsize=figsize)
-    ax = plt.subplot(111)
-    ax.set_aspect('equal', adjustable='box')
-    _prettify_axis(ax, spatial=True)
-    if swap_y_axis:
-        plt.scatter(coords[:,0], -coords[:,1], c=scores[interaction], cmap=cmap, s=s, vmin=vmin, vmax=vmax)
-    else:
-        plt.scatter(coords[:,0], coords[:,1], c=scores[interaction], cmap=cmap, s=s, vmin=vmin, vmax=vmax)
-    plt.title(f'{interaction}; {ct_pair[0]} and {ct_pair[1]}') if ct_pair is not None else plt.title(f'{interaction}')
-    if colorbar:
-        plt.colorbar()
-
-
-def plot_NMF_results(
+def plot_ct_interacting_cell_scores(
     adata: AnnData,
     deconv_adata: Optional[AnnData] = None,
+    cell_type_pair: Optional[list] = None,
+    interactions: Optional[list] = None,
     coords_obsm_key: Optional[str] = None,
-    interaction_type: Optional[Union[Literal["metabolite"], Literal["gene_pair"]]] = "metabolite",
-    only_sig_values: Optional[bool] = False,
-    use_FDR: Optional[bool] = True,
-    n_factors: Optional[int] = 5,
+    test: Optional[Union[Literal["parametric"], Literal["non-parametric"]]] = None,
+    agg_only: Optional[bool] = False,
+    normalize_values: Optional[bool] = False,
+    sample_specific: Optional[bool] = False,
     s: Optional[float] = None,
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
@@ -460,53 +416,151 @@ def plot_NMF_results(
     if isinstance(vmax, str) and 'p' not in vmax:
         raise ValueError('"vmax" needs to be either a numeric value or a percentile: e.g. "p95".')
     
+    if test not in ['parametric', 'non-parametric']:
+        raise ValueError('The "test" variable should be one of ["parametric", "non-parametric"].')
+    
+    test_str = 'p' if test == 'parametric' else 'np'
+    
+    if sample_specific and 'sample_key' not in adata.uns.keys():
+        raise ValueError('Sample information not found. Run Harreman using the "sample_key" parameter.')
+    
     if deconv_adata is not None:
-        adata.uns['NMF_results'] = deconv_adata.uns['NMF_results']
+        adata.uns[f'ct_interacting_cell_results_{test_str}_gp_cs_df'] = deconv_adata.uns[f'ct_interacting_cell_results_{test_str}_gp_cs_df']
+        adata.uns[f'ct_interacting_cell_results_{test_str}_m_cs_df'] = deconv_adata.uns[f'ct_interacting_cell_results_{test_str}_m_cs_df']
     
-    interaction_type_str = 'm' if interaction_type == 'metabolite' else 'gp'
+    if interactions is None:
+        raise ValueError("Please provide a LR pair or a metabolite.")
+    
+    cell_type_pair = [] if cell_type_pair is None else cell_type_pair
 
-    if only_sig_values:
-        sig_str = 'FDR' if use_FDR else 'pval'
+    if not isinstance(cell_type_pair, list):
+        raise ValueError(
+            'The "cell_type_pair" variable must be None, a list of strings, or a list of tuples.'
+        )
+        
+    ct_pairs = []
+    if cell_type_pair:
+        for ct in cell_type_pair:
+            if isinstance(ct, tuple):
+                ct_pairs.append(f"{ct[0]} - {ct[1]}")
+            elif isinstance(ct, str):
+                ct_pairs.append(ct)
+            else:
+                raise ValueError(
+                    'Each element in "cell_type_pair" must be either a tuple or a string.'
+                )
     
-    NMF_results_key_W = f'NMF_W_{interaction_type_str}_{n_factors}_sig_{sig_str}' if only_sig_values else f'NMF_W_{interaction_type_str}_{n_factors}'
-    if NMF_results_key_W not in adata.uns["NMF_results"].keys():
-        raise ValueError("The provided parameters haven't been used to compute NMF. Input the correct parameters.")
+    interacting_cell_scores_gp = adata.obsm[f'ct_interacting_cell_results_{test_str}_gp_cs_df']
+    interacting_cell_scores_m = adata.obsm[f'ct_interacting_cell_results_{test_str}_m_cs_df']
     
-    W = adata.uns["NMF_results"][NMF_results_key_W]
-    factors = W.columns
+    def match_columns(df, ct_pairs, interactions):
+        matched_columns = []
+        per_cell_aggregation = {}
+        for col in df.columns:
+            ct_pair_str, interaction = col.split(': ', 1)
+            if interaction not in interactions:
+                continue
+            if not ct_pairs:
+                matched_columns.append(col)
+                continue
+            try:
+                ct1, ct2 = ct_pair_str.split(' - ')
+            except ValueError:
+                continue  # skip malformed cell type pairs
+
+            for query in ct_pairs:
+                if ' - ' in query:
+                    # Exact match of cell type pair
+                    if query == f"{ct1} - {ct2}":
+                        matched_columns.append(col)
+                        break
+                else:
+                    # Single cell type: match if in either position
+                    if query == ct1 or query == ct2:
+                        matched_columns.append(col)
+                        key = f"{query}: {interaction}"
+                        if key not in per_cell_aggregation:
+                            per_cell_aggregation[key] = df[col].copy()
+                        else:
+                            per_cell_aggregation[key] += df[col]
+                        break
+
+        selected_df = df[matched_columns]
+        if per_cell_aggregation:
+            agg_df = pd.concat(per_cell_aggregation, axis=1)
+        else:
+            agg_df = pd.DataFrame(index=df.index)  # empty fallback
+
+        return selected_df, agg_df
     
-    for factor in factors:
+    gp_selected, gp_aggregated = match_columns(interacting_cell_scores_gp, ct_pairs, interactions)
+    m_selected, m_aggregated = match_columns(interacting_cell_scores_m, ct_pairs, interactions)
+    
+    dfs = [gp_aggregated, m_aggregated] if agg_only else [gp_selected, gp_aggregated, m_selected, m_aggregated]
+    scores = pd.concat(dfs, axis=1)
+    
+    if normalize_values:
+        scores = scores.apply(lambda x: (x - x.min()) / (x.max() - x.min()), axis=0) #We apply min-max normalization
+    
+    for interaction in scores.columns:
         if isinstance(vmin, str):
-            vmin_new = int(vmin.split('p')[1])
-            vmin_new = np.percentile(W[factor], vmin_new)
+            vmin_new = float(vmin.split('p')[1])
+            vmin_new = np.percentile(scores[interaction], vmin_new)
         else:
             vmin_new = vmin
         if isinstance(vmax, str):
-            vmax_new = int(vmax.split('p')[1])
-            vmax_new = np.percentile(W[factor], vmax_new)
+            vmax_new = float(vmax.split('p')[1])
+            vmax_new = np.percentile(scores[interaction], vmax_new)
         else:
             vmax_new = vmax
         
-        plot_factor(adata, W, factor, coords_obsm_key, s, vmin_new, vmax_new, figsize, cmap, colorbar, swap_y_axis)
-        plt.show()
-        plt.close()
+        if sample_specific:
+            sample_key = adata.uns['sample_key']
+            for sample in adata.obs[sample_key].unique().tolist():
+                print(sample)
+                plot_ct_interaction(adata[adata.obs[sample_key] == sample], scores.loc[adata.obs[sample_key] == sample], interaction, coords_obsm_key, s, vmin_new, vmax_new, figsize, cmap, colorbar, swap_y_axis)
+                plt.show()
+                plt.close()
+        else:
+            plot_ct_interaction(adata, scores, interaction, coords_obsm_key, s, vmin_new, vmax_new, figsize, cmap, colorbar, swap_y_axis)
+            plt.show()
+            plt.close()
 
 
-def plot_factor(adata, W, factor, coords_obsm_key, s, vmin, vmax, figsize, cmap, colorbar, swap_y_axis):
+def plot_interaction(adata, scores, interaction, coords_obsm_key, s, vmin, vmax, figsize, cmap, colorbar, swap_y_axis):
 
     if isinstance(adata.obsm[coords_obsm_key], pd.DataFrame):
         coords = adata.obsm[coords_obsm_key].values
     else:
         coords = adata.obsm[coords_obsm_key]
     
-    plt.figure(figsize=figsize)
     ax = plt.subplot(111)
+    ax.set_aspect('equal', adjustable='box')
     _prettify_axis(ax, spatial=True)
     if swap_y_axis:
-        plt.scatter(coords[:,0], -coords[:,1], c=W[factor], cmap=cmap, s=s, vmin=vmin, vmax=vmax)
+        plt.scatter(coords[:,0], -coords[:,1], c=scores[interaction], cmap=cmap, s=s, vmin=vmin, vmax=vmax)
     else:
-        plt.scatter(coords[:,0], coords[:,1], c=W[factor], cmap=cmap, s=s, vmin=vmin, vmax=vmax)
-    plt.title(factor)
+        plt.scatter(coords[:,0], coords[:,1], c=scores[interaction], cmap=cmap, s=s, vmin=vmin, vmax=vmax)
+    plt.title(interaction)
+    if colorbar:
+        plt.colorbar()
+        
+
+def plot_ct_interaction(adata, scores, interaction, coords_obsm_key, s, vmin, vmax, figsize, cmap, colorbar, swap_y_axis):
+
+    if isinstance(adata.obsm[coords_obsm_key], pd.DataFrame):
+        coords = adata.obsm[coords_obsm_key].values
+    else:
+        coords = adata.obsm[coords_obsm_key]
+    
+    ax = plt.subplot(111)
+    ax.set_aspect('equal', adjustable='box')
+    _prettify_axis(ax, spatial=True)
+    if swap_y_axis:
+        plt.scatter(coords[:,0], -coords[:,1], c=scores[interaction], cmap=cmap, s=s, vmin=vmin, vmax=vmax)
+    else:
+        plt.scatter(coords[:,0], coords[:,1], c=scores[interaction], cmap=cmap, s=s, vmin=vmin, vmax=vmax)
+    plt.title(interaction)
     if colorbar:
         plt.colorbar()
 

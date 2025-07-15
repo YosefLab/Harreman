@@ -52,6 +52,7 @@ def compute_local_autocorrelation(
     umi_counts_obs_key: Optional[str] = None,
     permutation_test: Optional[bool] = False,
     M: Optional[int] = 1000,
+    seed: Optional[int] = 42,
     check_analytic_null: Optional[bool] = False,
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     verbose: Optional[bool] = False,
@@ -82,6 +83,8 @@ def compute_local_autocorrelation(
         Whether to compute an empirical p-value and null distribution by permuting the data.
     M : int, optional (default: 1000)
         Number of permutations to perform if `permutation_test` is True.
+    seed : int, optional (default: 42)
+        A random seed for the permutation testing.
     check_analytic_null : bool, optional (default: False)
         Whether to evaluate Z-scores under an analytic null distribution using permutation Z-scores.
     device : torch.device, optional
@@ -138,37 +141,12 @@ def compute_local_autocorrelation(
     num_umi = counts.sum(axis=0) if umi_counts_obs_key is None else np.asarray(adata.obs[umi_counts_obs_key])
     adata.uns['umi_counts'] = num_umi
 
-    # Center values
-    # def center_vals_f(x, num_umi):
-    #     return center_values_total(x, num_umi, model)
-
-    # if sample_specific:
-    #     sample_key = adata.uns['sample_key']
-    #     sample_labels = adata.obs[sample_key].values
-    #     unique_samples = np.unique(sample_labels)
-    #     for sample in unique_samples:
-    #         subset = np.where(sample_labels == sample)[0]
-    #         num_umi_subset = num_umi[subset]
-    #         counts[:,subset] = np.apply_along_axis(
-    #             lambda x: center_vals_f(x, num_umi_subset)[np.newaxis], 1, counts[:,subset]
-    #         ).squeeze(axis=1)
-    # else:
-    #     counts = np.apply_along_axis(
-    #         lambda x: center_vals_f(x, num_umi)[np.newaxis], 1, counts
-    #     ).squeeze(axis=1)
-
     # Convert to tensors
     num_umi = torch.tensor(adata.uns["umi_counts"], dtype=torch.float64, device=device)
     counts = torch.tensor(counts, dtype=torch.float64, device=device)
 
     # Center values
-    if sample_specific:
-        sample_key = adata.uns['sample_key']
-        for sample in adata.obs[sample_key].unique():
-            subset = np.where(adata.obs[sample_key] == sample)[0]
-            counts[:, subset] = center_counts_torch(counts[:, subset], num_umi[subset], model)
-    else:
-        counts = center_counts_torch(counts, num_umi, model)
+    counts = standardize_counts(adata, counts, model, num_umi, sample_specific)
 
     adata.var['local_autocorrelation'] = False
     adata.var.loc[genes, 'local_autocorrelation'] = True
@@ -203,6 +181,7 @@ def compute_local_autocorrelation(
         D=D,
         M=M,
         permutation_test=permutation_test,
+        seed=seed,
         check_analytic_null=check_analytic_null,
         device=device,
     )
@@ -225,68 +204,26 @@ def compute_local_autocorrelation(
     adata.uns["gene_autocorrelation_results"] = results_df[cols]
     if verbose:
         print("Local autocorrelation results are stored in adata.uns['gene_autocorrelation_results']")
-    
-    # results = compute_autocor_Z_scores(G, G_max, Wtot2)
-    # variables = ["G", "G_max", "EG", "stdG", "Z", "C"]
-    # results = pd.DataFrame(results, index=variables, columns=genes).T
-    
-    # results["Z_Pval"] = norm.sf(results["Z"].values)
-    # results["Z_FDR"] = multipletests(results["Z_Pval"], method="fdr_bh")[1]
-    
-    # if permutation_test:
-    #     perm_array = np.zeros((counts.shape[0], M)).astype(np.float16)
-    #     if check_analytic_null:
-    #         ac_zs_perm_array = np.zeros((counts.shape[0], M)).astype(np.float16)
-    #         ac_pvals_perm_array = np.zeros((counts.shape[0], M)).astype(np.float16)
-    #     for i in tqdm(range(M)):
-    #         idx = np.random.permutation(counts.shape[1])
-    #         G_perm = (counts[:, idx].T * (weights @ counts[:, idx].T)).sum(axis=0)
-    #         perm_array[:, i] = G_perm
-            
-    #         if check_analytic_null:
-    #             G_perm_max = np.apply_along_axis(compute_local_cov_max, 1, counts[:, idx], D)
-    #             results_perm = compute_autocor_Z_scores(G_perm, G_perm_max, Wtot2)
-    #             results_perm = pd.DataFrame(results_perm, index=variables, columns=genes).T
-    #             ac_zs_perm_array[:, i] = results_perm["Z"].values
-    #             ac_pvals_perm_array[:, i] = norm.sf(results_perm["Z"].values)
-        
-    #     x = np.sum(perm_array > G[:, np.newaxis], axis=1)
-    #     pvals = (x + 1) / (M + 1)
-        
-    #     results["Perm_Pval"] = pvals
-    #     results["Perm_FDR"] = multipletests(results["Perm_Pval"], method="fdr_bh")[1]
-        
-    #     if check_analytic_null:
-    #         adata.uns['analytic_null_ac_zs_perm'] = ac_zs_perm_array
-    #         adata.uns['analytic_null_ac_pvals_perm'] = ac_pvals_perm_array
 
-    # results = results.sort_values("Z", ascending=False)
-    # results.index.name = "Gene"
-
-    # results = results[["C", "Z", "Z_Pval", "Z_FDR", "Perm_Pval", "Perm_FDR"]] if permutation_test else results[["C", "Z", "Z_Pval", "Z_FDR"]]
-
-    # adata.uns['gene_autocorrelation_results'] = results
-
-    if verbose:
         print("Finished computing local autocorrelation in %.3f seconds" %(time.time()-start))
 
     return
 
 
 def compute_gene_autocorrelation_results(
-    counts, weights, G, G_max, Wtot2, genes, D, M, permutation_test, check_analytic_null, device
+    counts, weights, G, G_max, Wtot2, genes, D, M, permutation_test, seed, check_analytic_null, device
 ):
-    # Step 1: Compute core stats
+    # Compute core stats
     stats = compute_autocor_Z_scores_torch(G, G_max, Wtot2)
 
-    # Step 2: Build DataFrame
+    # Build DataFrame
     results = pd.DataFrame({k: v.cpu().numpy() for k, v in stats.items()}, index=genes)
 
     # Z P-values and FDR
     results["Z_Pval"] = norm.sf(results["Z"])
     results["Z_FDR"] = multipletests(results["Z_Pval"], method="fdr_bh")[1]
 
-    # Step 3: Permutation test
+    # Permutation test
     if permutation_test:
         n_genes, n_cells = counts.shape
         perm_array = torch.zeros((n_genes, M), dtype=torch.float16, device=device)
@@ -295,6 +232,7 @@ def compute_gene_autocorrelation_results(
             ac_zs_perm_array = torch.zeros((n_genes, M), dtype=torch.float16, device=device)
             ac_pvals_perm_array = torch.zeros((n_genes, M), dtype=torch.float16, device=device)
 
+        torch.manual_seed(seed)
         for i in tqdm(range(M), desc="Permutation test"):
             idx = torch.randperm(n_cells, device=device)
             X_perm = counts[:, idx]  # (genes x cells)
@@ -311,7 +249,7 @@ def compute_gene_autocorrelation_results(
                     norm.sf(stats_perm["Z"].cpu().numpy()), device=device
                 ).half()
 
-        # Step 4: Compute empirical permutation p-values
+        # Compute empirical permutation p-values
         G_expanded = G.unsqueeze(1)  # (genes, 1)
         x = torch.sum(perm_array > G_expanded, dim=1)
         pvals = ((x + 1) / (M + 1)).cpu().numpy()
@@ -452,7 +390,7 @@ def center_counts_torch(counts, num_umi, model):
     elif model == 'normal':
         mu, var, _ = models.normal_model_torch(counts, num_umi)
     elif model == 'none':
-        mu, var, _ = none_model_batch(counts, num_umi)
+        mu, var, _ = models.none_model_torch(counts, num_umi)
     else:
         raise ValueError(f"Unsupported model type: {model}")
     
@@ -505,6 +443,19 @@ def compute_autocor_Z_scores_torch(G, G_max, Wtot2):
         "Z": Z,
         "C": C,
     }
+
+
+def standardize_counts(adata, counts, model, num_umi, sample_specific):
+    
+    if sample_specific:
+        sample_key = adata.uns['sample_key']
+        for sample in adata.obs[sample_key].unique():
+            subset = np.where(adata.obs[sample_key] == sample)[0]
+            counts[:, subset] = center_counts_torch(counts[:, subset], num_umi[subset], model)
+    else:
+        counts = center_counts_torch(counts, num_umi, model)
+    
+    return counts
 
 
 def compute_communication_autocorrelation(adata, spatial_coords_obsm_key):

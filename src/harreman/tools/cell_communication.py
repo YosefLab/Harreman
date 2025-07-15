@@ -5,10 +5,13 @@ from functools import partial
 from random import random
 from typing import Literal, Optional, Union
 import time
+import torch
 import numpy as np
 import pandas as pd
 import scipy.cluster.hierarchy as hcluster
+from collections import defaultdict
 import sparse
+import warnings
 import tensorly as tl
 from anndata import AnnData
 from numba import jit, njit
@@ -22,10 +25,9 @@ from threadpoolctl import threadpool_limits
 from scipy.stats.mstats import gmean
 from scipy.stats import mannwhitneyu
 from ..hotspot import models
-from sklearn.decomposition import NMF
 
 from ..preprocessing.anndata import counts_from_anndata
-from ..hotspot.local_autocorrelation import compute_local_autocorrelation
+from ..hotspot.local_autocorrelation import compute_local_autocorrelation, standardize_counts
 from ..tools.knn import make_weights_non_redundant
 
 
@@ -253,7 +255,7 @@ def compute_gene_pairs(
     cell_type_key: Optional[str] = None,
     cell_type_pairs: Optional[list] = None,
     ct_specific: Optional[bool] = True,
-    spatial: Optional[bool] = True,
+    fix_ct: Optional[Union[Literal["all"], str]] = None,
     verbose: Optional[bool] = False,
 ):
     """
@@ -277,8 +279,8 @@ def compute_gene_pairs(
         List of tuples specifying cell type pairs to consider. If not provided, all combinations are used.
     ct_specific : bool, optional (default: True)
         If True, restrict gene pair computation to combinations relevant to the given cell type annotations.
-    spatial : bool, optional (default: True)
-        If True, restrict gene pairs to spatially proximal cell types using the neighbor graph.
+    fix_ct : str, optional
+        Whether to restrict the cell type pairs to a particular cell type.
     verbose : bool, optional (default: False)
         Whether to print progress and status messages.
 
@@ -301,6 +303,7 @@ def compute_gene_pairs(
     layer_key = layer_key or adata.uns.get("layer_key")
     use_raw = layer_key == "use_raw"
     genes = adata.raw.var.index if use_raw else adata.var_names
+    adata.uns['fix_ct'] = fix_ct
         
     if ct_specific:
         cell_type_key = cell_type_key or adata.uns.get("cell_type_key")
@@ -353,16 +356,15 @@ def compute_gene_pairs(
     if ct_specific:
         if cell_type_pairs is None:
             cell_type_list = list(filtered_genes_ct)
-            cell_type_pairs = list(itertools.combinations_with_replacement(cell_type_list, 2))
-        if spatial:
-            cell_type_pairs_df = pd.Series(cell_type_pairs)
-            valid_mask = cell_type_pairs_df.apply(get_interacting_cell_type_pairs, args=(weights, cell_types))
-            cell_type_pairs = cell_type_pairs_df[valid_mask].tolist()
-        else:
-            cell_type_pairs = [
-                pair for pair in cell_type_pairs
-                if pair[0] in filtered_genes_ct and pair[1] in filtered_genes_ct
-            ]
+            if fix_ct:
+                cell_type_pairs = list(itertools.product(cell_type_list, repeat=2))
+                if fix_ct != 'all':
+                    cell_type_pairs = [pair for pair in cell_type_pairs if pair[0] == fix_ct]
+            else:
+                cell_type_pairs = list(itertools.combinations_with_replacement(cell_type_list, 2))
+        cell_type_pairs_df = pd.Series(cell_type_pairs)
+        valid_mask = cell_type_pairs_df.apply(get_interacting_cell_type_pairs, args=(weights, cell_types))
+        cell_type_pairs = cell_type_pairs_df[valid_mask].tolist()
     
     # Setup for result aggregation
     gene_pairs_per_metabolite = {}
@@ -403,9 +405,9 @@ def compute_gene_pairs(
 
         else: # LR
             ligand = adata.uns["ligand"].loc[metabolite].dropna().tolist()
-            # ligand = ligand[0] if len(ligand) == 1 else ligand
+            ligand = ligand[0] if len(ligand) == 1 else ligand
             receptor = adata.uns["receptor"].loc[metabolite].dropna().tolist()
-            # receptor = receptor[0] if len(receptor) == 1 else receptor
+            receptor = receptor[0] if len(receptor) == 1 else receptor
             # if len(ligand) == 0 or len(receptor) == 0:
             if not ligand or not receptor:
                 continue
@@ -446,7 +448,6 @@ def compute_gene_pairs(
                             gene_pairs_per_ct_pair.setdefault((ct1, ct2), []).append((var1, var2))
 
     # Save results
-    adata.uns["spatial"] = spatial
     adata.uns.setdefault("gene_pairs", gene_pairs)
     if ct_specific:
         adata.uns.setdefault("cell_type_pairs", ct_pairs)
@@ -464,14 +465,15 @@ def compute_cell_communication(
     layer_key_p_test: Optional[Union[Literal["use_raw"], str]] = None,
     layer_key_np_test: Optional[Union[Literal["use_raw"], str]] = None,
     model: str = None,
-    cell_type_key: Optional[str] = None,
     center_counts_for_np_test: Optional[bool] = False,
     subset_gene_pairs: Optional[str] = None,
     M: Optional[int] = 1000,
+    seed: Optional[int] = 42,
     test: Optional[Union[Literal["parametric"], Literal["non-parametric"], Literal["both"]]] = "both",
     spatial: Optional[bool] = True,
     mean: Optional[Union[Literal["algebraic"], Literal["geometric"]]] = 'algebraic',
     check_analytic_null: Optional[bool] = False,
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     verbose: Optional[bool] = False,
 ):
     
@@ -481,13 +483,61 @@ def compute_cell_communication(
 
     adata.uns['ccc_results'] = {}
 
-    if 'spatial' in adata.uns.keys():
-        spatial = adata.uns['spatial']
-    else:
-        adata.uns['spatial'] = spatial
+    if test not in ['both', 'parametric', 'non-parametric']:
+        raise ValueError('The "test" variable should be one of ["both", "parametric", "non-parametric"].')
     
-    if spatial is False:
-        test = 'non-parametric'
+    if mean not in ['algebraic', 'geometric']:
+        raise ValueError('The "mean" variable should be one of ["algebraic", "geometric"].')
+    
+    adata.uns['layer_key_p_test'] = layer_key_p_test
+    adata.uns['layer_key_np_test'] = layer_key_np_test
+    adata.uns['model'] = model
+    adata.uns['center_counts_for_np_test'] = center_counts_for_np_test
+    adata.uns['mean'] = mean
+
+    run_cell_communication_analysis(adata, layer_key_p_test, layer_key_np_test, model, center_counts_for_np_test, subset_gene_pairs, M, seed, test, spatial, mean, check_analytic_null, device, verbose)
+
+    print("Obtaining communication results...")
+    get_cell_communication_results(
+        adata,
+        adata.uns["genes"],
+        layer_key_p_test,
+        layer_key_np_test,
+        model,
+        adata.uns["D"],
+        test,
+        device,
+    )
+
+    print("Finished computing cell-cell communication analysis in %.3f seconds" %(time.time()-start))
+
+    return
+
+
+def compute_ct_cell_communication(
+    adata: AnnData,
+    layer_key_p_test: Optional[Union[Literal["use_raw"], str]] = None,
+    layer_key_np_test: Optional[Union[Literal["use_raw"], str]] = None,
+    model: str = None,
+    cell_type_key: Optional[str] = None,
+    center_counts_for_np_test: Optional[bool] = False,
+    subset_gene_pairs: Optional[list] = None,
+    subset_metabolites: Optional[list] = None,
+    fix_gp: Optional[bool] = False,
+    M: Optional[int] = 1000,
+    seed: Optional[int] = 42,
+    test: Optional[Union[Literal["parametric"], Literal["non-parametric"], Literal["both"]]] = "both",
+    mean: Optional[Union[Literal["algebraic"], Literal["geometric"]]] = 'algebraic',
+    check_analytic_null: Optional[bool] = False,
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    verbose: Optional[bool] = False,
+):
+    
+    start = time.time()
+    if verbose:
+        print("Starting cell type-aware cell-cell communication analysis...")
+
+    adata.uns['ct_ccc_results'] = {}
 
     if test not in ['both', 'parametric', 'non-parametric']:
         raise ValueError('The "test" variable should be one of ["both", "parametric", "non-parametric"].')
@@ -497,8 +547,8 @@ def compute_cell_communication(
     
     if 'cell_type_key' in adata.uns and cell_type_key is None:
         cell_type_key = adata.uns['cell_type_key']
-    # elif 'cell_type_key' not in adata.uns and cell_type_key is None:
-    #     raise ValueError('Please provide the "cell_type_key" argument.')
+    elif 'cell_type_key' not in adata.uns and cell_type_key is None:
+        raise ValueError('Please provide the "cell_type_key" argument.')
     
     adata.uns['layer_key_p_test'] = layer_key_p_test
     adata.uns['layer_key_np_test'] = layer_key_np_test
@@ -507,35 +557,38 @@ def compute_cell_communication(
     adata.uns['center_counts_for_np_test'] = center_counts_for_np_test
     adata.uns['mean'] = mean
 
-    run_cell_communication_analysis(adata, layer_key_p_test, layer_key_np_test, model, cell_type_key, center_counts_for_np_test, subset_gene_pairs, M, test, spatial, mean, check_analytic_null)
+    run_ct_cell_communication_analysis(adata, layer_key_p_test, layer_key_np_test, model, cell_type_key, center_counts_for_np_test, subset_gene_pairs, subset_metabolites, fix_gp, M, seed, test, mean, check_analytic_null, device, verbose)
+    # run_ct_cell_communication_analysis_old(adata, layer_key_p_test, layer_key_np_test, model, cell_type_key, center_counts_for_np_test, subset_gene_pairs, subset_metabolites, M, seed, test, mean, check_analytic_null, verbose)
 
-    print("Obtaining the communication results...")
-    if cell_type_key:
-        get_cell_communication_results(
-            adata,
-            adata.uns["genes"],
-            adata.uns["cells"],
-            layer_key_p_test,
-            layer_key_np_test,
-            model,
-            adata.uns["cell_types"],
-            adata.uns["cell_type_pairs"],
-            adata.uns["D"],
-            test,
-        )
-    else:
-        get_cell_communication_results_no_ct(
-            adata,
-            adata.uns["genes"],
-            layer_key_p_test,
-            layer_key_np_test,
-            model,
-            adata.uns["D"],
-            test,
-        )
+    print("Obtaining cell type-aware communication results...")
+    get_ct_cell_communication_results(
+        adata,
+        adata.uns["genes"],
+        adata.uns["cells"],
+        layer_key_p_test,
+        layer_key_np_test,
+        model,
+        adata.obs[cell_type_key],
+        adata.uns["cell_type_pairs"],
+        adata.uns["D"],
+        test,
+        device,
+    )
+    
+    # get_cell_communication_results_old(
+    #     adata,
+    #     adata.uns["genes"],
+    #     adata.uns["cells"],
+    #     layer_key_p_test,
+    #     layer_key_np_test,
+    #     model,
+    #     adata.obs[cell_type_key],
+    #     adata.uns["cell_type_pairs"],
+    #     adata.uns["D"],
+    #     test,
+    # )
 
-
-    print("Finished computing cell-cell communication analysis in %.3f seconds" %(time.time()-start))
+    print("Finished computing cell type-aware cell-cell communication analysis in %.3f seconds" %(time.time()-start))
 
     return
 
@@ -545,14 +598,664 @@ def run_cell_communication_analysis(
     layer_key_p_test,
     layer_key_np_test,
     model,
-    cell_type_key,
     center_counts_for_np_test,
     subset_gene_pairs,
     M,
+    seed,
     test,
     spatial,
     mean,
     check_analytic_null,
+    device,
+    verbose,
+):
+    
+    use_raw = (layer_key_p_test == "use_raw") & (layer_key_np_test == "use_raw")
+
+    cells = adata.raw.obs.index.values.astype(str) if use_raw else adata.obs_names.values.astype(str)
+    
+    sample_specific = 'sample_key' in adata.uns
+
+    gene_pairs = adata.uns["gene_pairs"] if subset_gene_pairs is None else subset_gene_pairs
+    genes = list(np.unique(list(flatten(adata.uns["gene_pairs"]))))
+    adata.uns["genes"] = genes
+    adata.uns["cells"] = cells
+    
+    # Map gene_pairs to index
+    gene_pairs_ind = []
+    for pair in gene_pairs:
+        idx1 = [genes.index(g) for g in pair[0]] if isinstance(pair[0], list) else genes.index(pair[0])
+        idx2 = [genes.index(g) for g in pair[1]] if isinstance(pair[1], list) else genes.index(pair[1])
+        gene_pairs_ind.append((idx1, idx2))
+    adata.uns["gene_pairs_ind"] = gene_pairs_ind
+    
+    # Compute weights
+    weights = make_weights_non_redundant(adata.obsp["weights"]).tocoo()
+    weights = torch.sparse_coo_tensor(
+        torch.tensor(np.vstack((weights.row, weights.col)), dtype=torch.long, device=device),
+        torch.tensor(weights.data, dtype=torch.float64, device=device),
+        torch.Size(weights.shape), 
+        device=device)
+    
+    # Compute node degree
+    row_degrees = torch.sparse.sum(weights, dim=1).to_dense()
+    col_degrees = torch.sparse.sum(weights, dim=0).to_dense()
+    D = row_degrees + col_degrees
+
+    adata.uns["D"] = D.cpu().numpy()
+    
+    gene_pairs_per_metabolite = adata.uns['gene_pairs_per_metabolite']
+
+    metabolite_gene_pair_df = pd.DataFrame.from_dict(gene_pairs_per_metabolite, orient="index").reset_index()
+    metabolite_gene_pair_df = metabolite_gene_pair_df.rename(columns={"index": "metabolite"})
+
+    metabolite_gene_pair_df['gene_pair'] = metabolite_gene_pair_df['gene_pair'].apply(lambda arr: [(sub_array[0], sub_array[1]) for sub_array in arr])
+    metabolite_gene_pair_df['gene_type'] = metabolite_gene_pair_df['gene_type'].apply(lambda arr: [(sub_array[0], sub_array[1]) for sub_array in arr])
+
+    metabolite_gene_pair_df = pd.concat(
+        [
+            metabolite_gene_pair_df['metabolite'],
+            metabolite_gene_pair_df.explode('gene_pair')['gene_pair'],
+            metabolite_gene_pair_df.explode('gene_type')['gene_type'],
+        ],
+        axis=1,
+    )
+    metabolite_gene_pair_df = metabolite_gene_pair_df.reset_index(drop=True)
+    
+    if 'LR_database' in adata.uns.keys():
+        LR_database = adata.uns['LR_database']
+        df_merged = pd.merge(metabolite_gene_pair_df, LR_database, left_on='metabolite', right_on='interaction_name', how='left')
+        LR_df = df_merged.dropna(subset=['pathway_name'])
+        metabolite_gene_pair_df['metabolite'][metabolite_gene_pair_df.metabolite.isin(LR_df.metabolite)] = LR_df['pathway_name']
+    
+    gene_pair_dict = {}
+    for metabolite, group in metabolite_gene_pair_df.groupby("metabolite"):
+        idxs = group["gene_pair"].apply(lambda gp: gene_pairs.index(gp) if gp in gene_pairs else None).dropna().tolist()
+        idxs = [int(ind) for ind in idxs if ind is not None]
+        if idxs:
+            gene_pair_dict[metabolite] = idxs
+    
+    adata.uns["gene_pair_dict"] = gene_pair_dict
+
+    if test in ['parametric', 'both']:
+        
+        if verbose:
+            print("Running the parametric test...")
+        
+        adata.uns['ccc_results']['p'] = {
+            'gp': {},
+            'm': {}
+        }
+
+        Wtot2 = torch.tensor((weights.data ** 2).sum(), device=device)
+
+        # Load counts
+        counts = counts_from_anndata(adata[cells, genes], layer_key_p_test, dense=True)
+        counts = torch.tensor(counts, dtype=torch.float64, device=device)
+        num_umi = counts.sum(dim=0)
+        
+        # Prepare counts_1 and counts_2
+        counts_1 = []
+        counts_2 = []
+        for (idx1, idx2) in gene_pairs_ind:
+            if isinstance(idx1, list):
+                c1 = counts[idx1, :].mean(dim=0) if mean == 'algebraic' else torch.exp(torch.log(counts[idx1, :] + 1e-8).mean(dim=0))
+            else:
+                c1 = counts[idx1, :]
+            if isinstance(idx2, list):
+                c2 = counts[idx2, :].mean(dim=0) if mean == 'algebraic' else torch.exp(torch.log(counts[idx2, :] + 1e-8).mean(dim=0))
+            else:
+                c2 = counts[idx2, :]
+            counts_1.append(c1)
+            counts_2.append(c2)
+
+        counts_1 = torch.stack(counts_1)
+        counts_2 = torch.stack(counts_2)
+
+        # Standardize counts
+        counts_1 = standardize_counts(adata, counts_1, model, num_umi, sample_specific)
+        counts_2 = standardize_counts(adata, counts_2, model, num_umi, sample_specific)
+        
+        # Compute CCC scores
+        WX2t = torch.sparse.mm(weights, counts_2.T)
+        WtX2t = torch.sparse.mm(weights.transpose(0, 1), counts_2.T)
+        cs_gp = (counts_1.T * WX2t).sum(0) + (counts_1.T * WtX2t).sum(0)
+        same_gene_mask = torch.tensor([g1 == g2 for g1, g2 in gene_pairs], device=device)
+        cs_gp[same_gene_mask] = cs_gp[same_gene_mask] / 2
+        adata.uns['ccc_results']['p']['gp']['cs'] = cs_gp.detach().cpu().numpy()
+        
+        # Compute metabolite-level scores
+        cs_m = compute_metabolite_cs(cs_gp, gene_pair_dict, interacting_cell_scores=False)
+        adata.uns['ccc_results']['p']['m']['cs'] = cs_m.detach().cpu().numpy()
+                
+        # Compute second moments
+        WX1t = torch.sparse.mm(weights, counts_1.T)
+        WtX1t = torch.sparse.mm(weights.transpose(0, 1), counts_1.T)
+        eg2_a = (WX1t + WtX1t).pow(2).sum(dim=0)
+        eg2_b = (WX2t + WtX2t).pow(2).sum(dim=0)
+        eg2s_gp = (eg2_a, eg2_b)
+
+        # Z-score computation
+        Z_gp, Z_m = compute_p_results(cs_gp, cs_m, gene_pairs_ind, Wtot2, eg2s_gp, gene_pair_dict)
+        # Convert tensors to numpy for statsmodels and pandas
+        Z_gp_np = Z_gp.detach().cpu().numpy()
+        Z_m_np = Z_m.detach().cpu().numpy()
+        # Compute p-values and FDRs
+        Z_pvals_gp = norm.sf(Z_gp_np)
+        Z_pvals_m = norm.sf(Z_m_np)
+        FDR_gp = multipletests(Z_pvals_gp, method="fdr_bh")[1]
+        FDR_m = multipletests(Z_pvals_m, method="fdr_bh")[1]
+        
+        # Store in AnnData
+        adata.uns['ccc_results']['p']['gp']['Z'] = Z_gp_np
+        adata.uns['ccc_results']['p']['gp']['Z_pval'] = Z_pvals_gp
+        adata.uns['ccc_results']['p']['gp']['Z_FDR'] = FDR_gp
+        adata.uns['ccc_results']['p']['m']['Z'] = Z_m_np
+        adata.uns['ccc_results']['p']['m']['Z_pval'] = Z_pvals_m
+        adata.uns['ccc_results']['p']['m']['Z_FDR'] = FDR_m
+        
+        # Symmetric LC Z-score matrix
+        genes_ = [tuple(i) if isinstance(i, list) else i for i in pd.Series([g for pair in gene_pairs for g in pair]).drop_duplicates()]
+        gene_pairs_ = [(tuple(a) if isinstance(a, list) else a, tuple(b) if isinstance(b, list) else b) for a, b in gene_pairs]
+        lc_zs = pd.DataFrame(np.zeros((len(genes_), len(genes_))), index=genes_, columns=genes_)
+        for i, (g1, g2) in enumerate(gene_pairs_):
+            lc_zs.iloc[genes_.index(g1), genes_.index(g2)] = Z_gp_np[i]
+        # Force diagonal to 0 and symmetrize
+        np.fill_diagonal(lc_zs.values, 0)
+        adata.uns['lc_zs'] = (lc_zs + lc_zs.T) / 2
+        
+        if verbose:
+            print("Parametric test finished.")
+
+    if test in ["non-parametric", "both"]:
+        
+        if verbose:
+            print("Running the non-parametric test...")
+        
+        adata.uns['ccc_results']['np'] = {
+            'gp': {},
+            'm': {}
+        }
+        
+        # Load counts
+        counts = counts_from_anndata(adata[cells, genes], layer_key_np_test, dense=True)
+        counts = torch.tensor(counts, dtype=torch.float64, device=device)
+        
+        # Prepare counts_1 and counts_2
+        counts_1 = []
+        counts_2 = []
+        for (idx1, idx2) in gene_pairs_ind:
+            if isinstance(idx1, list):
+                c1 = counts[idx1, :].mean(dim=0) if mean == 'algebraic' else torch.exp(torch.log(counts[idx1, :] + 1e-8).mean(dim=0))
+            else:
+                c1 = counts[idx1, :]
+            if isinstance(idx2, list):
+                c2 = counts[idx2, :].mean(dim=0) if mean == 'algebraic' else torch.exp(torch.log(counts[idx2, :] + 1e-8).mean(dim=0))
+            else:
+                c2 = counts[idx2, :]
+            counts_1.append(c1)
+            counts_2.append(c2)
+
+        counts_1 = torch.stack(counts_1)
+        counts_2 = torch.stack(counts_2)
+        
+        if center_counts_for_np_test:
+            num_umi = counts.sum(dim=0)
+            counts_1 = standardize_counts(adata, counts_1, model, num_umi, sample_specific)
+            counts_2 = standardize_counts(adata, counts_2, model, num_umi, sample_specific)
+        
+        n_cells = counts_1.shape[1]
+        same_gene_mask = torch.tensor([g1 == g2 for g1, g2 in gene_pairs], device=device)
+        
+        if center_counts_for_np_test and test == 'both':
+            adata.uns['ccc_results']['np']['gp']['cs'] = np.array(adata.uns['ccc_results']['p']['gp']['cs'])
+            adata.uns['ccc_results']['np']['m']['cs'] = np.array(adata.uns['ccc_results']['p']['m']['cs'])
+        else:
+            WX2t = torch.sparse.mm(weights, counts_2.T)
+            WtX2t = torch.sparse.mm(weights.transpose(0, 1), counts_2.T)
+            cs_gp = (counts_1.T * WX2t).sum(0) + (counts_1.T * WtX2t).sum(0)
+            cs_gp[same_gene_mask] = cs_gp[same_gene_mask] / 2
+            adata.uns['ccc_results']['np']['gp']['cs'] = cs_gp.detach().cpu().numpy()
+            cs_m = compute_metabolite_cs(cs_gp, gene_pair_dict, interacting_cell_scores=False)
+            adata.uns['ccc_results']['np']['m']['cs'] = cs_m.detach().cpu().numpy()
+        
+        perm_cs_gp_a = torch.zeros((counts_1.shape[0], M), dtype=torch.float64, device=device)
+        perm_cs_gp_b = torch.zeros_like(perm_cs_gp_a)
+        perm_cs_m_a = torch.zeros((len(gene_pair_dict), M), dtype=torch.float64, device=device)
+        perm_cs_m_b = torch.zeros_like(perm_cs_m_a)
+        
+        if check_analytic_null:
+            gp_zs_perm_array = torch.zeros_like(perm_cs_gp_a)
+            gp_pvals_perm_array = torch.zeros_like(perm_cs_gp_a)
+            m_zs_perm_array = torch.zeros_like(perm_cs_m_a)
+            m_pvals_perm_array = torch.zeros_like(perm_cs_m_a)
+        
+        torch.manual_seed(seed)
+        for i in tqdm(range(M), desc="Permutation test"):
+            idx = torch.randperm(n_cells, device=device)
+            
+            c1_perm_a = counts_1.clone()
+            c2_perm_a = counts_2[:, idx]
+            c1_perm_a[same_gene_mask] = counts_1[same_gene_mask, :][:, idx]
+
+            WX2t_a = torch.sparse.mm(weights, c2_perm_a.T)
+            WtX2t_a = torch.sparse.mm(weights.transpose(0, 1), c2_perm_a.T)
+            cs_a = (c1_perm_a.T * WX2t_a).sum(0) + (c1_perm_a.T * WtX2t_a).sum(0)
+            cs_a[same_gene_mask] = cs_a[same_gene_mask] / 2
+            perm_cs_gp_a[:, i] = cs_a
+
+            cs_m_a = compute_metabolite_cs(cs_a, gene_pair_dict, interacting_cell_scores=False)
+            perm_cs_m_a[:, i] = cs_m_a
+
+            c2_perm_b = counts_2.clone()
+            c1_perm_b = counts_1[:, idx]
+            c2_perm_b[same_gene_mask] = counts_2[same_gene_mask, :][:, idx]
+
+            WX2t_b = torch.sparse.mm(weights, c2_perm_b.T)
+            WtX2t_b = torch.sparse.mm(weights.transpose(0, 1), c2_perm_b.T)
+            cs_b = (c1_perm_b.T * WX2t_b).sum(0) + (c1_perm_b.T * WtX2t_b).sum(0)
+            cs_b[same_gene_mask] = cs_b[same_gene_mask] / 2
+            perm_cs_gp_b[:, i] = cs_b
+
+            cs_m_b = compute_metabolite_cs(cs_b, gene_pair_dict, interacting_cell_scores=False)
+            perm_cs_m_b[:, i] = cs_m_b
+
+            if check_analytic_null:
+                Z_gp_perm, Z_m_perm = compute_p_results((cs_a, cs_b), (cs_m_a, cs_m_b), gene_pairs_ind, Wtot2, eg2s_gp, gene_pair_dict)
+                gp_zs_perm_array[:, i] = Z_gp_perm
+                gp_pvals_perm_array[:, i] = torch.tensor(norm.sf(Z_gp_perm.cpu().numpy()), device=device)
+                m_zs_perm_array[:, i] = Z_m_perm
+                m_pvals_perm_array[:, i] = torch.tensor(norm.sf(Z_m_perm.cpu().numpy()), device=device)
+
+        adata.uns['ccc_results']['np']['gp']['perm_cs_a'] = perm_cs_gp_a.detach().cpu().numpy()
+        adata.uns['ccc_results']['np']['gp']['perm_cs_b'] = perm_cs_gp_b.detach().cpu().numpy()
+        adata.uns['ccc_results']['np']['m']['perm_cs_a'] = perm_cs_m_a.detach().cpu().numpy()
+        adata.uns['ccc_results']['np']['m']['perm_cs_b'] = perm_cs_m_b.detach().cpu().numpy()
+        
+        x_gp_a = (perm_cs_gp_a > cs_gp[:, None]).sum(dim=1)
+        x_gp_b = (perm_cs_gp_b > cs_gp[:, None]).sum(dim=1)
+        x_m_a = (perm_cs_m_a > cs_m[:, None]).sum(dim=1)
+        x_m_b = (perm_cs_m_b > cs_m[:, None]).sum(dim=1)
+
+        pvals_gp_a = (x_gp_a + 1).float() / (M + 1)
+        pvals_gp_b = (x_gp_b + 1).float() / (M + 1)
+        pvals_m_a = (x_m_a + 1).float() / (M + 1)
+        pvals_m_b = (x_m_b + 1).float() / (M + 1)
+
+        pvals_gp = torch.where(pvals_gp_a > pvals_gp_b, pvals_gp_a, pvals_gp_b)
+        pvals_m = torch.where(pvals_m_a > pvals_m_b, pvals_m_a, pvals_m_b)
+        
+        adata.uns['ccc_results']['np']['gp']['pval'] = pvals_gp.cpu().numpy()
+        adata.uns['ccc_results']['np']['gp']['FDR'] = multipletests(pvals_gp.cpu().numpy(), method="fdr_bh")[1]
+        adata.uns['ccc_results']['np']['m']['pval'] = pvals_m.cpu().numpy()
+        adata.uns['ccc_results']['np']['m']['FDR'] = multipletests(pvals_m.cpu().numpy(), method="fdr_bh")[1]
+
+        if check_analytic_null:
+            adata.uns['ccc_results']['np']['analytic_null'] = {
+                'gp_zs_perm': gp_zs_perm_array.detach().cpu().numpy(),
+                'gp_pvals_perm': gp_pvals_perm_array.detach().cpu().numpy(),
+                'm_zs_perm': m_zs_perm_array.detach().cpu().numpy(),
+                'm_pvals_perm': m_pvals_perm_array.detach().cpu().numpy(),
+            }
+    
+    if verbose:
+        print("Non-parametric test finished.")
+    
+    return
+
+
+def run_ct_cell_communication_analysis(
+    adata,
+    layer_key_p_test,
+    layer_key_np_test,
+    model,
+    cell_type_key,
+    center_counts_for_np_test,
+    subset_gene_pairs,
+    subset_metabolites,
+    fix_gp,
+    M,
+    seed,
+    test,
+    mean,
+    check_analytic_null,
+    device,
+    verbose,
+):
+    
+    use_raw = (layer_key_p_test == "use_raw") & (layer_key_np_test == "use_raw")
+    obs = adata.raw.obs if use_raw else adata.obs
+    cells = adata.raw.obs.index.values.astype(str) if use_raw else adata.obs_names.values.astype(str)
+    
+    sample_specific = 'sample_key' in adata.uns
+    
+    fix_ct = True if adata.uns['fix_ct'] else False
+    
+    gene_pairs = adata.uns["gene_pairs"] if subset_gene_pairs is None else subset_gene_pairs
+    genes = list(np.unique(list(flatten(adata.uns["gene_pairs"]))))
+    adata.uns["genes"] = genes
+        
+    cell_types = obs[cell_type_key]
+    cell_type_pairs = adata.uns.get("cell_type_pairs")
+    gene_pairs_per_ct_pair = adata.uns.get("gene_pairs_per_ct_pair", {})
+    
+    weights = adata.obsp["weights"]
+    
+    used_ct_pairs = list(set(ct for cell_type_pair in cell_type_pairs for ct in cell_type_pair))
+    all_cell_types = set(cell_types.unique())
+    used_ct_pairs_set = set(used_ct_pairs)
+    if used_ct_pairs_set < all_cell_types:
+        keep_mask = cell_types[cells].isin(used_ct_pairs).values
+        keep_indices = np.where(keep_mask)[0]
+        weights = weights[keep_indices][:, keep_indices]
+        cells = cells[keep_indices]
+        cell_types = cell_types.loc[cells]
+        
+    adata.uns["cells"] = cells
+    
+    weights_ct_pairs = create_weights_ct_pairs(weights.tocoo(), cell_types, cell_type_pairs, device)
+    
+    row_degrees = torch.sparse.sum(weights_ct_pairs, dim=2).to_dense()
+    col_degrees = torch.sparse.sum(weights_ct_pairs, dim=1).to_dense()
+    D = row_degrees + col_degrees
+    adata.uns["D"] = D.cpu().numpy()
+        
+    # Map gene_pairs to index
+    gene_pairs_ind = []
+    for pair in gene_pairs:
+        idx1 = [genes.index(g) for g in pair[0]] if isinstance(pair[0], list) else genes.index(pair[0])
+        idx2 = [genes.index(g) for g in pair[1]] if isinstance(pair[1], list) else genes.index(pair[1])
+        gene_pairs_ind.append((idx1, idx2))
+    adata.uns["gene_pairs_ind"] = gene_pairs_ind
+
+    # Cell-type pair-specific indices
+    gene_pairs_ind_per_ct_pair = defaultdict(list)
+    gene_pairs_per_ct_pair_ind = defaultdict(list)
+    for ct_pair, gpairs in gene_pairs_per_ct_pair.items():
+        for pair in gpairs:
+            if pair not in gene_pairs:
+                continue
+            idx = gene_pairs.index(pair)
+            gene_pairs_ind_per_ct_pair[ct_pair].append(gene_pairs_ind[idx])
+            gene_pairs_per_ct_pair_ind[ct_pair].append(idx)
+
+    adata.uns["gene_pairs_ind_per_ct_pair"] = dict(gene_pairs_ind_per_ct_pair)
+    adata.uns["gene_pairs_per_ct_pair_ind"] = dict(gene_pairs_per_ct_pair_ind)
+    
+    def make_hashable(pair):
+        return tuple(tuple(x) if isinstance(x, list) else x for x in pair)
+
+    gene_pairs_ind_set = {make_hashable(pair) for pair in gene_pairs_ind}
+    ct_specific_gene_pairs = [
+        i for i, pairs in enumerate(gene_pairs_ind_per_ct_pair.values())
+        if {make_hashable(pair) for pair in pairs} < gene_pairs_ind_set
+    ]
+    
+    # Metabolite-gene pair preparation
+    gp_metab = adata.uns['gene_pairs_per_metabolite']
+    metabolite_gene_pair_df = (
+        pd.DataFrame.from_dict(gp_metab, orient="index")
+        .rename_axis("metabolite")
+        .explode(["gene_pair", "gene_type"])
+        .reset_index()
+    )
+
+    if 'LR_database' in adata.uns:
+        merged = metabolite_gene_pair_df.merge(
+            adata.uns['LR_database'], left_on='metabolite', right_on='interaction_name', how='left'
+        )
+        LR_df = merged.dropna(subset=['pathway_name'])
+        metabolite_gene_pair_df.loc[
+            metabolite_gene_pair_df.metabolite.isin(LR_df.metabolite), 'metabolite'] = LR_df['pathway_name'].values
+
+    if subset_metabolites:
+        metabolite_gene_pair_df = metabolite_gene_pair_df[metabolite_gene_pair_df.metabolite.isin(subset_metabolites)]
+    
+    gene_pair_dict = {}
+    for metabolite, group in metabolite_gene_pair_df.groupby("metabolite"):
+        idxs = group["gene_pair"].apply(lambda gp: gene_pairs.index(gp) if gp in gene_pairs else None).dropna().tolist()
+        idxs = [int(ind) for ind in idxs if ind is not None]
+        if idxs:
+            gene_pair_dict[metabolite] = idxs
+    adata.uns['gene_pair_dict'] = gene_pair_dict
+
+    if test in ['parametric', 'both']:
+
+        if verbose:
+            print("Running the parametric test...")
+        
+        adata.uns['ct_ccc_results']['p'] = {
+            'gp': {},
+            'm': {}
+        }
+        
+        weights_sq_data = weights_ct_pairs.values() ** 2
+        weights_sq = torch.sparse_coo_tensor(
+            weights_ct_pairs.indices(),
+            weights_sq_data,
+            weights_ct_pairs.shape,
+            device=weights_ct_pairs.device
+        )
+        Wtot2 = torch.sparse.sum(weights_sq, dim=(1, 2)).to_dense()
+
+        # Load counts
+        counts = counts_from_anndata(adata[cells, genes], layer_key_p_test, dense=True)
+        counts = torch.tensor(counts, dtype=torch.float64, device=device)
+        num_umi = counts.sum(dim=0)
+        
+        # Prepare counts_1 and counts_2
+        counts_1 = []
+        counts_2 = []
+        for (idx1, idx2) in gene_pairs_ind:
+            if isinstance(idx1, list):
+                c1 = counts[idx1, :].mean(dim=0) if mean == 'algebraic' else torch.exp(torch.log(counts[idx1, :] + 1e-8).mean(dim=0))
+            else:
+                c1 = counts[idx1, :]
+            if isinstance(idx2, list):
+                c2 = counts[idx2, :].mean(dim=0) if mean == 'algebraic' else torch.exp(torch.log(counts[idx2, :] + 1e-8).mean(dim=0))
+            else:
+                c2 = counts[idx2, :]
+            counts_1.append(c1)
+            counts_2.append(c2)
+
+        counts_1 = torch.stack(counts_1)
+        counts_2 = torch.stack(counts_2)
+        
+        counts_1 = standardize_ct_counts(adata, counts_1, model, num_umi, sample_specific, cell_types)
+        counts_2 = standardize_ct_counts(adata, counts_2, model, num_umi, sample_specific, cell_types)
+        
+        # Compute CCC scores        
+        cs_gp = torch.zeros((len(cell_type_pairs), counts_1.shape[0]), device=counts_1.device)
+        for ct_pair in range(len(cell_type_pairs)):
+            W = weights_ct_pairs[ct_pair].coalesce()
+            WX2t = torch.sparse.mm(W, counts_2.T)
+            cs_gp[ct_pair] = (counts_1.T * WX2t).sum(0)
+        adata.uns['ct_ccc_results']['p']['gp']['cs'] = cs_gp.detach().cpu().numpy()
+        
+        cs_m = compute_metabolite_cs_ct(cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_ind, ct_specific_gene_pairs, interacting_cell_scores=False)
+        adata.uns['ct_ccc_results']['p']['m']['cs'] = cs_m.detach().cpu().numpy()
+        
+        EG2_gp = torch.zeros_like(cs_gp) if fix_ct or fix_gp else Wtot2
+        if fix_ct:
+            for ct_pair in range(len(cell_type_pairs)):
+                W = weights_ct_pairs[ct_pair].coalesce()
+                W_sq_data = W.values() ** 2
+                W_sq = torch.sparse_coo_tensor(W.indices(), W_sq_data, W.shape, device=W.device)
+                X1_sq = counts_1 ** 2
+                EG2_gp[ct_pair] = torch.sparse.mm(W_sq, X1_sq.T).sum(0)
+        elif fix_gp:
+            for ct_pair in range(len(cell_type_pairs)):
+                W = weights_ct_pairs[ct_pair].coalesce()
+                W_sq_data = W.values() ** 2
+                W_sq = torch.sparse_coo_tensor(W.indices(), W_sq_data, W.shape, device=W.device)
+                X1_sq = counts_1 ** 2
+                X2_sq = counts_2 ** 2
+                EG2_gp[ct_pair] = (X1_sq.T * torch.sparse.mm(W_sq, X2_sq.T)).sum(0)
+
+        Z_gp, Z_m = compute_ct_p_results(cs_gp, cs_m, gene_pairs_per_ct_pair_ind, ct_specific_gene_pairs, EG2_gp, cell_type_key, gene_pair_dict)
+
+        # Convert tensors to numpy for statsmodels and pandas
+        Z_gp_np = Z_gp.detach().cpu().numpy()
+        Z_m_np = Z_m.detach().cpu().numpy()
+        # Compute p-values and FDRs
+        Z_pvals_gp = norm.sf(Z_gp_np)
+        Z_pvals_m = norm.sf(Z_m_np)
+        FDR_gp = multipletests(Z_pvals_gp.flatten(), method="fdr_bh")[1].reshape(Z_pvals_gp.shape)
+        FDR_m = multipletests(Z_pvals_m.flatten(), method="fdr_bh")[1].reshape(Z_pvals_m.shape)
+        
+        # Store in AnnData
+        adata.uns['ct_ccc_results']['p']['gp']['Z'] = Z_gp_np
+        adata.uns['ct_ccc_results']['p']['gp']['Z_pval'] = Z_pvals_gp
+        adata.uns['ct_ccc_results']['p']['gp']['Z_FDR'] = FDR_gp
+        adata.uns['ct_ccc_results']['p']['m']['Z'] = Z_m_np
+        adata.uns['ct_ccc_results']['p']['m']['Z_pval'] = Z_pvals_m
+        adata.uns['ct_ccc_results']['p']['m']['Z_FDR'] = FDR_m
+
+    if test in ["non-parametric", "both"]:
+
+        if verbose:
+            print("Running the non-parametric test...")
+        
+        adata.uns['ct_ccc_results']['np'] = {
+            'gp': {},
+            'm': {}
+        }
+
+        # Load counts
+        counts = counts_from_anndata(adata[cells, genes], layer_key_np_test, dense=True)
+        counts = torch.tensor(counts, dtype=torch.float64, device=device)
+
+        # Prepare counts_1 and counts_2
+        counts_1 = []
+        counts_2 = []
+        for (idx1, idx2) in gene_pairs_ind:
+            if isinstance(idx1, list):
+                c1 = counts[idx1, :].mean(dim=0) if mean == 'algebraic' else torch.exp(torch.log(counts[idx1, :] + 1e-8).mean(dim=0))
+            else:
+                c1 = counts[idx1, :]
+            if isinstance(idx2, list):
+                c2 = counts[idx2, :].mean(dim=0) if mean == 'algebraic' else torch.exp(torch.log(counts[idx2, :] + 1e-8).mean(dim=0))
+            else:
+                c2 = counts[idx2, :]
+            counts_1.append(c1)
+            counts_2.append(c2)
+
+        counts_1 = torch.stack(counts_1)
+        counts_2 = torch.stack(counts_2)
+        
+        if center_counts_for_np_test:
+            num_umi = counts.sum(dim=0)
+            counts_1 = standardize_ct_counts(adata, counts_1, model, num_umi, sample_specific, cell_types)
+            counts_2 = standardize_ct_counts(adata, counts_2, model, num_umi, sample_specific, cell_types)
+        
+        if center_counts_for_np_test and test == 'both':
+            adata.uns['ct_ccc_results']['np']['gp']['cs'] = np.array(adata.uns['ct_ccc_results']['p']['gp']['cs'])
+            adata.uns['ct_ccc_results']['np']['m']['cs'] = np.array(adata.uns['ct_ccc_results']['p']['m']['cs'])
+        else:            
+            cs_gp = torch.zeros((len(cell_type_pairs), counts_1.shape[0]), device=counts_1.device)
+            for ct_pair in range(len(cell_type_pairs)):
+                W = weights_ct_pairs[ct_pair].coalesce()
+                WX2t = torch.sparse.mm(W, counts_2.T)
+                cs_gp[ct_pair] = (counts_1.T * WX2t).sum(0)
+            adata.uns['ct_ccc_results']['np']['gp']['cs'] = cs_gp.detach().cpu().numpy()
+            cs_m = compute_metabolite_cs_ct(cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_ind, ct_specific_gene_pairs, interacting_cell_scores=False)
+            adata.uns['ct_ccc_results']['np']['m']['cs'] = cs_m.detach().cpu().numpy()
+        
+        perm_cs_gp = torch.zeros((len(cell_type_pairs), counts_1.shape[0], M), dtype=torch.float64, device=device)
+        perm_cs_m = torch.zeros((len(cell_type_pairs), len(gene_pair_dict), M), dtype=torch.float64, device=device)
+        
+        if check_analytic_null:
+            gp_zs_perm_array = torch.zeros_like(perm_cs_gp)
+            gp_pvals_perm_array = torch.zeros_like(perm_cs_gp)
+            m_zs_perm_array = torch.zeros_like(perm_cs_m)
+            m_pvals_perm_array = torch.zeros_like(perm_cs_m)
+        
+        if fix_gp:
+            c1_perm = counts_1
+            c2_perm = counts_2
+        
+        torch.manual_seed(seed)
+        for i in tqdm(range(M), desc="Permutation test"):
+            
+            if fix_gp:
+                indices = torch.randperm(len(cell_types)).numpy()
+                shuffled_cell_types = cell_types.iloc[indices].reset_index(drop=True)
+                weights_ct_pairs = create_weights_ct_pairs(weights, shuffled_cell_types, cell_type_pairs, device)
+            else:
+                cell_type_labels = torch.tensor(cell_types.astype('category').cat.codes.values, device=counts_1.device)
+                idx = torch.empty_like(cell_type_labels, dtype=torch.int64)
+
+                for ct in torch.unique(cell_type_labels):
+                    ct_mask = cell_type_labels == ct
+                    ct_indices = torch.nonzero(ct_mask, as_tuple=True)[0]
+                    permuted_indices = ct_indices[torch.randperm(len(ct_indices))]
+                    idx[ct_indices] = permuted_indices
+
+                c1_perm = counts_1 if fix_ct else counts_1[:, idx.long()]
+                c2_perm = counts_2[:, idx.long()]
+            
+            cs_gp = torch.zeros((len(cell_type_pairs), c1_perm.shape[0]), device=c1_perm.device)
+            for ct_pair in range(len(cell_type_pairs)):
+                W = weights_ct_pairs[ct_pair].coalesce()
+                WX2t = torch.sparse.mm(W, c2_perm.T)
+                cs_gp[ct_pair] = (c1_perm.T * WX2t).sum(0)
+            perm_cs_gp[:, :, i] = cs_gp
+            
+            cs_m = compute_metabolite_cs_ct(cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_ind, ct_specific_gene_pairs, interacting_cell_scores=False)
+            perm_cs_m[:, :, i] = cs_m
+            
+            if check_analytic_null:
+                Z_gp_perm, Z_m_perm = compute_ct_p_results(cs_gp, cs_m, gene_pairs_per_ct_pair_ind, ct_specific_gene_pairs, EG2_gp, cell_type_key, gene_pair_dict)
+                gp_zs_perm_array[:, :, i] = Z_gp_perm
+                gp_pvals_perm_array[:, :, i] = torch.tensor(norm.sf(Z_gp_perm.cpu().numpy()), device=device)
+                m_zs_perm_array[:, :, i] = Z_m_perm
+                m_pvals_perm_array[:, :, i] = torch.tensor(norm.sf(Z_m_perm.cpu().numpy()), device=device)
+            
+        adata.uns['ct_ccc_results']['np']['gp']['perm_cs'] = perm_cs_gp.detach().cpu().numpy()
+        adata.uns['ct_ccc_results']['np']['m']['perm_cs'] = perm_cs_m.detach().cpu().numpy()
+        
+        x_gp = np.sum(adata.uns['ct_ccc_results']['np']['gp']['perm_cs'] > adata.uns['ct_ccc_results']['np']['gp']['cs'][:, :, np.newaxis], axis=2)
+        x_m = np.sum(adata.uns['ct_ccc_results']['np']['m']['perm_cs'] > adata.uns['ct_ccc_results']['np']['m']['cs'][:, :, np.newaxis], axis=2)
+        
+        pvals_gp = (x_gp + 1) / (M + 1)
+        pvals_m = (x_m + 1) / (M + 1)
+        
+        adata.uns['ct_ccc_results']['np']['gp']['pval'] = pvals_gp
+        adata.uns['ct_ccc_results']['np']['gp']['FDR'] = multipletests(pvals_gp.flatten(), method="fdr_bh")[1].reshape(pvals_gp.shape)
+        adata.uns['ct_ccc_results']['np']['m']['pval'] = pvals_m
+        adata.uns['ct_ccc_results']['np']['m']['FDR'] = multipletests(pvals_m.flatten(), method="fdr_bh")[1].reshape(pvals_m.shape)
+        
+        if check_analytic_null:
+            adata.uns['ct_ccc_results']['np']['analytic_null'] = {
+                'gp_zs_perm': gp_zs_perm_array.detach().cpu().numpy(),
+                'gp_pvals_perm': gp_pvals_perm_array.detach().cpu().numpy(),
+                'm_zs_perm': m_zs_perm_array.detach().cpu().numpy(),
+                'm_pvals_perm': m_pvals_perm_array.detach().cpu().numpy(),
+            }
+
+    adata.uns["cell_types"] = cell_types.tolist() if cell_type_key else None
+    
+    if verbose:
+        print("Non-parametric test finished.")
+    
+    return
+
+
+def run_ct_cell_communication_analysis_old(
+    adata,
+    layer_key_p_test,
+    layer_key_np_test,
+    model,
+    cell_type_key,
+    center_counts_for_np_test,
+    subset_gene_pairs,
+    subset_metabolites,
+    M,
+    seed,
+    test,
+    mean,
+    check_analytic_null,
+    verbose,
 ):
     
     use_raw = (layer_key_p_test == "use_raw") & (layer_key_np_test == "use_raw")
@@ -563,25 +1266,22 @@ def run_cell_communication_analysis(
     sample_specific = 'sample_key' in adata.uns.keys()
 
     weights = adata.obsp["weights"]
-    weights = weights if cell_type_key else make_weights_non_redundant(weights)
-    if cell_type_key:
-        cell_types = adata.obs[cell_type_key] if not use_raw else adata.raw.obs[cell_type_key]
+    cell_types = adata.obs[cell_type_key] if not use_raw else adata.raw.obs[cell_type_key]
     gene_pairs = adata.uns["gene_pairs"] if subset_gene_pairs is None else subset_gene_pairs
     genes = list(np.unique(list(flatten(adata.uns["gene_pairs"]))))
     adata.uns["genes"] = genes
     cell_type_pairs = adata.uns["cell_type_pairs"] if "cell_type_pairs" in adata.uns.keys() else None
     gene_pairs_per_ct_pair = adata.uns["gene_pairs_per_ct_pair"] if "gene_pairs_per_ct_pair" in adata.uns.keys() else None
     
-    if cell_type_key:
-        used_ct_pairs = list(set(ct for cell_type_pair in cell_type_pairs for ct in cell_type_pair))
-        all_cell_types = set(cell_types.unique())
-        used_ct_pairs_set = set(used_ct_pairs)
-        if used_ct_pairs_set < all_cell_types:
-            keep_mask = cell_types[cells].isin(used_ct_pairs).values
-            keep_indices = np.where(keep_mask)[0]
-            weights = weights[keep_indices][:, keep_indices]
-            cells = cells[keep_indices]
-            cell_types = cell_types.loc[cells]
+    used_ct_pairs = list(set(ct for cell_type_pair in cell_type_pairs for ct in cell_type_pair))
+    all_cell_types = set(cell_types.unique())
+    used_ct_pairs_set = set(used_ct_pairs)
+    if used_ct_pairs_set < all_cell_types:
+        keep_mask = cell_types[cells].isin(used_ct_pairs).values
+        keep_indices = np.where(keep_mask)[0]
+        weights = weights[keep_indices][:, keep_indices]
+        cells = cells[keep_indices]
+        cell_types = cell_types.loc[cells]
 
     adata.uns["cells"] = cells
     
@@ -595,45 +1295,39 @@ def run_cell_communication_analysis(
     
     adata.uns["gene_pairs_ind"] = gene_pairs_ind
 
-    if gene_pairs_per_ct_pair:
-        gene_pairs_per_ct_pair_ind = {}
-        gene_pairs_ind_per_ct_pair = {}
-        for ct_pair in gene_pairs_per_ct_pair.keys():
-            gene_pairs_ = gene_pairs_per_ct_pair[ct_pair]
-            gene_pairs_per_ct_pair_ind[ct_pair] = []
-            gene_pairs_ind_per_ct_pair[ct_pair] = []
-            for pair in gene_pairs_:
-                if pair not in gene_pairs:
-                    continue
-                var1, var2 = pair
-                var1_ind = genes.index(var1) if type(var1) is not list else [genes.index(var) for var in var1 if var in genes]
-                var2_ind = genes.index(var2) if type(var2) is not list else [genes.index(var) for var in var2 if var in genes]
-                pair_tuple = (var1_ind, var2_ind)
-                gene_pairs_ind_per_ct_pair[ct_pair].append(pair_tuple)
-                idx = gene_pairs_ind.index(pair_tuple)
-                gene_pairs_per_ct_pair_ind[ct_pair].append(idx)
-    
-        adata.uns["gene_pairs_ind_per_ct_pair"] = gene_pairs_ind_per_ct_pair
-        adata.uns["gene_pairs_per_ct_pair_ind"] = gene_pairs_per_ct_pair_ind
-        
-        def make_hashable(pair):
-            return tuple(tuple(x) if isinstance(x, list) else x for x in pair)
-        
-        gene_pairs_ind_set = {make_hashable(pair) for pair in gene_pairs_ind}
-        ct_specific_gene_pairs = [
-            i for i, pairs in enumerate(gene_pairs_ind_per_ct_pair.values())
-            if {make_hashable(pair) for pair in pairs} < gene_pairs_ind_set
-        ]
-    else:
-        gene_pairs_per_ct_pair_ind = None
-        gene_pairs_ind_per_ct_pair = None
-        ct_specific_gene_pairs = None
+    gene_pairs_per_ct_pair_ind = {}
+    gene_pairs_ind_per_ct_pair = {}
+    for ct_pair in gene_pairs_per_ct_pair.keys():
+        gene_pairs_ = gene_pairs_per_ct_pair[ct_pair]
+        gene_pairs_per_ct_pair_ind[ct_pair] = []
+        gene_pairs_ind_per_ct_pair[ct_pair] = []
+        for pair in gene_pairs_:
+            if pair not in gene_pairs:
+                continue
+            var1, var2 = pair
+            var1_ind = genes.index(var1) if type(var1) is not list else [genes.index(var) for var in var1 if var in genes]
+            var2_ind = genes.index(var2) if type(var2) is not list else [genes.index(var) for var in var2 if var in genes]
+            pair_tuple = (var1_ind, var2_ind)
+            gene_pairs_ind_per_ct_pair[ct_pair].append(pair_tuple)
+            idx = gene_pairs_ind.index(pair_tuple)
+            gene_pairs_per_ct_pair_ind[ct_pair].append(idx)
 
-    if cell_type_key:
-        weights = sparse.COO.from_scipy_sparse(weights)
-        weights_ct_pairs = get_ct_pair_weights(
-            weights, cell_type_pairs, cell_types, spatial
-        )
+    adata.uns["gene_pairs_ind_per_ct_pair"] = gene_pairs_ind_per_ct_pair
+    adata.uns["gene_pairs_per_ct_pair_ind"] = gene_pairs_per_ct_pair_ind
+    
+    def make_hashable(pair):
+        return tuple(tuple(x) if isinstance(x, list) else x for x in pair)
+    
+    gene_pairs_ind_set = {make_hashable(pair) for pair in gene_pairs_ind}
+    ct_specific_gene_pairs = [
+        i for i, pairs in enumerate(gene_pairs_ind_per_ct_pair.values())
+        if {make_hashable(pair) for pair in pairs} < gene_pairs_ind_set
+    ]
+
+    weights = sparse.COO.from_scipy_sparse(weights)
+    weights_ct_pairs = get_ct_pair_weights(
+        weights, cell_type_pairs, cell_types
+    )
     
     row_degrees = weights_ct_pairs.sum(axis=2).todense() if cell_type_key else weights.sum(axis=1).A1
     col_degrees = weights_ct_pairs.sum(axis=1).todense() if cell_type_key else weights.sum(axis=0).A1
@@ -664,6 +1358,9 @@ def run_cell_communication_analysis(
         LR_df = df_merged.dropna(subset=['pathway_name'])
         metabolite_gene_pair_df['metabolite'][metabolite_gene_pair_df.metabolite.isin(LR_df.metabolite)] = LR_df['pathway_name']
     
+    if subset_metabolites:
+        metabolite_gene_pair_df = metabolite_gene_pair_df[metabolite_gene_pair_df.metabolite.isin(subset_metabolites)]
+    
     gene_pair_dict = {}
     for metabolite, group in metabolite_gene_pair_df.groupby("metabolite"):
         indexes = group["gene_pair"].apply(lambda gp: gene_pairs.index(gp) if gp in gene_pairs else None).dropna().tolist()
@@ -679,364 +1376,287 @@ def run_cell_communication_analysis(
 
         print("Running the parametric test...")
 
-        adata.uns['ccc_results']['p'] = {}
-        adata.uns['ccc_results']['p']['gp'] = {}
-        adata.uns['ccc_results']['p']['m'] = {}
+        adata.uns['ct_ccc_results']['p'] = {}
+        adata.uns['ct_ccc_results']['p']['gp'] = {}
+        adata.uns['ct_ccc_results']['p']['m'] = {}
 
-        if cell_type_key:
-            weights_ct_pairs_sq_data = weights_ct_pairs.data ** 2
-            weights_ct_pairs_sq = sparse.COO(weights_ct_pairs.coords, weights_ct_pairs_sq_data, shape=weights_ct_pairs.shape)
-            Wtot2 = sparse.sum(weights_ct_pairs_sq, axis=(1, 2))
-        else:
-            Wtot2 = (weights.data ** 2).sum()
+        weights_ct_pairs_sq_data = weights_ct_pairs.data ** 2
+        weights_ct_pairs_sq = sparse.COO(weights_ct_pairs.coords, weights_ct_pairs_sq_data, shape=weights_ct_pairs.shape)
+        Wtot2 = sparse.sum(weights_ct_pairs_sq, axis=(1, 2))
 
         counts = counts_from_anndata(adata[cells, genes], layer_key_p_test, dense=True)
         num_umi = counts.sum(axis=0)
-        counts = standardize_ct_counts(adata[cells,], counts, model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts, model, num_umi, sample_specific)
+        # counts = standardize_ct_counts_old(adata[cells,], counts, model, num_umi, sample_specific, cell_types)
+        
+        # if mean == 'algebraic':
+        #     counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else counts_from_anndata(adata[cells, [genes[i] for i in gene_pair[0]]], layer_key_p_test, dense=True).mean(0) for gene_pair in gene_pairs_ind])
+        #     counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else counts_from_anndata(adata[cells, [genes[i] for i in gene_pair[1]]], layer_key_p_test, dense=True).mean(0) for gene_pair in gene_pairs_ind])
+        # else:
+        #     counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else gmean(counts_from_anndata(adata[cells, [genes[i] for i in gene_pair[0]]], layer_key_p_test, dense=True), axis=0) for gene_pair in gene_pairs_ind])
+        #     counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else gmean(counts_from_anndata(adata[cells, [genes[i] for i in gene_pair[1]]], layer_key_p_test, dense=True), axis=0) for gene_pair in gene_pairs_ind])
+        
+        # subunits_1 = [i for i, (a, b) in enumerate(gene_pairs_ind) if isinstance(a, list)]
+        # subunits_2 = [i for i, (a, b) in enumerate(gene_pairs_ind) if isinstance(b, list)]
+        # counts_1[subunits_1,:] = standardize_ct_counts_old(adata[cells,], counts_1[subunits_1,:], model, num_umi, sample_specific, cell_types)
+        # counts_2[subunits_2,:] = standardize_ct_counts_old(adata[cells,], counts_2[subunits_2,:], model, num_umi, sample_specific, cell_types)
         
         if mean == 'algebraic':
-            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else counts_from_anndata(adata[cells, [genes[i] for i in gene_pair[0]]], layer_key_p_test, dense=True).mean(0) for gene_pair in gene_pairs_ind])
-            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else counts_from_anndata(adata[cells, [genes[i] for i in gene_pair[1]]], layer_key_p_test, dense=True).mean(0) for gene_pair in gene_pairs_ind])
+            counts_1 = np.vstack([counts[idx1].mean(0) if isinstance(idx1, list) else counts[idx1] for (idx1, _) in gene_pairs_ind])
+            counts_2 = np.vstack([counts[idx2].mean(0) if isinstance(idx2, list) else counts[idx2] for (_, idx2) in gene_pairs_ind])
         else:
-            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else gmean(counts_from_anndata(adata[cells, [genes[i] for i in gene_pair[0]]], layer_key_p_test, dense=True), axis=0) for gene_pair in gene_pairs_ind])
-            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else gmean(counts_from_anndata(adata[cells, [genes[i] for i in gene_pair[1]]], layer_key_p_test, dense=True), axis=0) for gene_pair in gene_pairs_ind])
+            counts_1 = np.vstack([gmean(counts[idx1], axis=0) if isinstance(idx1, list) else counts[idx1] for (idx1, _) in gene_pairs_ind])
+            counts_2 = np.vstack([gmean(counts[idx2], axis=0) if isinstance(idx2, list) else counts[idx2] for (_, idx2) in gene_pairs_ind])
         
-        subunits_1 = [i for i, (a, b) in enumerate(gene_pairs_ind) if isinstance(a, list)]
-        subunits_2 = [i for i, (a, b) in enumerate(gene_pairs_ind) if isinstance(b, list)]
-        counts_1[subunits_1,:] = standardize_ct_counts(adata[cells,], counts_1[subunits_1,:], model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts_1[subunits_1,:], model, num_umi, sample_specific)
-        counts_2[subunits_2,:] = standardize_ct_counts(adata[cells,], counts_2[subunits_2,:], model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts_2[subunits_2,:], model, num_umi, sample_specific)
+        counts_1 = standardize_ct_counts_old(adata[cells,], counts_1, model, num_umi, sample_specific, cell_types)
+        counts_2 = standardize_ct_counts_old(adata[cells,], counts_2, model, num_umi, sample_specific, cell_types)
         
-        cs_gp = compute_CCC_scores(counts_1, counts_2, weights_ct_pairs, gene_pairs) if cell_type_key else compute_CCC_scores(counts_1, counts_2, weights, gene_pairs)
-        cs_m = compute_metabolite_cs(cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_ind, ct_specific_gene_pairs, interacting_cell_scores=False)
+        cs_gp = compute_CCC_scores(counts_1, counts_2, weights_ct_pairs, gene_pairs)
+        cs_m = compute_metabolite_cs_old(cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_ind, ct_specific_gene_pairs, interacting_cell_scores=False)
         
         # eg2s_gp = conditional_eg2_cellcom_gp(counts_1, counts_2, weights_ct_pairs) if cell_type_key else conditional_eg2_cellcom_gp(counts_1, counts_2, weights)
         eg2s_gp = (Wtot2, Wtot2) if cell_type_key else conditional_eg2_cellcom_gp(counts_1, counts_2, weights)
 
-        if cell_type_key:
-            compute_p_results_partial = partial(
-                compute_p_results,
-                cell_type_pairs=cell_type_pairs,
-                cs_gp=cs_gp,
-                cs_m=cs_m,
-                gene_pairs_ind=gene_pairs_ind,
-                gene_pairs_ind_per_ct_pair=gene_pairs_ind_per_ct_pair,
-                Wtot2=Wtot2,
-                eg2s_gp=eg2s_gp,
-                cell_type_key=cell_type_key,
-                gene_pair_dict=gene_pair_dict,
-            )
+        compute_p_results_partial = partial(
+            compute_p_results_old,
+            cell_type_pairs=cell_type_pairs,
+            cs_gp=cs_gp,
+            cs_m=cs_m,
+            gene_pairs_ind=gene_pairs_ind,
+            gene_pairs_ind_per_ct_pair=gene_pairs_ind_per_ct_pair,
+            Wtot2=Wtot2,
+            eg2s_gp=eg2s_gp,
+            cell_type_key=cell_type_key,
+            gene_pair_dict=gene_pair_dict,
+        )
 
-            p_results = list(map(compute_p_results_partial, cell_type_pairs))
-            cs_gp = np.vstack([x[0] for x in p_results])
-            Z_scores_gp_a = np.vstack([x[1] for x in p_results])
-            Z_scores_gp_b = np.vstack([x[2] for x in p_results])
-            cs_m = np.vstack([x[3] for x in p_results])
-            Z_scores_m_a = np.vstack([x[4] for x in p_results])
-            Z_scores_m_b = np.vstack([x[5] for x in p_results])
-            
-        else:
-            p_results = compute_p_results_no_ct(cs_gp, cs_m, gene_pairs_ind, Wtot2, eg2s_gp, cell_type_key, gene_pair_dict)
-            Z_scores_gp = p_results[0]
-            Z_scores_m = p_results[1]
+        p_results = list(map(compute_p_results_partial, cell_type_pairs))
+        cs_gp = np.vstack([x[0] for x in p_results])
+        Z_scores_gp_a = np.vstack([x[1] for x in p_results])
+        Z_scores_gp_b = np.vstack([x[2] for x in p_results])
+        cs_m = np.vstack([x[3] for x in p_results])
+        Z_scores_m_a = np.vstack([x[4] for x in p_results])
+        Z_scores_m_b = np.vstack([x[5] for x in p_results])
 
-            genes_ = pd.Series([gene for gene_pair in gene_pairs for gene in gene_pair]).drop_duplicates().tolist()
-            genes_ = [tuple(i) if isinstance(i, list) else i for i in genes_]
-            gene_pairs_ = [(tuple(gp_1) if isinstance(gp_1, list) else gp_1, tuple(gp_2) if isinstance(gp_2, list) else gp_2) for gp_1, gp_2 in gene_pairs]
-
-            lc_zs = pd.DataFrame(np.zeros((len(genes_), len(genes_))), index=genes_, columns=genes_)
-            for i, gene_pair in enumerate(gene_pairs_):
-                gp_1, gp_2 = gene_pair
-                gp_1_ind = genes_.index(gp_1)
-                gp_2_ind = genes_.index(gp_2)
-                lc_zs.iloc[gp_1_ind, gp_2_ind] = Z_scores_gp[i]
-            
-            np.fill_diagonal(lc_zs.values, 0)
-            lc_zs = lc_zs/2 + lc_zs.T/2
-            adata.uns['lc_zs'] = lc_zs
-
-        adata.uns['ccc_results']['p']['gp']['cs'] = cs_gp
-        adata.uns['ccc_results']['p']['m']['cs'] = cs_m
-        if cell_type_key:
-            Z_pvals_gp_a = norm.sf(Z_scores_gp_a)
-            Z_pvals_gp_b = norm.sf(Z_scores_gp_b)
-            Z_pvals_m_a = norm.sf(Z_scores_m_a)
-            Z_pvals_m_b = norm.sf(Z_scores_m_b)
-            adata.uns['ccc_results']['p']['gp']['Z_a'] = Z_scores_gp_a
-            adata.uns['ccc_results']['p']['gp']['Z_b'] = Z_scores_gp_b
-            adata.uns['ccc_results']['p']['gp']['Z_pval_a'] = Z_pvals_gp_a
-            adata.uns['ccc_results']['p']['gp']['Z_pval_b'] = Z_pvals_gp_b
-            adata.uns['ccc_results']['p']['gp']['Z_FDR_a'] = multipletests(Z_pvals_gp_a.flatten(), method="fdr_bh")[1].reshape(Z_pvals_gp_a.shape)
-            adata.uns['ccc_results']['p']['gp']['Z_FDR_b'] = multipletests(Z_pvals_gp_b.flatten(), method="fdr_bh")[1].reshape(Z_pvals_gp_b.shape)
-            adata.uns['ccc_results']['p']['m']['Z_a'] = Z_scores_m_a
-            adata.uns['ccc_results']['p']['m']['Z_b'] = Z_scores_m_b
-            adata.uns['ccc_results']['p']['m']['Z_pval_a'] = Z_pvals_m_a
-            adata.uns['ccc_results']['p']['m']['Z_pval_b'] = Z_pvals_m_b
-            adata.uns['ccc_results']['p']['m']['Z_FDR_a'] = multipletests(Z_pvals_m_a.flatten(), method="fdr_bh")[1].reshape(Z_pvals_m_a.shape)
-            adata.uns['ccc_results']['p']['m']['Z_FDR_b'] = multipletests(Z_pvals_m_b.flatten(), method="fdr_bh")[1].reshape(Z_pvals_m_b.shape)
-        else:
-            Z_pvals_gp = norm.sf(Z_scores_gp)
-            Z_pvals_m = norm.sf(Z_scores_m)
-            adata.uns['ccc_results']['p']['gp']['Z'] = Z_scores_gp
-            adata.uns['ccc_results']['p']['gp']['Z_pval'] = Z_pvals_gp
-            adata.uns['ccc_results']['p']['gp']['Z_FDR'] = multipletests(Z_pvals_gp.flatten(), method="fdr_bh")[1].reshape(Z_pvals_gp.shape)
-            adata.uns['ccc_results']['p']['m']['Z'] = Z_scores_m
-            adata.uns['ccc_results']['p']['m']['Z_pval'] = Z_pvals_m
-            adata.uns['ccc_results']['p']['m']['Z_FDR'] = multipletests(Z_pvals_m.flatten(), method="fdr_bh")[1].reshape(Z_pvals_m.shape)
+        adata.uns['ct_ccc_results']['p']['gp']['cs'] = cs_gp
+        adata.uns['ct_ccc_results']['p']['m']['cs'] = cs_m
+        
+        Z_pvals_gp_a = norm.sf(Z_scores_gp_a)
+        Z_pvals_gp_b = norm.sf(Z_scores_gp_b)
+        Z_pvals_m_a = norm.sf(Z_scores_m_a)
+        Z_pvals_m_b = norm.sf(Z_scores_m_b)
+        adata.uns['ct_ccc_results']['p']['gp']['Z_a'] = Z_scores_gp_a
+        adata.uns['ct_ccc_results']['p']['gp']['Z_b'] = Z_scores_gp_b
+        adata.uns['ct_ccc_results']['p']['gp']['Z_pval_a'] = Z_pvals_gp_a
+        adata.uns['ct_ccc_results']['p']['gp']['Z_pval_b'] = Z_pvals_gp_b
+        adata.uns['ct_ccc_results']['p']['gp']['Z_FDR_a'] = multipletests(Z_pvals_gp_a.flatten(), method="fdr_bh")[1].reshape(Z_pvals_gp_a.shape)
+        adata.uns['ct_ccc_results']['p']['gp']['Z_FDR_b'] = multipletests(Z_pvals_gp_b.flatten(), method="fdr_bh")[1].reshape(Z_pvals_gp_b.shape)
+        adata.uns['ct_ccc_results']['p']['m']['Z_a'] = Z_scores_m_a
+        adata.uns['ct_ccc_results']['p']['m']['Z_b'] = Z_scores_m_b
+        adata.uns['ct_ccc_results']['p']['m']['Z_pval_a'] = Z_pvals_m_a
+        adata.uns['ct_ccc_results']['p']['m']['Z_pval_b'] = Z_pvals_m_b
+        adata.uns['ct_ccc_results']['p']['m']['Z_FDR_a'] = multipletests(Z_pvals_m_a.flatten(), method="fdr_bh")[1].reshape(Z_pvals_m_a.shape)
+        adata.uns['ct_ccc_results']['p']['m']['Z_FDR_b'] = multipletests(Z_pvals_m_b.flatten(), method="fdr_bh")[1].reshape(Z_pvals_m_b.shape)
 
     if test in ["non-parametric", "both"]:
 
         print("Running the non-parametric test...")
         
-        adata.uns['ccc_results']['np'] = {}
-        adata.uns['ccc_results']['np']['gp'] = {}
-        adata.uns['ccc_results']['np']['m'] = {}
+        adata.uns['ct_ccc_results']['np'] = {}
+        adata.uns['ct_ccc_results']['np']['gp'] = {}
+        adata.uns['ct_ccc_results']['np']['m'] = {}
         
         counts = counts_from_anndata(adata[cells, genes], layer_key_np_test, dense=True)
+        num_umi = counts.sum(axis=0)
 
-        if center_counts_for_np_test:
-            num_umi = counts.sum(axis=0)
-            counts = standardize_ct_counts(adata[cells,], counts, model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts, model, num_umi, sample_specific)
+        # if center_counts_for_np_test:
+        #     num_umi = counts.sum(axis=0)
+        #     counts = standardize_ct_counts_old(adata[cells,], counts, model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts, model, num_umi, sample_specific)
 
+        # if mean == 'algebraic':
+        #     counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else counts_from_anndata(adata[cells, [genes[i] for i in gene_pair[0]]], layer_key_np_test, dense=True).mean(0) for gene_pair in gene_pairs_ind])
+        #     counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else counts_from_anndata(adata[cells, [genes[i] for i in gene_pair[1]]], layer_key_np_test, dense=True).mean(0) for gene_pair in gene_pairs_ind])
+        # else:
+        #     counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else gmean(counts_from_anndata(adata[cells, [genes[i] for i in gene_pair[0]]], layer_key_np_test, dense=True), axis=0) for gene_pair in gene_pairs_ind])
+        #     counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else gmean(counts_from_anndata(adata[cells, [genes[i] for i in gene_pair[1]]], layer_key_np_test, dense=True), axis=0) for gene_pair in gene_pairs_ind])
+        
+        # if center_counts_for_np_test:
+        #     subunits_1 = [i for i, (a, b) in enumerate(gene_pairs_ind) if isinstance(a, list)]
+        #     subunits_2 = [i for i, (a, b) in enumerate(gene_pairs_ind) if isinstance(b, list)]
+        #     counts_1[subunits_1,:] = standardize_ct_counts_old(adata[cells,], counts_1[subunits_1,:], model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts_1[subunits_1,:], model, num_umi, sample_specific)
+        #     counts_2[subunits_2,:] = standardize_ct_counts_old(adata[cells,], counts_2[subunits_2,:], model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts_2[subunits_2,:], model, num_umi, sample_specific)
+        
         if mean == 'algebraic':
-            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else counts_from_anndata(adata[cells, [genes[i] for i in gene_pair[0]]], layer_key_np_test, dense=True).mean(0) for gene_pair in gene_pairs_ind])
-            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else counts_from_anndata(adata[cells, [genes[i] for i in gene_pair[1]]], layer_key_np_test, dense=True).mean(0) for gene_pair in gene_pairs_ind])
+            counts_1 = np.vstack([counts[idx1].mean(0) if isinstance(idx1, list) else counts[idx1] for (idx1, _) in gene_pairs_ind])
+            counts_2 = np.vstack([counts[idx2].mean(0) if isinstance(idx2, list) else counts[idx2] for (_, idx2) in gene_pairs_ind])
         else:
-            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else gmean(counts_from_anndata(adata[cells, [genes[i] for i in gene_pair[0]]], layer_key_np_test, dense=True), axis=0) for gene_pair in gene_pairs_ind])
-            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else gmean(counts_from_anndata(adata[cells, [genes[i] for i in gene_pair[1]]], layer_key_np_test, dense=True), axis=0) for gene_pair in gene_pairs_ind])
+            counts_1 = np.vstack([gmean(counts[idx1], axis=0) if isinstance(idx1, list) else counts[idx1] for (idx1, _) in gene_pairs_ind])
+            counts_2 = np.vstack([gmean(counts[idx2], axis=0) if isinstance(idx2, list) else counts[idx2] for (_, idx2) in gene_pairs_ind])
         
         if center_counts_for_np_test:
-            subunits_1 = [i for i, (a, b) in enumerate(gene_pairs_ind) if isinstance(a, list)]
-            subunits_2 = [i for i, (a, b) in enumerate(gene_pairs_ind) if isinstance(b, list)]
-            counts_1[subunits_1,:] = standardize_ct_counts(adata[cells,], counts_1[subunits_1,:], model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts_1[subunits_1,:], model, num_umi, sample_specific)
-            counts_2[subunits_2,:] = standardize_ct_counts(adata[cells,], counts_2[subunits_2,:], model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts_2[subunits_2,:], model, num_umi, sample_specific)
+            counts_1 = standardize_ct_counts_old(adata[cells,], counts_1, model, num_umi, sample_specific, cell_types)
+            counts_2 = standardize_ct_counts_old(adata[cells,], counts_2, model, num_umi, sample_specific, cell_types)
         
         if center_counts_for_np_test and test == 'both':
-            adata.uns['ccc_results']['np']['gp']['cs'] = np.array(adata.uns['ccc_results']['p']['gp']['cs'])
-            adata.uns['ccc_results']['np']['m']['cs'] = np.array(adata.uns['ccc_results']['p']['m']['cs'])
+            adata.uns['ct_ccc_results']['np']['gp']['cs'] = np.array(adata.uns['ct_ccc_results']['p']['gp']['cs'])
+            adata.uns['ct_ccc_results']['np']['m']['cs'] = np.array(adata.uns['ct_ccc_results']['p']['m']['cs'])
         else:            
-            cs_gp = compute_CCC_scores(counts_1, counts_2, weights_ct_pairs, gene_pairs) if cell_type_key else compute_CCC_scores(counts_1, counts_2, weights, gene_pairs)
-            cs_m = compute_metabolite_cs(cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_ind, ct_specific_gene_pairs, interacting_cell_scores=False)
-            adata.uns['ccc_results']['np']['gp']['cs'] = cs_gp
-            adata.uns['ccc_results']['np']['m']['cs'] = cs_m
+            cs_gp = compute_CCC_scores(counts_1, counts_2, weights_ct_pairs, gene_pairs)
+            cs_m = compute_metabolite_cs_old(cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_ind, ct_specific_gene_pairs, interacting_cell_scores=False)
+            adata.uns['ct_ccc_results']['np']['gp']['cs'] = cs_gp
+            adata.uns['ct_ccc_results']['np']['m']['cs'] = cs_m
 
-        adata.uns['ccc_results']['np']['gp']['perm_cs_a'] = np.zeros((len(cell_type_pairs), counts_1.shape[0], M)).astype(np.float16) if cell_type_key else np.zeros((counts_1.shape[0], M)).astype(np.float16)
-        adata.uns['ccc_results']['np']['gp']['perm_cs_b'] = np.zeros((len(cell_type_pairs), counts_1.shape[0], M)).astype(np.float16) if cell_type_key else np.zeros((counts_1.shape[0], M)).astype(np.float16)
-        adata.uns['ccc_results']['np']['m']['perm_cs_a'] = np.zeros((len(cell_type_pairs), len(metabolites), M)).astype(np.float16) if cell_type_key else np.zeros((len(metabolites), M)).astype(np.float16)
-        adata.uns['ccc_results']['np']['m']['perm_cs_b'] = np.zeros((len(cell_type_pairs), len(metabolites), M)).astype(np.float16) if cell_type_key else np.zeros((len(metabolites), M)).astype(np.float16)
+        adata.uns['ct_ccc_results']['np']['gp']['perm_cs_a'] = np.zeros((len(cell_type_pairs), counts_1.shape[0], M)).astype(np.float16) if cell_type_key else np.zeros((counts_1.shape[0], M)).astype(np.float16)
+        adata.uns['ct_ccc_results']['np']['gp']['perm_cs_b'] = np.zeros((len(cell_type_pairs), counts_1.shape[0], M)).astype(np.float16) if cell_type_key else np.zeros((counts_1.shape[0], M)).astype(np.float16)
+        adata.uns['ct_ccc_results']['np']['m']['perm_cs_a'] = np.zeros((len(cell_type_pairs), len(metabolites), M)).astype(np.float16) if cell_type_key else np.zeros((len(metabolites), M)).astype(np.float16)
+        adata.uns['ct_ccc_results']['np']['m']['perm_cs_b'] = np.zeros((len(cell_type_pairs), len(metabolites), M)).astype(np.float16) if cell_type_key else np.zeros((len(metabolites), M)).astype(np.float16)
         
         counts_1_perm = counts_1.copy()
         counts_2_perm = counts_2.copy()
         
         if check_analytic_null:
-            if cell_type_key:
-                gp_zs_a_perm_array = np.zeros((len(cell_type_pairs), counts_1.shape[0], M)).astype(np.float16)
-                gp_zs_b_perm_array = np.zeros((len(cell_type_pairs), counts_1.shape[0], M)).astype(np.float16)
-                gp_pvals_a_perm_array = np.zeros((len(cell_type_pairs), counts_1.shape[0], M)).astype(np.float16)
-                gp_pvals_b_perm_array = np.zeros((len(cell_type_pairs), counts_1.shape[0], M)).astype(np.float16)
-                m_zs_a_perm_array = np.zeros((len(cell_type_pairs), len(metabolites), M)).astype(np.float16)
-                m_zs_b_perm_array = np.zeros((len(cell_type_pairs), len(metabolites), M)).astype(np.float16)
-                m_pvals_a_perm_array = np.zeros((len(cell_type_pairs), len(metabolites), M)).astype(np.float16)
-                m_pvals_b_perm_array = np.zeros((len(cell_type_pairs), len(metabolites), M)).astype(np.float16)
-            else:
-                gp_zs_perm_array = np.zeros((counts_1.shape[0], M)).astype(np.float16)
-                gp_pvals_perm_array = np.zeros((counts_1.shape[0], M)).astype(np.float16)
-                m_zs_perm_array = np.zeros((len(metabolites), M)).astype(np.float16)
-                m_pvals_perm_array = np.zeros((len(metabolites), M)).astype(np.float16)
+            gp_zs_a_perm_array = np.zeros((len(cell_type_pairs), counts_1.shape[0], M)).astype(np.float16)
+            gp_zs_b_perm_array = np.zeros((len(cell_type_pairs), counts_1.shape[0], M)).astype(np.float16)
+            gp_pvals_a_perm_array = np.zeros((len(cell_type_pairs), counts_1.shape[0], M)).astype(np.float16)
+            gp_pvals_b_perm_array = np.zeros((len(cell_type_pairs), counts_1.shape[0], M)).astype(np.float16)
+            m_zs_a_perm_array = np.zeros((len(cell_type_pairs), len(metabolites), M)).astype(np.float16)
+            m_zs_b_perm_array = np.zeros((len(cell_type_pairs), len(metabolites), M)).astype(np.float16)
+            m_pvals_a_perm_array = np.zeros((len(cell_type_pairs), len(metabolites), M)).astype(np.float16)
+            m_pvals_b_perm_array = np.zeros((len(cell_type_pairs), len(metabolites), M)).astype(np.float16)
         
+        np.random.seed(seed)
         for i in tqdm(range(M)):
-            if cell_type_key:
-                # Cells shuffled within cell types
-                cell_type_labels = np.array(cell_types)
-                idx = np.empty_like(cell_type_labels, dtype=int)
-                for ct in np.unique(cell_type_labels):
-                    ct_indices = np.where(cell_type_labels == ct)[0]
-                    shuffled = np.random.permutation(ct_indices)
-                    idx[ct_indices] = shuffled
-                
-                # Cells shuffled all over space / Only cell type labels are shuffled
-                # idx = np.random.permutation(counts_1.shape[1])
-            else:
-                idx = np.random.permutation(counts_1.shape[1])
-            
-            # Cells shuffled all over space / Cells shuffled within cell types
-            
-
-            # if cell_type_key:
-                # Cells shuffled all over space
-                # cell_types_perm = pd.Series(cell_types[idx])
-                # weights_ct_pairs_perm = get_ct_pair_weights(
-                #     weights, cell_type_pairs, cell_types_perm, spatial
-                # )
-                
-                # weights_ct_pairs_perm_t = weights_ct_pairs_perm.transpose(axes=(0, 2, 1))
-                # weights_ct_pairs_perm = weights_ct_pairs_perm + weights_ct_pairs_perm_t
-                
-                # Cells shuffled all over space / Only cell type labels are shuffled
-                # perm_cs_gp = compute_CCC_scores(counts_1, counts_2, weights_ct_pairs_perm, gene_pairs)
+            cell_type_labels = np.array(cell_types)
+            idx = np.empty_like(cell_type_labels, dtype=int)
+            for ct in np.unique(cell_type_labels):
+                ct_indices = np.where(cell_type_labels == ct)[0]
+                shuffled = np.random.permutation(ct_indices)
+                idx[ct_indices] = shuffled
 
             same_gene_mask = np.array([pair1 == pair2 for pair1, pair2 in gene_pairs])
             # We fix gene a
-            counts_1_perm[same_gene_mask, :], counts_2_perm = counts_1[same_gene_mask, :][:, idx], counts_2[:, idx]
+            # counts_1_perm[same_gene_mask, :], counts_2_perm = counts_1[same_gene_mask, :][:, idx], counts_2[:, idx]
+            counts_1_perm, counts_2_perm = counts_1[:, idx], counts_2[:, idx]
             perm_cs_gp_a = compute_CCC_scores(counts_1_perm, counts_2_perm, weights_ct_pairs, gene_pairs) if cell_type_key else compute_CCC_scores(counts_1_perm, counts_2_perm, weights, gene_pairs)
-            perm_cs_m_a = compute_metabolite_cs(perm_cs_gp_a, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_ind, ct_specific_gene_pairs, interacting_cell_scores=False)
+            perm_cs_m_a = compute_metabolite_cs_old(perm_cs_gp_a, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_ind, ct_specific_gene_pairs, interacting_cell_scores=False)
             # We fix gene b
-            counts_2_perm[same_gene_mask, :], counts_1_perm = counts_2[same_gene_mask, :][:, idx], counts_1[:, idx]
+            # counts_2_perm[same_gene_mask, :], counts_1_perm = counts_2[same_gene_mask, :][:, idx], counts_1[:, idx]
+            counts_2_perm, counts_1_perm = counts_2[:, idx], counts_1[:, idx]
             perm_cs_gp_b = compute_CCC_scores(counts_1_perm, counts_2_perm, weights_ct_pairs, gene_pairs) if cell_type_key else compute_CCC_scores(counts_1_perm, counts_2_perm, weights, gene_pairs)
-            perm_cs_m_b = compute_metabolite_cs(perm_cs_gp_b, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_ind, ct_specific_gene_pairs, interacting_cell_scores=False)
+            perm_cs_m_b = compute_metabolite_cs_old(perm_cs_gp_b, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_ind, ct_specific_gene_pairs, interacting_cell_scores=False)
             
             if check_analytic_null:
-                if cell_type_key:
-                    compute_p_results_partial = partial(
-                        compute_p_results,
-                        cell_type_pairs=cell_type_pairs,
-                        cs_gp=(perm_cs_gp_a, perm_cs_gp_b),
-                        cs_m=(perm_cs_m_a, perm_cs_m_b),
-                        gene_pairs_ind=gene_pairs_ind,
-                        gene_pairs_ind_per_ct_pair=gene_pairs_ind_per_ct_pair,
-                        Wtot2=Wtot2,
-                        eg2s_gp=eg2s_gp,
-                        cell_type_key=cell_type_key,
-                        gene_pair_dict=gene_pair_dict,
-                    )
+                compute_p_results_partial = partial(
+                    compute_p_results_old,
+                    cell_type_pairs=cell_type_pairs,
+                    cs_gp=(perm_cs_gp_a, perm_cs_gp_b),
+                    cs_m=(perm_cs_m_a, perm_cs_m_b),
+                    gene_pairs_ind=gene_pairs_ind,
+                    gene_pairs_ind_per_ct_pair=gene_pairs_ind_per_ct_pair,
+                    Wtot2=Wtot2,
+                    eg2s_gp=eg2s_gp,
+                    cell_type_key=cell_type_key,
+                    gene_pair_dict=gene_pair_dict,
+                )
 
-                    p_results = list(map(compute_p_results_partial, cell_type_pairs))
-                    cs_gp_perm = np.vstack([x[0] for x in p_results])
-                    Z_scores_gp_a_perm = np.vstack([x[1] for x in p_results])
-                    Z_scores_gp_b_perm = np.vstack([x[2] for x in p_results])
-                    cs_m_perm = np.vstack([x[3] for x in p_results])
-                    Z_scores_m_a_perm = np.vstack([x[4] for x in p_results])
-                    Z_scores_m_b_perm = np.vstack([x[5] for x in p_results])
-                    
-                    gp_zs_a_perm_array[:, :, i] = Z_scores_gp_a_perm
-                    gp_zs_b_perm_array[:, :, i] = Z_scores_gp_b_perm
-                    m_zs_a_perm_array[:, :, i] = Z_scores_m_a_perm
-                    m_zs_b_perm_array[:, :, i] = Z_scores_m_b_perm
-                    
-                    Z_pvals_gp_a_perm = norm.sf(Z_scores_gp_a_perm)
-                    Z_pvals_gp_b_perm = norm.sf(Z_scores_gp_b_perm)
-                    Z_pvals_m_a_perm = norm.sf(Z_scores_m_a_perm)
-                    Z_pvals_m_b_perm = norm.sf(Z_scores_m_b_perm)
-                    
-                    gp_pvals_a_perm_array[:, :, i] = Z_pvals_gp_a_perm
-                    gp_pvals_b_perm_array[:, :, i] = Z_pvals_gp_b_perm
-                    m_pvals_a_perm_array[:, :, i] = Z_pvals_m_a_perm
-                    m_pvals_b_perm_array[:, :, i] = Z_pvals_m_b_perm
-                    
-                else:
-                    Z_scores_gp_perm, Z_scores_m_perm = compute_p_results_no_ct((perm_cs_gp_a, perm_cs_gp_b), (perm_cs_m_a, perm_cs_m_b), gene_pairs_ind, Wtot2, eg2s_gp, cell_type_key, gene_pair_dict)
-                    gp_zs_perm_array[:, i] = Z_scores_gp_perm
-                    m_zs_perm_array[:, i] = Z_scores_m_perm
-                    Z_pvals_gp_perm = norm.sf(Z_scores_gp_perm)
-                    Z_pvals_m_perm = norm.sf(Z_scores_m_perm)
-                    gp_pvals_perm_array[:, i] = Z_pvals_gp_perm
-                    m_pvals_perm_array[:, i] = Z_pvals_m_perm
+                p_results = list(map(compute_p_results_partial, cell_type_pairs))
+                cs_gp_perm = np.vstack([x[0] for x in p_results])
+                Z_scores_gp_a_perm = np.vstack([x[1] for x in p_results])
+                Z_scores_gp_b_perm = np.vstack([x[2] for x in p_results])
+                cs_m_perm = np.vstack([x[3] for x in p_results])
+                Z_scores_m_a_perm = np.vstack([x[4] for x in p_results])
+                Z_scores_m_b_perm = np.vstack([x[5] for x in p_results])
+                
+                gp_zs_a_perm_array[:, :, i] = Z_scores_gp_a_perm
+                gp_zs_b_perm_array[:, :, i] = Z_scores_gp_b_perm
+                m_zs_a_perm_array[:, :, i] = Z_scores_m_a_perm
+                m_zs_b_perm_array[:, :, i] = Z_scores_m_b_perm
+                
+                Z_pvals_gp_a_perm = norm.sf(Z_scores_gp_a_perm)
+                Z_pvals_gp_b_perm = norm.sf(Z_scores_gp_b_perm)
+                Z_pvals_m_a_perm = norm.sf(Z_scores_m_a_perm)
+                Z_pvals_m_b_perm = norm.sf(Z_scores_m_b_perm)
+                
+                gp_pvals_a_perm_array[:, :, i] = Z_pvals_gp_a_perm
+                gp_pvals_b_perm_array[:, :, i] = Z_pvals_gp_b_perm
+                m_pvals_a_perm_array[:, :, i] = Z_pvals_m_a_perm
+                m_pvals_b_perm_array[:, :, i] = Z_pvals_m_b_perm
             
-            if cell_type_key:
-                adata.uns['ccc_results']['np']['gp']['perm_cs_a'][:, :, i] = perm_cs_gp_a
-                adata.uns['ccc_results']['np']['gp']['perm_cs_b'][:, :, i] = perm_cs_gp_b
-                adata.uns['ccc_results']['np']['m']['perm_cs_a'][:, :, i] = perm_cs_m_a
-                adata.uns['ccc_results']['np']['m']['perm_cs_b'][:, :, i] = perm_cs_m_b
-            else:
-                adata.uns['ccc_results']['np']['gp']['perm_cs_a'][:, i] = perm_cs_gp_a
-                adata.uns['ccc_results']['np']['gp']['perm_cs_b'][:, i] = perm_cs_gp_b
-                adata.uns['ccc_results']['np']['m']['perm_cs_a'][:, i] = perm_cs_m_a
-                adata.uns['ccc_results']['np']['m']['perm_cs_b'][:, i] = perm_cs_m_b
+            adata.uns['ct_ccc_results']['np']['gp']['perm_cs_a'][:, :, i] = perm_cs_gp_a
+            adata.uns['ct_ccc_results']['np']['gp']['perm_cs_b'][:, :, i] = perm_cs_gp_b
+            adata.uns['ct_ccc_results']['np']['m']['perm_cs_a'][:, :, i] = perm_cs_m_a
+            adata.uns['ct_ccc_results']['np']['m']['perm_cs_b'][:, :, i] = perm_cs_m_b
         
-        if cell_type_key:
-            x_gp_a = np.sum(adata.uns['ccc_results']['np']['gp']['perm_cs_a'] > adata.uns['ccc_results']['np']['gp']['cs'][:, :, np.newaxis], axis=2)
-            x_gp_b = np.sum(adata.uns['ccc_results']['np']['gp']['perm_cs_b'] > adata.uns['ccc_results']['np']['gp']['cs'][:, :, np.newaxis], axis=2)
-            x_m_a = np.sum(adata.uns['ccc_results']['np']['m']['perm_cs_a'] > adata.uns['ccc_results']['np']['m']['cs'][:, :, np.newaxis], axis=2)
-            x_m_b = np.sum(adata.uns['ccc_results']['np']['m']['perm_cs_b'] > adata.uns['ccc_results']['np']['m']['cs'][:, :, np.newaxis], axis=2)
-        else:            
-            x_gp_a = np.sum(adata.uns['ccc_results']['np']['gp']['perm_cs_a'] > adata.uns['ccc_results']['np']['gp']['cs'][:, np.newaxis], axis=1)
-            x_gp_b = np.sum(adata.uns['ccc_results']['np']['gp']['perm_cs_b'] > adata.uns['ccc_results']['np']['gp']['cs'][:, np.newaxis], axis=1)
-            x_m_a = np.sum(adata.uns['ccc_results']['np']['m']['perm_cs_a'] > adata.uns['ccc_results']['np']['m']['cs'][:, np.newaxis], axis=1)
-            x_m_b = np.sum(adata.uns['ccc_results']['np']['m']['perm_cs_b'] > adata.uns['ccc_results']['np']['m']['cs'][:, np.newaxis], axis=1)
+        x_gp_a = np.sum(adata.uns['ct_ccc_results']['np']['gp']['perm_cs_a'] > adata.uns['ct_ccc_results']['np']['gp']['cs'][:, :, np.newaxis], axis=2)
+        x_gp_b = np.sum(adata.uns['ct_ccc_results']['np']['gp']['perm_cs_b'] > adata.uns['ct_ccc_results']['np']['gp']['cs'][:, :, np.newaxis], axis=2)
+        x_m_a = np.sum(adata.uns['ct_ccc_results']['np']['m']['perm_cs_a'] > adata.uns['ct_ccc_results']['np']['m']['cs'][:, :, np.newaxis], axis=2)
+        x_m_b = np.sum(adata.uns['ct_ccc_results']['np']['m']['perm_cs_b'] > adata.uns['ct_ccc_results']['np']['m']['cs'][:, :, np.newaxis], axis=2)
         
         pvals_gp_a = (x_gp_a + 1) / (M + 1)
         pvals_gp_b = (x_gp_b + 1) / (M + 1)
         pvals_m_a = (x_m_a + 1) / (M + 1)
         pvals_m_b = (x_m_b + 1) / (M + 1)
-        
-        if not cell_type_key:
-            pvals_gp = np.where(pvals_gp_a > pvals_gp_b, pvals_gp_a, pvals_gp_b)
-            pvals_m = np.where(pvals_m_a > pvals_m_b, pvals_m_a, pvals_m_b)
 
         if check_analytic_null:
-            if cell_type_key:
-                adata.uns['analytic_null_gp_zs_a_perm'] = gp_zs_a_perm_array
-                adata.uns['analytic_null_gp_zs_b_perm'] = gp_zs_b_perm_array
-                adata.uns['analytic_null_m_zs_a_perm'] = m_zs_a_perm_array
-                adata.uns['analytic_null_m_zs_b_perm'] = m_zs_b_perm_array
-                adata.uns['analytic_null_gp_pvals_a_perm'] = gp_pvals_a_perm_array
-                adata.uns['analytic_null_gp_pvals_b_perm'] = gp_pvals_b_perm_array
-                adata.uns['analytic_null_m_pvals_a_perm'] = m_pvals_a_perm_array
-                adata.uns['analytic_null_m_pvals_b_perm'] = m_pvals_b_perm_array
-            else:
-                adata.uns['analytic_null_gp_zs_perm'] = gp_zs_perm_array
-                adata.uns['analytic_null_m_zs_perm'] = m_zs_perm_array
-                adata.uns['analytic_null_gp_pvals_perm'] = gp_pvals_perm_array
-                adata.uns['analytic_null_m_pvals_perm'] = m_pvals_perm_array
+            adata.uns['analytic_null_gp_zs_a_perm'] = gp_zs_a_perm_array
+            adata.uns['analytic_null_gp_zs_b_perm'] = gp_zs_b_perm_array
+            adata.uns['analytic_null_m_zs_a_perm'] = m_zs_a_perm_array
+            adata.uns['analytic_null_m_zs_b_perm'] = m_zs_b_perm_array
+            adata.uns['analytic_null_gp_pvals_a_perm'] = gp_pvals_a_perm_array
+            adata.uns['analytic_null_gp_pvals_b_perm'] = gp_pvals_b_perm_array
+            adata.uns['analytic_null_m_pvals_a_perm'] = m_pvals_a_perm_array
+            adata.uns['analytic_null_m_pvals_b_perm'] = m_pvals_b_perm_array
         
-        if cell_type_key:
-            compute_np_results_partial = partial(
-                compute_np_results,
-                cell_type_pairs=cell_type_pairs,
-                cs_gp=cs_gp,
-                cs_m=cs_m,
-                pvals_gp=(pvals_gp_a, pvals_gp_b),
-                pvals_m=(pvals_m_a, pvals_m_b),
-                gene_pair_dict=gene_pair_dict,
-                gene_pairs_ind=gene_pairs_ind,
-                gene_pairs_ind_per_ct_pair=gene_pairs_ind_per_ct_pair,
-            )
-            np_results = list(map(compute_np_results_partial, cell_type_pairs))
-            C_scores_gp = np.vstack([x[0] for x in np_results])
-            pvals_gp_a = np.vstack([x[1] for x in np_results])
-            pvals_gp_b = np.vstack([x[2] for x in np_results])
-            C_scores_m = np.vstack([x[3] for x in np_results])
-            pvals_m_a = np.vstack([x[4] for x in np_results])
-            pvals_m_b = np.vstack([x[5] for x in np_results])
+        compute_np_results_partial = partial(
+            compute_np_results,
+            cell_type_pairs=cell_type_pairs,
+            cs_gp=cs_gp,
+            cs_m=cs_m,
+            pvals_gp=(pvals_gp_a, pvals_gp_b),
+            pvals_m=(pvals_m_a, pvals_m_b),
+            gene_pair_dict=gene_pair_dict,
+            gene_pairs_ind=gene_pairs_ind,
+            gene_pairs_ind_per_ct_pair=gene_pairs_ind_per_ct_pair,
+        )
+        np_results = list(map(compute_np_results_partial, cell_type_pairs))
+        C_scores_gp = np.vstack([x[0] for x in np_results])
+        pvals_gp_a = np.vstack([x[1] for x in np_results])
+        pvals_gp_b = np.vstack([x[2] for x in np_results])
+        C_scores_m = np.vstack([x[3] for x in np_results])
+        pvals_m_a = np.vstack([x[4] for x in np_results])
+        pvals_m_b = np.vstack([x[5] for x in np_results])
+    
+        adata.uns['ct_ccc_results']['np']['gp']['cs'] = C_scores_gp
+        adata.uns['ct_ccc_results']['np']['m']['cs'] = C_scores_m
         
-            adata.uns['ccc_results']['np']['gp']['cs'] = C_scores_gp
-            adata.uns['ccc_results']['np']['m']['cs'] = C_scores_m
-        
-        if cell_type_key:
-            adata.uns['ccc_results']['np']['gp']['pval_a'] = pvals_gp_a
-            adata.uns['ccc_results']['np']['gp']['FDR_a'] = multipletests(pvals_gp_a.flatten(), method="fdr_bh")[1].reshape(pvals_gp_a.shape)
-            adata.uns['ccc_results']['np']['gp']['pval_b'] = pvals_gp_b
-            adata.uns['ccc_results']['np']['gp']['FDR_b'] = multipletests(pvals_gp_b.flatten(), method="fdr_bh")[1].reshape(pvals_gp_b.shape)
-            adata.uns['ccc_results']['np']['m']['pval_a'] = pvals_m_a
-            adata.uns['ccc_results']['np']['m']['FDR_a'] = multipletests(pvals_m_a.flatten(), method="fdr_bh")[1].reshape(pvals_m_a.shape)
-            adata.uns['ccc_results']['np']['m']['pval_b'] = pvals_m_b
-            adata.uns['ccc_results']['np']['m']['FDR_b'] = multipletests(pvals_m_b.flatten(), method="fdr_bh")[1].reshape(pvals_m_b.shape)
-        else:
-            adata.uns['ccc_results']['np']['gp']['pval'] = pvals_gp
-            adata.uns['ccc_results']['np']['gp']['FDR'] = multipletests(pvals_gp, method="fdr_bh")[1]
-            adata.uns['ccc_results']['np']['m']['pval'] = pvals_m
-            adata.uns['ccc_results']['np']['m']['FDR'] = multipletests(pvals_m, method="fdr_bh")[1]
+        adata.uns['ct_ccc_results']['np']['gp']['pval_a'] = pvals_gp_a
+        adata.uns['ct_ccc_results']['np']['gp']['FDR_a'] = multipletests(pvals_gp_a.flatten(), method="fdr_bh")[1].reshape(pvals_gp_a.shape)
+        adata.uns['ct_ccc_results']['np']['gp']['pval_b'] = pvals_gp_b
+        adata.uns['ct_ccc_results']['np']['gp']['FDR_b'] = multipletests(pvals_gp_b.flatten(), method="fdr_bh")[1].reshape(pvals_gp_b.shape)
+        adata.uns['ct_ccc_results']['np']['m']['pval_a'] = pvals_m_a
+        adata.uns['ct_ccc_results']['np']['m']['FDR_a'] = multipletests(pvals_m_a.flatten(), method="fdr_bh")[1].reshape(pvals_m_a.shape)
+        adata.uns['ct_ccc_results']['np']['m']['pval_b'] = pvals_m_b
+        adata.uns['ct_ccc_results']['np']['m']['FDR_b'] = multipletests(pvals_m_b.flatten(), method="fdr_bh")[1].reshape(pvals_m_b.shape)
 
     adata.uns["cell_types"] = cell_types.tolist() if cell_type_key else None
     
     return
 
 
-def standardize_counts(adata, counts, model, num_umi, sample_specific):
-
+def standardize_ct_counts(adata, counts, model, num_umi, sample_specific, cell_types):
+    
     if sample_specific:
         sample_key = adata.uns['sample_key']
-        for sample in adata.obs[sample_key].unique().tolist():
+        for sample in adata.obs[sample_key].unique():
             subset = np.where(adata.obs[sample_key] == sample)[0]
-            counts[:,subset] = create_centered_counts(counts[:,subset], model, num_umi[subset])
+            counts[:, subset] = center_ct_counts_torch(counts[:, subset], num_umi[subset], model, cell_types[subset])
     else:
-        counts = create_centered_counts(counts, model, num_umi)
-    counts = np.nan_to_num(counts)
-    
+        counts = center_ct_counts_torch(counts, num_umi, model, cell_types)
+            
     return counts
 
 
-def standardize_ct_counts(adata, counts, model, num_umi, sample_specific, cell_types):
-
+def standardize_ct_counts_old(adata, counts, model, num_umi, sample_specific, cell_types):
+    
     if sample_specific:
         sample_key = adata.uns['sample_key']
         for sample in adata.obs[sample_key].unique().tolist():
@@ -1045,8 +1665,7 @@ def standardize_ct_counts(adata, counts, model, num_umi, sample_specific, cell_t
     else:
         counts = create_centered_counts_ct(counts, model, num_umi, cell_types)
     counts = np.nan_to_num(counts)
-    # counts = sparse.COO.from_numpy(counts)
-    
+            
     return counts
 
 
@@ -1058,92 +1677,84 @@ def flatten(nested_list):
             yield item
 
 
+def create_weights_ct_pairs(weights, cell_types, cell_type_pairs, device):
+    
+    indices = torch.tensor([weights.row, weights.col], dtype=torch.long, device=device)
+    values = torch.tensor(weights.data, dtype=torch.float64, device=device)
+    shape = weights.shape
+
+    cell_type_cats = cell_types.astype("category")
+    cell_type_codes = torch.tensor(cell_type_cats.cat.codes.values, dtype=torch.long, device=device)
+    ct_name_to_code = {name: code for code, name in enumerate(cell_type_cats.cat.categories)}
+
+    row_idx, col_idx = indices
+    sender_types = cell_type_codes[row_idx]
+    receiver_types = cell_type_codes[col_idx]
+    
+    weights_list = []
+    coord_list = []
+
+    for i, (ct1, ct2) in enumerate(cell_type_pairs):
+        code1 = ct_name_to_code[ct1]
+        code2 = ct_name_to_code[ct2]
+
+        pair_mask = (sender_types == code1) & (receiver_types == code2)
+        if pair_mask.sum() == 0:
+            continue
+
+        pair_values = values[pair_mask]
+        pair_coords = torch.stack([
+            torch.full((pair_values.shape[0],), i, dtype=torch.long, device=device),
+            row_idx[pair_mask],
+            col_idx[pair_mask]
+        ], dim=0)
+
+        weights_list.append(pair_values)
+        coord_list.append(pair_coords)
+
+    all_values = torch.cat(weights_list)
+    all_coords = torch.cat(coord_list, dim=1)
+    weights_ct_pairs = torch.sparse_coo_tensor(
+        all_coords, all_values, (len(cell_type_pairs), shape[0], shape[1]), device=device
+    )
+    weights_ct_pairs = weights_ct_pairs.coalesce()
+    
+    return weights_ct_pairs
+
+
 def select_significant_interactions(
     adata: AnnData,
+    ct_aware: Optional[bool] = False,
     test: Optional[Union[Literal["parametric"], Literal["non-parametric"]]] = "parametric",
+    use_FDR: Optional[bool] = True,
     threshold: Optional[float] = 0.05,
 ):
+    
+    ccc_key = 'ct_ccc_results' if ct_aware else 'ccc_results'
+    sig_key = 'FDR' if use_FDR else 'pval'
 
     if test == 'parametric':
-        FDR_values_gp = adata.uns['ccc_results']['cell_com_df_gp']['Z_FDR'].values
-        C_values_gp = adata.uns['ccc_results']['cell_com_df_gp']['C_p'].values
-        FDR_values_m = adata.uns['ccc_results']['cell_com_df_m']['Z_FDR'].values
-        C_values_m = adata.uns['ccc_results']['cell_com_df_m']['C_p'].values
+        FDR_values_gp = adata.uns[ccc_key]['cell_com_df_gp'][f'Z_{sig_key}'].values
+        C_values_gp = adata.uns[ccc_key]['cell_com_df_gp']['C_p'].values
+        FDR_values_m = adata.uns[ccc_key]['cell_com_df_m'][f'Z_{sig_key}'].values
+        C_values_m = adata.uns[ccc_key]['cell_com_df_m']['C_p'].values
     elif test == 'non-parametric':
-        FDR_values_gp = adata.uns['ccc_results']['cell_com_df_gp']['FDR_np'].values
-        C_values_gp = adata.uns['ccc_results']['cell_com_df_gp']['C_np'].values
-        FDR_values_m = adata.uns['ccc_results']['cell_com_df_m']['FDR_np'].values
-        C_values_m = adata.uns['ccc_results']['cell_com_df_m']['C_np'].values
+        FDR_values_gp = adata.uns[ccc_key]['cell_com_df_gp'][f'{sig_key}_np'].values
+        C_values_gp = adata.uns[ccc_key]['cell_com_df_gp']['C_np'].values
+        FDR_values_m = adata.uns[ccc_key]['cell_com_df_m'][f'{sig_key}_np'].values
+        C_values_m = adata.uns[ccc_key]['cell_com_df_m']['C_np'].values
     else:
         raise ValueError('The "test" variable should be one of ["parametric", "non-parametric"].')
 
     # Gene pair
-    adata.uns['ccc_results']['cell_com_df_gp']['selected'] = (FDR_values_gp < threshold) & (C_values_gp > 0) if test == 'non-parametric' else (FDR_values_gp < threshold)
-    cell_com_df_gp = adata.uns['ccc_results']['cell_com_df_gp']
-    adata.uns['ccc_results']['cell_com_df_gp_sig'] = cell_com_df_gp[cell_com_df_gp.selected == True].copy()
+    adata.uns[ccc_key]['cell_com_df_gp']['selected'] = (FDR_values_gp < threshold) & (C_values_gp > 0) if test == 'non-parametric' else (FDR_values_gp < threshold)
+    cell_com_df_gp = adata.uns[ccc_key]['cell_com_df_gp']
+    adata.uns[ccc_key]['cell_com_df_gp_sig'] = cell_com_df_gp[cell_com_df_gp.selected == True].copy()
 
     # Metabolite
-    adata.uns['ccc_results']['cell_com_df_m']['selected'] = (FDR_values_m < threshold) & (C_values_m > 0) if test == 'non-parametric' else (FDR_values_m < threshold)
-    cell_com_df_m = adata.uns['ccc_results']['cell_com_df_m']
-    adata.uns['ccc_results']['cell_com_df_m_sig'] = cell_com_df_m[cell_com_df_m.selected == True].copy()
-
-    return
-
-
-def compute_metabolite_scores(
-    adata: Union[str, AnnData],
-    var: str,
-    func: Optional[Union[Literal["sum"], Literal["mean"], Literal["max"]]] = 'mean',
-):
-    
-    cell_type_key = adata.uns['cell_type_key']
-
-    cell_communication_df = adata.uns['ccc_results']['cell_com_df_gp_sig'].copy()
-    cell_communication_df[['Gene 1', 'Gene 2']] = cell_communication_df[['Gene 1', 'Gene 2']].map(lambda x: tuple(x) if isinstance(x, list) else x)
-    cell_communication_df['gene_pair'] = cell_communication_df.apply(lambda row: ensure_tuple((row['Gene 1'], row['Gene 2'])), axis=1)
-    # cell_communication_df['gene_pair'] = cell_communication_df.apply(lambda row: (row['Gene 1'], row['Gene 2']), axis=1)
-
-    gene_pairs_per_metabolite = adata.uns['gene_pairs_per_metabolite']
-
-    metabolite_gene_pair_df = pd.DataFrame.from_dict(gene_pairs_per_metabolite, orient="index").reset_index()
-    metabolite_gene_pair_df = metabolite_gene_pair_df.rename(columns={"index": "metabolite"})
-
-    metabolite_gene_pair_df['gene_pair'] = metabolite_gene_pair_df['gene_pair'].apply(lambda arr: [(sub_array[0], sub_array[1]) for sub_array in arr])
-    metabolite_gene_pair_df['gene_type'] = metabolite_gene_pair_df['gene_type'].apply(lambda arr: [(sub_array[0], sub_array[1]) for sub_array in arr])
-
-    metabolite_gene_pair_df = pd.concat(
-        [
-            metabolite_gene_pair_df['metabolite'],
-            metabolite_gene_pair_df.explode('gene_pair')['gene_pair'],
-            metabolite_gene_pair_df.explode('gene_type')['gene_type'],
-        ],
-        axis=1,
-    )
-    metabolite_gene_pair_df = metabolite_gene_pair_df.reset_index(drop=True).dropna()
-
-    adata.uns['metabolite_gene_pair_df'] = metabolite_gene_pair_df
-
-    metabolite_gene_pair_df['gene_pair'] = metabolite_gene_pair_df.apply(lambda row: ensure_tuple(row['gene_pair']), axis=1)
-
-    if 'LR_database' in adata.uns.keys():
-        LR_database = adata.uns['LR_database']
-        df_merged = pd.merge(metabolite_gene_pair_df, LR_database, left_on='metabolite', right_on='interaction_name', how='left')
-        LR_df = df_merged.dropna(subset=['pathway_name'])
-        metabolite_gene_pair_df['metabolite'][metabolite_gene_pair_df.metabolite.isin(LR_df.metabolite)] = LR_df['pathway_name']
-
-    cell_communication_df = pd.merge(cell_communication_df, metabolite_gene_pair_df, on='gene_pair', how='inner')
-
-    adata.uns['ccc_results']['cell_com_df_gp_sig_metab'] = cell_communication_df
-    if func == 'sum':
-        cell_communication_df = cell_communication_df.groupby(['Cell Type 1', 'Cell Type 2', 'metabolite'])[var].sum().reset_index() if cell_type_key else cell_communication_df.groupby(['metabolite'])[var].sum().reset_index()
-    elif func == 'mean':
-        cell_communication_df = cell_communication_df.groupby(['Cell Type 1', 'Cell Type 2', 'metabolite'])[var].mean().reset_index() if cell_type_key else cell_communication_df.groupby(['metabolite'])[var].mean().reset_index()
-    elif func == 'max':
-        cell_communication_df = cell_communication_df.groupby(['Cell Type 1', 'Cell Type 2', 'metabolite'])[var].max().reset_index() if cell_type_key else cell_communication_df.groupby(['metabolite'])[var].max().reset_index()
-    else:
-        raise ValueError('The "func" variable should be one of ["sum", "mean", "max"].')
-
-    adata.uns['ccc_results'][f'cell_com_df_gp_sig_metab_scores_{var}_{func}'] = cell_communication_df
+    adata.uns[ccc_key]['cell_com_df_m']['selected'] = (FDR_values_m < threshold) & (C_values_m > 0) if test == 'non-parametric' else (FDR_values_m < threshold)
+    cell_com_df_m = adata.uns[ccc_key]['cell_com_df_m']
+    adata.uns[ccc_key]['cell_com_df_m_sig'] = cell_com_df_m[cell_com_df_m.selected == True].copy()
 
     return
 
@@ -1152,128 +1763,111 @@ def compute_interacting_cell_scores(
     adata: Union[str, AnnData],
     center_counts_for_np_test: Optional[bool] = False,
     test: Optional[Union[Literal["parametric"], Literal["non-parametric"], Literal["both"]]] = "both",
-    subset_gene_pairs: Optional[list] = None,
-    subset_metabolites: Optional[list] = None,
-    only_sig_results: Optional[bool] = True,
+    # subset_gene_pairs: Optional[list] = None,
+    # subset_metabolites: Optional[list] = None,
+    # only_sig_results: Optional[bool] = True,
+    restrict_significance: Optional[Union[Literal["gene pairs"], Literal["metabolites"], Literal["both"]]] = "both",
+    compute_significance: Optional[Union[Literal["parametric"], Literal["non-parametric"], Literal["both"]]] = "both",
     M: Optional[int] = 1000,
+    seed: Optional[int] = 42,
+    check_analytic_null: Optional[bool] = False,
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    verbose: Optional[bool] = False,
 ):
     
     start = time.time()
-    print("Computing gene pair and metabolite scores...")
+    if verbose:
+        print("Computing gene pair and metabolite scores...")
     
     adata.uns['interacting_cell_results'] = {}
 
     model = adata.uns["model"]
     mean = adata.uns["mean"]
+    
     if test not in ['both', 'parametric', 'non-parametric']:
         raise ValueError('The "test" variable should be one of ["both", "parametric", "non-parametric"].')
     
-    sample_specific = 'sample_key' in adata.uns.keys()
+    if restrict_significance not in ['both', 'gene pairs', 'metabolites']:
+        raise ValueError('The "restrict_significance" variable should be one of ["both", "gene pairs", "metabolites"].')
     
-    layer_key_p_test = adata.uns["layer_key_p_test"] if "layer_key_p_test" in adata.uns.keys() else None
-    layer_key_np_test = adata.uns["layer_key_np_test"] if "layer_key_np_test" in adata.uns.keys() else None
+    if compute_significance not in ['both', 'parametric', 'non-parametric']:
+        raise ValueError('The "compute_significance" variable should be one of ["both", "parametric", "non-parametric"].')
     
-    use_raw = (layer_key_p_test == "use_raw") & (layer_key_np_test == "use_raw")
+    sample_specific = 'sample_key' in adata.uns
 
-    cell_communication_df = adata.uns['ccc_results']['cell_com_df_gp_sig'].copy()
-    cell_communication_df[['Gene 1', 'Gene 2']] = cell_communication_df[['Gene 1', 'Gene 2']].map(lambda x: tuple(x) if isinstance(x, list) else x)
-
-    gene_pairs_per_ct_pair = adata.uns['gene_pairs_per_ct_pair'] if 'gene_pairs_per_ct_pair' in adata.uns else None
-    gene_pairs = adata.uns['gene_pairs'] if 'gene_pairs' in adata.uns else None
+    layer_key_p_test = adata.uns.get("layer_key_p_test", None)
+    layer_key_np_test = adata.uns.get("layer_key_np_test", None)
+    use_raw = (layer_key_p_test == "use_raw") and (layer_key_np_test == "use_raw")
+    
+    gene_pairs = adata.uns.get('gene_pairs', None)
     gene_pairs_per_metabolite = adata.uns['gene_pairs_per_metabolite']
+    
+    def to_tuple(x):
+        # Recursively convert lists to tuples
+        if isinstance(x, list):
+            return tuple(to_tuple(i) for i in x)
+        return x
 
     metabolite_gene_pair_df = pd.DataFrame.from_dict(gene_pairs_per_metabolite, orient="index").reset_index()
     metabolite_gene_pair_df = metabolite_gene_pair_df.rename(columns={"index": "metabolite"})
-
-    metabolite_gene_pair_df['gene_pair'] = metabolite_gene_pair_df['gene_pair'].apply(lambda arr: [(sub_array[0], sub_array[1]) for sub_array in arr])
-    metabolite_gene_pair_df['gene_type'] = metabolite_gene_pair_df['gene_type'].apply(lambda arr: [(sub_array[0], sub_array[1]) for sub_array in arr])
-
-    metabolite_gene_pair_df = pd.concat(
-        [
-            metabolite_gene_pair_df['metabolite'],
-            metabolite_gene_pair_df.explode('gene_pair')['gene_pair'],
-            metabolite_gene_pair_df.explode('gene_type')['gene_type'],
-        ],
-        axis=1,
+    metabolite_gene_pair_df['gene_pair'] = metabolite_gene_pair_df['gene_pair'].apply(
+        lambda arr: [(to_tuple(gp[0]), to_tuple(gp[1])) for gp in arr]
     )
-    metabolite_gene_pair_df = metabolite_gene_pair_df.reset_index(drop=True)
+    metabolite_gene_pair_df['gene_type'] = metabolite_gene_pair_df['gene_type'].apply(
+        lambda arr: [(to_tuple(gt[0]), to_tuple(gt[1])) for gt in arr]
+    )
+    metabolite_gene_pair_df = pd.concat([
+        metabolite_gene_pair_df['metabolite'],
+        metabolite_gene_pair_df.explode('gene_pair')['gene_pair'],
+        metabolite_gene_pair_df.explode('gene_type')['gene_type'],
+    ], axis=1).reset_index(drop=True)
+    
+    if 'LR_database' in adata.uns:
+        LR_database = adata.uns['LR_database']
+        df_merged = pd.merge(metabolite_gene_pair_df, LR_database, left_on='metabolite', right_on='interaction_name', how='left')
+        LR_df = df_merged.dropna(subset=['pathway_name'])
+        metabolite_gene_pair_df['metabolite'][metabolite_gene_pair_df.metabolite.isin(LR_df.metabolite)] = LR_df['pathway_name']
+    
+    if restrict_significance in ['both', 'gene pairs']:
+        cell_com_gp_df = adata.uns['ccc_results']['cell_com_df_gp_sig'].copy()
+        cell_com_gp_df[['Gene 1', 'Gene 2']] = cell_com_gp_df[['Gene 1', 'Gene 2']].applymap(
+            lambda x: tuple(x) if isinstance(x, list) else x)
 
-    if gene_pairs:
-        gene_pairs_sig = []
-        for gene_pair in gene_pairs:
-            gene_1, gene_2 = gene_pair
-            gene_1 = gene_1 if type(gene_1) is str else tuple(gene_1)
-            gene_2 = gene_2 if type(gene_2) is str else tuple(gene_2)
-            cell_com_df_gene_pair = cell_communication_df[(cell_communication_df['Gene 1'] == gene_1) & (cell_communication_df['Gene 2'] == gene_2)]
-            if cell_com_df_gene_pair.shape[0] == 0:
-                continue
-            if subset_gene_pairs is not None and gene_pair not in subset_gene_pairs:
-                continue
-            gene_pairs_sig.append(gene_pair)
+        gene_pairs_set = set([tuple(x) for x in cell_com_gp_df[['Gene 1', 'Gene 2']].values])
+        metabolite_gene_pair_df = metabolite_gene_pair_df[metabolite_gene_pair_df['gene_pair'].isin(gene_pairs_set)]
+    
+    if restrict_significance in ['both', 'metabolites']:
+        cell_com_m_df = adata.uns['ccc_results']['cell_com_df_m_sig'].copy()
+        metabolite_set = set(cell_com_m_df['Metabolite'].values)
+        metabolite_gene_pair_df = metabolite_gene_pair_df[metabolite_gene_pair_df['metabolite'].isin(metabolite_set)]
 
     genes = adata.uns["genes"]
+    gene_pairs_sig = []
+    if gene_pairs:
+        for g1, g2 in gene_pairs:
+            g1 = tuple(g1) if isinstance(g1, list) else g1
+            g2 = tuple(g2) if isinstance(g2, list) else g2
+            # if subset_gene_pairs and (gp not in subset_gene_pairs):
+            #     continue
+            # if not cell_com_gp_df[(cell_com_gp_df['Gene 1'] == g1) & (cell_com_gp_df['Gene 2'] == g2)].empty:
+            if not metabolite_gene_pair_df[metabolite_gene_pair_df['gene_pair'] == (g1, g2)].empty:
+                gene_pairs_sig.append((g1, g2))
+
+    adata.uns["gene_pairs_sig"] = gene_pairs_sig
 
     gene_pairs_sig_ind = []
-    for pair in gene_pairs_sig:
-        var1, var2 = pair
-        var1_ind = genes.index(var1) if type(var1) is not list else [genes.index(var) for var in var1 if var in genes]
-        var2_ind = genes.index(var2) if type(var2) is not list else [genes.index(var) for var in var2 if var in genes]
-        pair_tuple = (var1_ind, var2_ind)
-        gene_pairs_sig_ind.append(pair_tuple)
+    for g1, g2 in gene_pairs_sig:
+        idx1 = tuple([genes.index(g) for g in g1]) if isinstance(g1, tuple) else genes.index(g1)
+        idx2 = tuple([genes.index(g) for g in g2]) if isinstance(g2, tuple) else genes.index(g2)
+        gene_pairs_sig_ind.append((idx1, idx2))
 
-    if subset_metabolites:
-        gene_pairs_m = metabolite_gene_pair_df[metabolite_gene_pair_df['metabolite'].isin(subset_metabolites)]['gene_pair'].tolist()
-        gene_pairs_sig = [gp for gp in gene_pairs_sig if gp in gene_pairs_m] if only_sig_results else gene_pairs_m
+    adata.uns["gene_pairs_sig_ind"] = gene_pairs_sig_ind
 
-        if len(gene_pairs_sig) == 0:
-            raise ValueError(f"There are no significant gene pairs for metabolites: {subset_metabolites}")
-
-    if gene_pairs_per_ct_pair:
-        gene_pairs_per_ct_pair_sig = {}
-        for ct_pair in gene_pairs_per_ct_pair.keys():
-            ct_1, ct_2 = ct_pair
-            cell_com_df_ct_pair = cell_communication_df[(cell_communication_df['Cell Type 1'] == ct_1) & (cell_communication_df['Cell Type 2'] == ct_2)]
-            if cell_com_df_ct_pair.shape[0] == 0:
-                continue
-            gene_pairs_per_ct_pair_sig[ct_pair] = []
-            for gene_pair in gene_pairs_per_ct_pair[ct_pair]:
-                gene_1, gene_2 = gene_pair
-                gene_1 = gene_1 if type(gene_1) is str else tuple(gene_1)
-                gene_2 = gene_2 if type(gene_2) is str else tuple(gene_2)
-                cell_com_df_ct_pair_gene_pair = cell_com_df_ct_pair[(cell_com_df_ct_pair['Gene 1'] == gene_1) & (cell_com_df_ct_pair['Gene 2'] == gene_2)]
-                if cell_com_df_ct_pair_gene_pair.shape[0] == 0:
-                    continue
-                if subset_gene_pairs is not None and gene_pair not in subset_gene_pairs:
-                    continue
-                gene_pairs_per_ct_pair_sig[ct_pair].append(gene_pair)
-
-        gene_pairs_per_ct_pair_sig_ind = {}
-        gene_pairs_ind_per_ct_pair_sig = {}
-        for ct_pair in gene_pairs_per_ct_pair_sig.keys():
-            gene_pairs = gene_pairs_per_ct_pair_sig[ct_pair]
-            gene_pairs_per_ct_pair_sig_ind[ct_pair] = []
-            gene_pairs_ind_per_ct_pair_sig[ct_pair] = []
-            for pair in gene_pairs_sig:
-                var1, var2 = pair
-                var1_ind = genes.index(var1) if type(var1) is not list else [genes.index(var) for var in var1 if var in genes]
-                var2_ind = genes.index(var2) if type(var2) is not list else [genes.index(var) for var in var2 if var in genes]
-                pair_tuple = (var1_ind, var2_ind)
-                gene_pairs_ind_per_ct_pair_sig[ct_pair].append(pair_tuple)
-                idx = gene_pairs_sig_ind.index(pair_tuple)
-                gene_pairs_per_ct_pair_sig_ind[ct_pair].append(idx)
-        
-        def make_hashable(pair):
-            return tuple(tuple(x) if isinstance(x, list) else x for x in pair)
-        
-        gene_pairs_sig_ind_set = {make_hashable(pair) for pair in gene_pairs_sig_ind}
-        ct_specific_gene_pairs = [
-            i for i, pairs in enumerate(gene_pairs_ind_per_ct_pair_sig.values())
-            if {make_hashable(pair) for pair in pairs} < gene_pairs_sig_ind_set
-        ]
-    else:
-        gene_pairs_per_ct_pair_sig_ind = None
-        gene_pairs_ind_per_ct_pair_sig = None
-        ct_specific_gene_pairs = None
+    # if subset_metabolites:
+    #     gene_pairs_m = metabolite_gene_pair_df[metabolite_gene_pair_df['metabolite'].isin(subset_metabolites)]['gene_pair'].tolist()
+    #     gene_pairs_sig = [gp for gp in gene_pairs_sig if gp in gene_pairs_m] if only_sig_results else gene_pairs_m
+    #     if not gene_pairs_sig:
+    #         raise ValueError(f"No significant gene pairs for metabolites: {subset_metabolites}")
 
     if 'barcode_key' in adata.uns:
         barcode_key = adata.uns['barcode_key']
@@ -1281,277 +1875,786 @@ def compute_interacting_cell_scores(
     else:
         cells = adata.obs_names if not use_raw else adata.raw.obs_names
 
-    weights = adata.obsp["weights"].tocsr()
-    cell_type_key = adata.uns['cell_type_key'] if 'cell_type_key' in adata.uns.keys() else None
-
-    if cell_type_key:
-        cell_types = adata.obs[cell_type_key] if not use_raw else adata.raw.obs[cell_type_key]
-        cell_type_pairs = adata.uns["cell_type_pairs"] if "cell_type_pairs" in adata.uns.keys() else None
-        cell_type_pairs = [ct_pair for ct_pair in cell_type_pairs if ct_pair in gene_pairs_per_ct_pair_sig.keys()] if cell_type_pairs is not None else None
-
-        weights = sparse.COO.from_scipy_sparse(weights)
-        weights_ct_pairs = get_ct_pair_weights(
-            weights, cell_type_pairs, cell_types, spatial = True,
-        )
-
-    if 'LR_database' in adata.uns.keys():
-        LR_database = adata.uns['LR_database']
-        df_merged = pd.merge(metabolite_gene_pair_df, LR_database, left_on='metabolite', right_on='interaction_name', how='left')
-        LR_df = df_merged.dropna(subset=['pathway_name'])
-        metabolite_gene_pair_df['metabolite'][metabolite_gene_pair_df.metabolite.isin(LR_df.metabolite)] = LR_df['pathway_name']
-    
-    # metabolic_communication_df = adata.uns['ccc_results']['cell_com_df_m_sig'].copy()
-    # metabolite_gene_pair_df = metabolite_gene_pair_df[metabolite_gene_pair_df['metabolite'].isin(metabolic_communication_df['Metabolite'].tolist())]
+    # Compute weights
+    weights = make_weights_non_redundant(adata.obsp["weights"]).tocoo()
+    weights = torch.sparse_coo_tensor(
+        torch.tensor(np.vstack((weights.row, weights.col)), dtype=torch.long, device=device),
+        torch.tensor(weights.data, dtype=torch.float64, device=device),
+        torch.Size(weights.shape), 
+        device=device)
 
     gene_pair_dict = {}
     for metabolite, group in metabolite_gene_pair_df.groupby("metabolite"):
-        indexes = group["gene_pair"].apply(lambda gp: gene_pairs_sig.index(gp) if gp in gene_pairs_sig else None).dropna().tolist()
-        indexes = [int(ind) for ind in indexes if ind is not None]
-        if len(indexes) == 0:
-            continue
-        gene_pair_dict[metabolite] = indexes
+        idxs = group["gene_pair"].apply(lambda gp: gene_pairs_sig.index(gp) if gp in gene_pairs_sig else None).dropna().tolist()
+        idxs = [int(ind) for ind in idxs if ind is not None]
+        if idxs:
+            gene_pair_dict[metabolite] = idxs
     metabolites = list(gene_pair_dict.keys())
-    
+
     adata.uns['metabolites'] = metabolites
 
     gene_pairs_sig_names = [
-        "_".join("_".join(g) if isinstance(g, list) else g for g in gp) 
+        "_".join("_".join(g) if isinstance(g, tuple) else g for g in gp) 
         for gp in gene_pairs_sig
     ]
-    
+
     adata.uns['gene_pairs_sig_names'] = gene_pairs_sig_names
-    
+        
     if test in ['parametric', 'both']:
 
-        print("Running the parametric test...")
+        if verbose:
+            print("Running the parametric test...")
         
-        adata.uns['interacting_cell_results']['p'] = {}
-        adata.uns['interacting_cell_results']['p']['gp'] = {}
-        adata.uns['interacting_cell_results']['p']['m'] = {}
+        adata.uns['interacting_cell_results']['p'] = {
+            'gp': {},
+            'm': {}
+        }
         
-        if cell_type_key:
-            weights_ct_pairs_sq_data = weights_ct_pairs.data ** 2
-            weights_ct_pairs_sq = sparse.COO(weights_ct_pairs.coords, weights_ct_pairs_sq_data, shape=weights_ct_pairs.shape)
-            Wtot2 = sparse.sum(weights_ct_pairs_sq, axis=2).todense()
-        else:
-            Wtot2 = (weights ** 2).sum(axis=1).A1
-        
-        counts = counts_from_anndata(adata[:, genes], layer_key_p_test, dense=True)
-        num_umi = counts.sum(axis=0)
-        counts = standardize_ct_counts(adata, counts, model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts, model, num_umi, sample_specific)
-        
-        if mean == 'algebraic':
-            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else counts_from_anndata(adata[:, [genes[i] for i in gene_pair[0]]], layer_key_p_test, dense=True).mean(0) for gene_pair in gene_pairs_sig_ind])
-            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else counts_from_anndata(adata[:, [genes[i] for i in gene_pair[1]]], layer_key_p_test, dense=True).mean(0) for gene_pair in gene_pairs_sig_ind])
-        else:
-            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else gmean(counts_from_anndata(adata[:, [genes[i] for i in gene_pair[0]]], layer_key_p_test, dense=True), axis=0) for gene_pair in gene_pairs_sig_ind])
-            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else gmean(counts_from_anndata(adata[:, [genes[i] for i in gene_pair[1]]], layer_key_p_test, dense=True), axis=0) for gene_pair in gene_pairs_sig_ind])
-        
-        subunits_1 = [i for i, (a, b) in enumerate(gene_pairs_sig_ind) if isinstance(a, list)]
-        subunits_2 = [i for i, (a, b) in enumerate(gene_pairs_sig_ind) if isinstance(b, list)]
-        counts_1[subunits_1,:] = standardize_ct_counts(adata, counts_1[subunits_1,:], model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts_1[subunits_1,:], model, num_umi, sample_specific)
-        counts_2[subunits_2,:] = standardize_ct_counts(adata, counts_2[subunits_2,:], model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts_2[subunits_2,:], model, num_umi, sample_specific)
-        
-        eg2s_gp = conditional_eg2_gp_score(counts, weights_ct_pairs) if cell_type_key else conditional_eg2_gp_score(counts, weights)
+        # Wtot2 = (weights ** 2).sum(axis=1).A1
+        Wtot2 = torch.tensor((weights.data ** 2).sum(), device=device)
 
-        cs_gp = compute_int_CCC_scores(counts_1, counts_2, weights_ct_pairs, gene_pairs_sig) if cell_type_key else compute_int_CCC_scores(counts_1, counts_2, weights, gene_pairs_sig)
-        cs_m = compute_metabolite_cs(cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_sig_ind, ct_specific_gene_pairs, interacting_cell_scores=True)
+        # counts = counts_from_anndata(adata[:, genes], layer_key_p_test, dense=True)
+        # num_umi = counts.sum(axis=0)
+        # counts = standardize_counts(adata, counts, model, num_umi, sample_specific)
+        # Load counts
+        counts = counts_from_anndata(adata[cells, genes], layer_key_p_test, dense=True)
+        counts = torch.tensor(counts, dtype=torch.float64, device=device)
+        num_umi = counts.sum(dim=0)
         
-        if cell_type_key:
-            compute_p_int_cell_results_partial = partial(
-                compute_p_int_cell_results,
-                cell_type_pairs=cell_type_pairs,
-                cs_gp=cs_gp,
-                cs_m=cs_m,
-                gene_pairs_ind=gene_pairs_sig_ind,
-                gene_pairs_ind_per_ct_pair=gene_pairs_ind_per_ct_pair_sig,
-                Wtot2=Wtot2,
-                eg2s_gp=eg2s_gp,
-                cell_type_key=cell_type_key,
-                gene_pair_dict=gene_pair_dict,
-            )
-
-            p_results = list(map(compute_p_int_cell_results_partial, cell_type_pairs))
-            cs_gp = np.stack([x[0] for x in p_results], axis=0)
-            Z_scores_gp = np.stack([x[1] for x in p_results], axis=0)
-            cs_m = np.stack([x[2] for x in p_results], axis=0)
-            Z_scores_m = np.stack([x[3] for x in p_results], axis=0)
-        else:
-            p_results = compute_p_int_cell_results_no_ct(cs_gp, cs_m, gene_pairs_sig_ind, Wtot2, eg2s_gp, cell_type_key, gene_pair_dict)
-            Z_scores_gp = p_results[0]
-            Z_scores_m = p_results[1]
-
-        Z_pvals_gp = norm.sf(Z_scores_gp)
-        Z_pvals_m = norm.sf(Z_scores_m)
-
-        adata.uns['interacting_cell_results']['p']['gp']['cs'] = cs_gp
-        adata.uns['interacting_cell_results']['p']['gp']['Z'] = Z_scores_gp
-        adata.uns['interacting_cell_results']['p']['gp']['Z_pval'] = Z_pvals_gp
-        adata.uns['interacting_cell_results']['p']['gp']['Z_FDR'] = multipletests(Z_pvals_gp.flatten(), method="fdr_bh")[1].reshape(Z_pvals_gp.shape)
-
-        adata.uns['interacting_cell_results']['p']['m']['cs'] = cs_m
-        adata.uns['interacting_cell_results']['p']['m']['Z'] = Z_scores_m
-        adata.uns['interacting_cell_results']['p']['m']['Z_pval'] = Z_pvals_m
-        adata.uns['interacting_cell_results']['p']['m']['Z_FDR'] = multipletests(Z_pvals_m.flatten(), method="fdr_bh")[1].reshape(Z_pvals_m.shape)
+        # if mean == 'algebraic':
+        #     counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else counts_from_anndata(adata[:, [genes[i] for i in gene_pair[0]]], layer_key_p_test, dense=True).mean(0) for gene_pair in gene_pairs_sig_ind])
+        #     counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else counts_from_anndata(adata[:, [genes[i] for i in gene_pair[1]]], layer_key_p_test, dense=True).mean(0) for gene_pair in gene_pairs_sig_ind])
+        # else:
+        #     counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else gmean(counts_from_anndata(adata[:, [genes[i] for i in gene_pair[0]]], layer_key_p_test, dense=True), axis=0) for gene_pair in gene_pairs_sig_ind])
+        #     counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else gmean(counts_from_anndata(adata[:, [genes[i] for i in gene_pair[1]]], layer_key_p_test, dense=True), axis=0) for gene_pair in gene_pairs_sig_ind])
         
-        # P-value
-        mask_gp = adata.uns['interacting_cell_results']['p']['gp']['Z_pval'] < 0.05
-        mask_m = adata.uns['interacting_cell_results']['p']['m']['Z_pval'] < 0.05
+        # subunits_1 = [i for i, (a, b) in enumerate(gene_pairs_sig_ind) if isinstance(a, list)]
+        # subunits_2 = [i for i, (a, b) in enumerate(gene_pairs_sig_ind) if isinstance(b, list)]
+        # counts_1[subunits_1,:] = standardize_counts(adata, counts_1[subunits_1,:], model, num_umi, sample_specific)
+        # counts_2[subunits_2,:] = standardize_counts(adata, counts_2[subunits_2,:], model, num_umi, sample_specific)
+        
+        # Prepare counts_1 and counts_2
+        counts_1 = []
+        counts_2 = []
+        for (idx1, idx2) in gene_pairs_sig_ind:
+            if isinstance(idx1, tuple):
+                c1 = counts[idx1, :].mean(dim=0) if mean == 'algebraic' else torch.exp(torch.log(counts[idx1, :] + 1e-8).mean(dim=0))
+            else:
+                c1 = counts[idx1, :]
+            if isinstance(idx2, tuple):
+                c2 = counts[idx2, :].mean(dim=0) if mean == 'algebraic' else torch.exp(torch.log(counts[idx2, :] + 1e-8).mean(dim=0))
+            else:
+                c2 = counts[idx2, :]
+            counts_1.append(c1)
+            counts_2.append(c2)
 
-        cs_gp_sig = adata.uns['interacting_cell_results']['p']['gp']['cs'].copy()
-        cs_m_sig = adata.uns['interacting_cell_results']['p']['m']['cs'].copy()
-        if cell_type_key:
-            for i, ct_pair in enumerate(cell_type_pairs):
-                cs_gp_sig[i][~mask_gp[i,:,:]] = np.nan
-                cs_m_sig[i][~mask_m[i,:,:]] = np.nan
-            adata.uns['interacting_cell_results']['p']['gp']['cs_sig_pval'] = cs_gp_sig
-            adata.uns['interacting_cell_results']['p']['m']['cs_sig_pval'] = cs_m_sig
+        counts_1 = torch.stack(counts_1)
+        counts_2 = torch.stack(counts_2)
+        
+        counts_1 = standardize_counts(adata, counts_1, model, num_umi, sample_specific)
+        counts_2 = standardize_counts(adata, counts_2, model, num_umi, sample_specific)
+        
+        # Compute CCC scores
+        WX2t = torch.sparse.mm(weights, counts_2.T)
+        WtX2t = torch.sparse.mm(weights.transpose(0, 1), counts_2.T)
+        cs_gp = (counts_1.T * WX2t) + (counts_1.T * WtX2t)
+        same_gene_mask = torch.tensor([g1 == g2 for g1, g2 in gene_pairs_sig], device=device)
+        cs_gp[:, same_gene_mask] = cs_gp[:, same_gene_mask] / 2
+        adata.uns['interacting_cell_results']['p']['gp']['cs'] = cs_gp.detach().cpu().numpy()
+        
+        # Compute metabolite-level scores
+        cs_m = compute_metabolite_cs(cs_gp, gene_pair_dict, interacting_cell_scores=True)
+        adata.uns['interacting_cell_results']['p']['m']['cs'] = cs_m.detach().cpu().numpy()
+        
+        if compute_significance in ['parametric', 'both']:
+            # Compute second moments
+            WX1t = torch.sparse.mm(weights, counts_1.T)
+            WtX1t = torch.sparse.mm(weights.transpose(0, 1), counts_1.T)
+            eg2_a = (WX1t + WtX1t).pow(2)
+            eg2_b = (WX2t + WtX2t).pow(2)
+            eg2s_gp = (eg2_a, eg2_b)
             
-        else:
+            # eg2s_gp = conditional_eg2_gp_score(counts, weights)
+
+            # cs_gp = compute_int_CCC_scores(counts_1, counts_2, weights, gene_pairs_sig)
+            # cs_m = compute_metabolite_cs(cs_gp, gene_pair_dict, interacting_cell_scores=True)
+            
+            Z_gp, Z_m = compute_p_int_cell_results_no_ct(cs_gp, cs_m, gene_pairs_sig_ind, Wtot2, eg2s_gp, gene_pair_dict)
+
+            Z_gp_np = Z_gp.detach().cpu().numpy()
+            Z_m_np = Z_m.detach().cpu().numpy()
+            # Compute p-values and FDRs
+            Z_pvals_gp = norm.sf(Z_gp_np)
+            Z_pvals_m = norm.sf(Z_m_np)
+            FDR_gp = multipletests(Z_pvals_gp.flatten(), method="fdr_bh")[1].reshape(Z_pvals_gp.shape)
+            FDR_m = multipletests(Z_pvals_m.flatten(), method="fdr_bh")[1].reshape(Z_pvals_m.shape)
+
+            adata.uns['interacting_cell_results']['p']['gp']['Z'] = Z_gp_np
+            adata.uns['interacting_cell_results']['p']['gp']['Z_pval'] = Z_pvals_gp
+            adata.uns['interacting_cell_results']['p']['gp']['Z_FDR'] = FDR_gp
+            adata.uns['interacting_cell_results']['p']['m']['Z'] = Z_m_np
+            adata.uns['interacting_cell_results']['p']['m']['Z_pval'] = Z_pvals_m
+            adata.uns['interacting_cell_results']['p']['m']['Z_FDR'] = FDR_m
+            
+            # P-value
+            mask_gp = adata.uns['interacting_cell_results']['p']['gp']['Z_pval'] < 0.05
+            mask_m = adata.uns['interacting_cell_results']['p']['m']['Z_pval'] < 0.05
+
+            cs_gp_sig = adata.uns['interacting_cell_results']['p']['gp']['cs'].copy()
+            cs_m_sig = adata.uns['interacting_cell_results']['p']['m']['cs'].copy()
+
             cs_gp_sig[~mask_gp] = np.nan
             cs_m_sig[~mask_m] = np.nan
             adata.uns['interacting_cell_results']['p']['gp']['cs_sig_pval'] = cs_gp_sig
             adata.uns['interacting_cell_results']['p']['m']['cs_sig_pval'] = cs_m_sig
 
-        # FDR
-        mask_gp = adata.uns['interacting_cell_results']['p']['gp']['Z_FDR'] < 0.05
-        mask_m = adata.uns['interacting_cell_results']['p']['m']['Z_FDR'] < 0.05
+            # FDR
+            mask_gp = adata.uns['interacting_cell_results']['p']['gp']['Z_FDR'] < 0.05
+            mask_m = adata.uns['interacting_cell_results']['p']['m']['Z_FDR'] < 0.05
 
-        cs_gp_sig = adata.uns['interacting_cell_results']['p']['gp']['cs'].copy()
-        cs_m_sig = adata.uns['interacting_cell_results']['p']['m']['cs'].copy()
-        if cell_type_key:
-            for i, ct_pair in enumerate(cell_type_pairs):
-                cs_gp_sig[i][~mask_gp[i,:,:]] = np.nan
-                cs_m_sig[i][~mask_m[i,:,:]] = np.nan
-            adata.uns['interacting_cell_results']['p']['gp']['cs_sig_FDR'] = cs_gp_sig
-            adata.uns['interacting_cell_results']['p']['m']['cs_sig_FDR'] = cs_m_sig
-            
-        else:
+            cs_gp_sig = adata.uns['interacting_cell_results']['p']['gp']['cs'].copy()
+            cs_m_sig = adata.uns['interacting_cell_results']['p']['m']['cs'].copy()
+
             cs_gp_sig[~mask_gp] = np.nan
             cs_m_sig[~mask_m] = np.nan
             adata.uns['interacting_cell_results']['p']['gp']['cs_sig_FDR'] = cs_gp_sig
             adata.uns['interacting_cell_results']['p']['m']['cs_sig_FDR'] = cs_m_sig
         
+        if verbose:
+            print("Parametric test finished.")
+
+
     if test in ["non-parametric", "both"]:
 
-        print("Running the non-parametric test...")
+        if verbose:
+            print("Running the non-parametric test...")
         
-        adata.uns['interacting_cell_results']['np'] = {}
-        adata.uns['interacting_cell_results']['np']['gp'] = {}
-        adata.uns['interacting_cell_results']['np']['m'] = {}
+        adata.uns['interacting_cell_results']['np'] = {
+            'gp': {},
+            'm': {}
+        }
         
-        counts = counts_from_anndata(adata[:, genes], layer_key_np_test, dense=True)
+        # counts = counts_from_anndata(adata[:, genes], layer_key_np_test, dense=True)
 
-        if center_counts_for_np_test:
-            num_umi = counts.sum(axis=0)
-            counts = standardize_ct_counts(adata, counts, model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts, model, num_umi, sample_specific)
+        # if center_counts_for_np_test:
+        #     num_umi = counts.sum(axis=0)
+        #     counts = standardize_counts(adata, counts, model, num_umi, sample_specific)
         
-        if mean == 'algebraic':
-            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else counts_from_anndata(adata[:, [genes[i] for i in gene_pair[0]]], layer_key_np_test, dense=True).mean(0) for gene_pair in gene_pairs_sig_ind])
-            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else counts_from_anndata(adata[:, [genes[i] for i in gene_pair[1]]], layer_key_np_test, dense=True).mean(0) for gene_pair in gene_pairs_sig_ind])
-        else:
-            counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else gmean(counts_from_anndata(adata[:, [genes[i] for i in gene_pair[0]]], layer_key_np_test, dense=True), axis=0) for gene_pair in gene_pairs_sig_ind])
-            counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else gmean(counts_from_anndata(adata[:, [genes[i] for i in gene_pair[1]]], layer_key_np_test, dense=True), axis=0) for gene_pair in gene_pairs_sig_ind])
+        # if mean == 'algebraic':
+        #     counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else counts_from_anndata(adata[:, [genes[i] for i in gene_pair[0]]], layer_key_np_test, dense=True).mean(0) for gene_pair in gene_pairs_sig_ind])
+        #     counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else counts_from_anndata(adata[:, [genes[i] for i in gene_pair[1]]], layer_key_np_test, dense=True).mean(0) for gene_pair in gene_pairs_sig_ind])
+        # else:
+        #     counts_1 = np.vstack([counts[gene_pair[0]] if type(gene_pair[0]) is not list else gmean(counts_from_anndata(adata[:, [genes[i] for i in gene_pair[0]]], layer_key_np_test, dense=True), axis=0) for gene_pair in gene_pairs_sig_ind])
+        #     counts_2 = np.vstack([counts[gene_pair[1]] if type(gene_pair[1]) is not list else gmean(counts_from_anndata(adata[:, [genes[i] for i in gene_pair[1]]], layer_key_np_test, dense=True), axis=0) for gene_pair in gene_pairs_sig_ind])
+        
+        # if center_counts_for_np_test:
+        #     subunits_1 = [i for i, (a, b) in enumerate(gene_pairs_sig_ind) if isinstance(a, list)]
+        #     subunits_2 = [i for i, (a, b) in enumerate(gene_pairs_sig_ind) if isinstance(b, list)]
+        #     counts_1[subunits_1,:] = standardize_counts(adata, counts_1[subunits_1,:], model, num_umi, sample_specific)
+        #     counts_2[subunits_2,:] = standardize_counts(adata, counts_2[subunits_2,:], model, num_umi, sample_specific)
+        
+        # Load counts
+        counts = counts_from_anndata(adata[cells, genes], layer_key_np_test, dense=True)
+        counts = torch.tensor(counts, dtype=torch.float64, device=device)
+        
+        # Prepare counts_1 and counts_2
+        counts_1 = []
+        counts_2 = []
+        for (idx1, idx2) in gene_pairs_sig_ind:
+            if isinstance(idx1, tuple):
+                c1 = counts[idx1, :].mean(dim=0) if mean == 'algebraic' else torch.exp(torch.log(counts[idx1, :] + 1e-8).mean(dim=0))
+            else:
+                c1 = counts[idx1, :]
+            if isinstance(idx2, tuple):
+                c2 = counts[idx2, :].mean(dim=0) if mean == 'algebraic' else torch.exp(torch.log(counts[idx2, :] + 1e-8).mean(dim=0))
+            else:
+                c2 = counts[idx2, :]
+            counts_1.append(c1)
+            counts_2.append(c2)
+
+        counts_1 = torch.stack(counts_1)
+        counts_2 = torch.stack(counts_2)
         
         if center_counts_for_np_test:
-            subunits_1 = [i for i, (a, b) in enumerate(gene_pairs_sig_ind) if isinstance(a, list)]
-            subunits_2 = [i for i, (a, b) in enumerate(gene_pairs_sig_ind) if isinstance(b, list)]
-            counts_1[subunits_1,:] = standardize_ct_counts(adata, counts_1[subunits_1,:], model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts_1[subunits_1,:], model, num_umi, sample_specific)
-            counts_2[subunits_2,:] = standardize_ct_counts(adata, counts_2[subunits_2,:], model, num_umi, sample_specific, cell_types) if cell_type_key else standardize_counts(adata, counts_2[subunits_2,:], model, num_umi, sample_specific)
+            num_umi = counts.sum(dim=0)
+            counts_1 = standardize_counts(adata, counts_1, model, num_umi, sample_specific)
+            counts_2 = standardize_counts(adata, counts_2, model, num_umi, sample_specific)
+        
+        n_cells = counts_1.shape[1]
+        same_gene_mask = torch.tensor([g1 == g2 for g1, g2 in gene_pairs_sig], device=device)
         
         if center_counts_for_np_test and test == 'both':
             adata.uns['interacting_cell_results']['np']['gp']['cs'] = np.array(adata.uns['interacting_cell_results']['p']['gp']['cs'])
             adata.uns['interacting_cell_results']['np']['m']['cs'] = np.array(adata.uns['interacting_cell_results']['p']['m']['cs'])
         else:
-            cs_gp = compute_int_CCC_scores(counts_1, counts_2, weights_ct_pairs, gene_pairs_sig) if cell_type_key else compute_int_CCC_scores(counts_1, counts_2, weights, gene_pairs_sig)
-            cs_m = compute_metabolite_cs(cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_sig_ind, ct_specific_gene_pairs, interacting_cell_scores=True)
-            adata.uns['interacting_cell_results']['np']['gp']['cs'] = cs_gp
-            adata.uns['interacting_cell_results']['np']['m']['cs'] = cs_m
-        
-        adata.uns['interacting_cell_results']['np']['gp']['perm_cs'] = np.zeros((len(cell_type_pairs), counts_1.shape[1], counts_1.shape[0], M)).astype(np.float16) if cell_type_key else np.zeros((counts_1.shape[1], counts_1.shape[0], M)).astype(np.float16)
-        adata.uns['interacting_cell_results']['np']['m']['perm_cs'] = np.zeros((len(cell_type_pairs), counts_1.shape[1], len(metabolites), M)).astype(np.float16) if cell_type_key else np.zeros((counts_1.shape[1], len(metabolites), M)).astype(np.float16)
-        
-        for i in tqdm(range(M)):
-            idx = np.random.permutation(counts_1.shape[1])
-            counts_1, counts_2 = counts_1[:, idx], counts_2[:, idx]
+            # cs_gp = compute_int_CCC_scores(counts_1, counts_2, weights, gene_pairs_sig)
+            # cs_m = compute_metabolite_cs(cs_gp, gene_pair_dict, interacting_cell_scores=True)
+            # adata.uns['interacting_cell_results']['np']['gp']['cs'] = cs_gp
+            # adata.uns['interacting_cell_results']['np']['m']['cs'] = cs_m
+            
+            WX2t = torch.sparse.mm(weights, counts_2.T)
+            WtX2t = torch.sparse.mm(weights.transpose(0, 1), counts_2.T)
+            cs_gp = (counts_1.T * WX2t) + (counts_1.T * WtX2t)
+            cs_gp[:, same_gene_mask] = cs_gp[:, same_gene_mask] / 2
+            adata.uns['interacting_cell_results']['np']['gp']['cs'] = cs_gp.detach().cpu().numpy()
+            cs_m = compute_metabolite_cs(cs_gp, gene_pair_dict, interacting_cell_scores=True)
+            adata.uns['interacting_cell_results']['np']['m']['cs'] = cs_m.detach().cpu().numpy()
+            
+        if compute_significance in ['non-parametric', 'both']:
+            perm_cs_gp_a = torch.zeros((n_cells, counts_1.shape[0], M), dtype=torch.float64, device=device)
+            perm_cs_gp_b = torch.zeros_like(perm_cs_gp_a)
+            perm_cs_m_a = torch.zeros((n_cells, len(gene_pair_dict), M), dtype=torch.float64, device=device)
+            perm_cs_m_b = torch.zeros_like(perm_cs_m_a)
+            
+            if check_analytic_null:
+                gp_zs_perm_array = torch.zeros_like(perm_cs_gp_a)
+                gp_pvals_perm_array = torch.zeros_like(perm_cs_gp_a)
+                m_zs_perm_array = torch.zeros_like(perm_cs_m_a)
+                m_pvals_perm_array = torch.zeros_like(perm_cs_m_a)
+            
+            # adata.uns['interacting_cell_results']['np']['gp']['perm_cs'] = np.zeros((counts_1.shape[1], counts_1.shape[0], M)).astype(np.float16)
+            # adata.uns['interacting_cell_results']['np']['m']['perm_cs'] = np.zeros((counts_1.shape[1], len(metabolites), M)).astype(np.float16)
+            
+            torch.manual_seed(seed)
+            for i in tqdm(range(M), desc="Permutation test"):
+                idx = torch.randperm(n_cells, device=device)
+                # idx = np.random.permutation(counts_1.shape[1])
+                # counts_1, counts_2 = counts_1[:, idx], counts_2[:, idx]
 
-            if cell_type_key:
-                cell_types_perm = pd.Series(cell_types[idx])
-                weights_ct_pairs_perm = get_ct_pair_weights(
-                    weights, cell_type_pairs, cell_types_perm, spatial = True,
-                )
-                # weights_ct_pairs_perm_t = weights_ct_pairs_perm.transpose(axes=(0, 2, 1))
-                # weights_ct_pairs_perm = weights_ct_pairs_perm + weights_ct_pairs_perm_t
+                # perm_cs_gp = compute_int_CCC_scores(counts_1, counts_2, weights, gene_pairs_sig)
+                # perm_cs_m = compute_metabolite_cs(perm_cs_gp, gene_pair_dict, interacting_cell_scores=True)
+                # adata.uns['interacting_cell_results']['np']['gp']['perm_cs'][:, :, i] = perm_cs_gp
+                # adata.uns['interacting_cell_results']['np']['m']['perm_cs'][:, :, i] = perm_cs_m
                 
-                perm_cs_gp = compute_int_CCC_scores(counts_1, counts_2, weights_ct_pairs_perm, gene_pairs_sig)
-                perm_cs_m = compute_metabolite_cs(perm_cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_sig_ind, ct_specific_gene_pairs, interacting_cell_scores=True)
-                adata.uns['interacting_cell_results']['np']['gp']['perm_cs'][:, :, :, i] = perm_cs_gp
-                adata.uns['interacting_cell_results']['np']['m']['perm_cs'][:, :, :, i] = perm_cs_m
-            else:
-                perm_cs_gp = compute_int_CCC_scores(counts_1, counts_2, weights, gene_pairs_sig)
-                perm_cs_m = compute_metabolite_cs(perm_cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_sig_ind, ct_specific_gene_pairs, interacting_cell_scores=True)
-                adata.uns['interacting_cell_results']['np']['gp']['perm_cs'][:, :, i] = perm_cs_gp
-                adata.uns['interacting_cell_results']['np']['m']['perm_cs'][:, :, i] = perm_cs_m
-        
-        if cell_type_key:
-            x_gp = np.sum(adata.uns['interacting_cell_results']['np']['gp']['perm_cs'] > adata.uns['interacting_cell_results']['p']['gp']['cs'][:, :, :, np.newaxis], axis=3)
-            x_m = np.sum(adata.uns['interacting_cell_results']['np']['m']['perm_cs'] > adata.uns['interacting_cell_results']['p']['m']['cs'][:, :, :, np.newaxis], axis=3)
-        else:
-            x_gp = np.sum(adata.uns['interacting_cell_results']['np']['gp']['perm_cs'] > adata.uns['interacting_cell_results']['p']['gp']['cs'][:, :, np.newaxis], axis=2)
-            x_m = np.sum(adata.uns['interacting_cell_results']['np']['m']['perm_cs'] > adata.uns['interacting_cell_results']['p']['m']['cs'][:, :, np.newaxis], axis=2)
-        pvals_gp = (x_gp + 1) / (M + 1)
-        pvals_m = (x_m + 1) / (M + 1)
-        
-        adata.uns['interacting_cell_results']['np']['gp']['pval'] = pvals_gp
-        adata.uns['interacting_cell_results']['np']['gp']['FDR'] = multipletests(pvals_gp.flatten(), method="fdr_bh")[1].reshape(pvals_gp.shape)
-        
-        adata.uns['interacting_cell_results']['np']['m']['pval'] = pvals_m
-        adata.uns['interacting_cell_results']['np']['m']['FDR'] = multipletests(pvals_m.flatten(), method="fdr_bh")[1].reshape(pvals_m.shape)
-        
-        # P-value
-        mask_gp = adata.uns['interacting_cell_results']['np']['gp']['pval'] < 0.05
-        mask_m = adata.uns['interacting_cell_results']['np']['m']['pval'] < 0.05
-        
-        cs_gp_sig = adata.uns['interacting_cell_results']['np']['gp']['cs'].copy()
-        cs_m_sig = adata.uns['interacting_cell_results']['np']['m']['cs'].copy()
-        if cell_type_key:
-            for i, ct_pair in enumerate(cell_type_pairs):
-                cs_gp_sig[i][~mask_gp[i,:,:]] = np.nan
-                cs_m_sig[i][~mask_m[i,:,:]] = np.nan
-            adata.uns['interacting_cell_results']['np']['gp']['cs_sig_pval'] = cs_gp_sig
-            adata.uns['interacting_cell_results']['np']['m']['cs_sig_pval'] = cs_m_sig
+                c1_perm_a = counts_1.clone()
+                c2_perm_a = counts_2[:, idx]
+                c1_perm_a[same_gene_mask] = counts_1[same_gene_mask, :][:, idx]
+
+                WX2t_a = torch.sparse.mm(weights, c2_perm_a.T)
+                WtX2t_a = torch.sparse.mm(weights.transpose(0, 1), c2_perm_a.T)
+                cs_a = (c1_perm_a.T * WX2t_a) + (c1_perm_a.T * WtX2t_a)
+                cs_a[:, same_gene_mask] = cs_a[:, same_gene_mask] / 2
+                perm_cs_gp_a[:, :, i] = cs_a
+
+                cs_m_a = compute_metabolite_cs(cs_a, gene_pair_dict, interacting_cell_scores=True)
+                perm_cs_m_a[:, :, i] = cs_m_a
+
+                c2_perm_b = counts_2.clone()
+                c1_perm_b = counts_1[:, idx]
+                c2_perm_b[same_gene_mask] = counts_2[same_gene_mask, :][:, idx]
+
+                WX2t_b = torch.sparse.mm(weights, c2_perm_b.T)
+                WtX2t_b = torch.sparse.mm(weights.transpose(0, 1), c2_perm_b.T)
+                cs_b = (c1_perm_b.T * WX2t_b) + (c1_perm_b.T * WtX2t_b)
+                cs_b[:, same_gene_mask] = cs_b[:, same_gene_mask] / 2
+                perm_cs_gp_b[:, :, i] = cs_b
+
+                cs_m_b = compute_metabolite_cs(cs_b, gene_pair_dict, interacting_cell_scores=True)
+                perm_cs_m_b[:, :, i] = cs_m_b
+
+                if check_analytic_null:
+                    Z_gp_perm, Z_m_perm = compute_p_results((cs_a, cs_b), (cs_m_a, cs_m_b), gene_pairs_ind, Wtot2, eg2s_gp, gene_pair_dict)
+                    gp_zs_perm_array[:, :, i] = Z_gp_perm
+                    gp_pvals_perm_array[:, :, i] = torch.tensor(norm.sf(Z_gp_perm.cpu().numpy()), device=device)
+                    m_zs_perm_array[:, :, i] = Z_m_perm
+                    m_pvals_perm_array[:, :, i] = torch.tensor(norm.sf(Z_m_perm.cpu().numpy()), device=device)
             
-        else:
+            adata.uns['interacting_cell_results']['np']['gp']['perm_cs_a'] = perm_cs_gp_a.detach().cpu().numpy()
+            adata.uns['interacting_cell_results']['np']['gp']['perm_cs_b'] = perm_cs_gp_b.detach().cpu().numpy()
+            adata.uns['interacting_cell_results']['np']['m']['perm_cs_a'] = perm_cs_m_a.detach().cpu().numpy()
+            adata.uns['interacting_cell_results']['np']['m']['perm_cs_b'] = perm_cs_m_b.detach().cpu().numpy()
+            
+            # x_gp = np.sum(adata.uns['interacting_cell_results']['np']['gp']['perm_cs'] > adata.uns['interacting_cell_results']['p']['gp']['cs'][:, :, np.newaxis], axis=2)
+            # x_m = np.sum(adata.uns['interacting_cell_results']['np']['m']['perm_cs'] > adata.uns['interacting_cell_results']['p']['m']['cs'][:, :, np.newaxis], axis=2)
+            # pvals_gp = (x_gp + 1) / (M + 1)
+            # pvals_m = (x_m + 1) / (M + 1)
+            
+            x_gp_a = (perm_cs_gp_a > cs_gp[:, :, None]).sum(dim=2)
+            x_gp_b = (perm_cs_gp_b > cs_gp[:, :, None]).sum(dim=2)
+            x_m_a = (perm_cs_m_a > cs_m[:, :, None]).sum(dim=2)
+            x_m_b = (perm_cs_m_b > cs_m[:, :, None]).sum(dim=2)
+
+            pvals_gp_a = (x_gp_a + 1).float() / (M + 1)
+            pvals_gp_b = (x_gp_b + 1).float() / (M + 1)
+            pvals_m_a = (x_m_a + 1).float() / (M + 1)
+            pvals_m_b = (x_m_b + 1).float() / (M + 1)
+            
+            pvals_gp = torch.where(pvals_gp_a > pvals_gp_b, pvals_gp_a, pvals_gp_b)
+            pvals_m = torch.where(pvals_m_a > pvals_m_b, pvals_m_a, pvals_m_b)
+            
+            # adata.uns['interacting_cell_results']['np']['gp']['pval'] = pvals_gp
+            # adata.uns['interacting_cell_results']['np']['gp']['FDR'] = multipletests(pvals_gp.flatten(), method="fdr_bh")[1].reshape(pvals_gp.shape)
+            
+            # adata.uns['interacting_cell_results']['np']['m']['pval'] = pvals_m
+            # adata.uns['interacting_cell_results']['np']['m']['FDR'] = multipletests(pvals_m.flatten(), method="fdr_bh")[1].reshape(pvals_m.shape)
+            
+            pvals_gp = pvals_gp.cpu().numpy()
+            pvals_m = pvals_m.cpu().numpy()
+            
+            adata.uns['interacting_cell_results']['np']['gp']['pval'] = pvals_gp
+            adata.uns['interacting_cell_results']['np']['gp']['FDR'] = multipletests(pvals_gp.flatten(), method="fdr_bh")[1].reshape(pvals_gp.shape)
+            adata.uns['interacting_cell_results']['np']['m']['pval'] = pvals_m
+            adata.uns['interacting_cell_results']['np']['m']['FDR'] = multipletests(pvals_m.flatten(), method="fdr_bh")[1].reshape(pvals_m.shape)
+
+            if check_analytic_null:
+                adata.uns['interacting_cell_results']['np']['analytic_null'] = {
+                    'gp_zs_perm': gp_zs_perm_array.detach().cpu().numpy(),
+                    'gp_pvals_perm': gp_pvals_perm_array.detach().cpu().numpy(),
+                    'm_zs_perm': m_zs_perm_array.detach().cpu().numpy(),
+                    'm_pvals_perm': m_pvals_perm_array.detach().cpu().numpy(),
+                }
+                # adata.uns['analytic_null_gp_zs_perm'] = gp_zs_perm_array.detach().cpu().numpy()
+                # adata.uns['analytic_null_gp_pvals_perm'] = gp_pvals_perm_array.detach().cpu().numpy()
+                # adata.uns['analytic_null_m_zs_perm'] = m_zs_perm_array.detach().cpu().numpy()
+                # adata.uns['analytic_null_m_pvals_perm'] = m_pvals_perm_array.detach().cpu().numpy()
+            
+            # P-value
+            mask_gp = adata.uns['interacting_cell_results']['np']['gp']['pval'] < 0.05
+            mask_m = adata.uns['interacting_cell_results']['np']['m']['pval'] < 0.05
+            
+            cs_gp_sig = adata.uns['interacting_cell_results']['np']['gp']['cs'].copy()
+            cs_m_sig = adata.uns['interacting_cell_results']['np']['m']['cs'].copy()
+
             cs_gp_sig[~mask_gp] = np.nan
             cs_m_sig[~mask_m] = np.nan
             adata.uns['interacting_cell_results']['np']['gp']['cs_sig_pval'] = cs_gp_sig
             adata.uns['interacting_cell_results']['np']['m']['cs_sig_pval'] = cs_m_sig
-        
-        # FDR
-        mask_gp = adata.uns['interacting_cell_results']['np']['gp']['FDR'] < 0.05
-        mask_m = adata.uns['interacting_cell_results']['np']['m']['FDR'] < 0.05
-        
-        cs_gp_sig = adata.uns['interacting_cell_results']['np']['gp']['cs'].copy()
-        cs_m_sig = adata.uns['interacting_cell_results']['np']['m']['cs'].copy()
-        if cell_type_key:
-            for i, ct_pair in enumerate(cell_type_pairs):
-                cs_gp_sig[i][~mask_gp[i,:,:]] = np.nan
-                cs_m_sig[i][~mask_m[i,:,:]] = np.nan
-            adata.uns['interacting_cell_results']['np']['gp']['cs_sig_FDR'] = cs_gp_sig
-            adata.uns['interacting_cell_results']['np']['m']['cs_sig_FDR'] = cs_m_sig
             
-        else:
+            # FDR
+            mask_gp = adata.uns['interacting_cell_results']['np']['gp']['FDR'] < 0.05
+            mask_m = adata.uns['interacting_cell_results']['np']['m']['FDR'] < 0.05
+            
+            cs_gp_sig = adata.uns['interacting_cell_results']['np']['gp']['cs'].copy()
+            cs_m_sig = adata.uns['interacting_cell_results']['np']['m']['cs'].copy()
+
             cs_gp_sig[~mask_gp] = np.nan
             cs_m_sig[~mask_m] = np.nan
             adata.uns['interacting_cell_results']['np']['gp']['cs_sig_FDR'] = cs_gp_sig
             adata.uns['interacting_cell_results']['np']['m']['cs_sig_FDR'] = cs_m_sig
             
-    print("Finished computing gene pair and metabolite scores in %.3f seconds" %(time.time()-start))
+        if verbose:
+            print("Non-parametric test finished.")
+    
+    if verbose:
+        print("Finished computing gene pair and metabolite scores in %.3f seconds" %(time.time()-start))
     
     return
 
 
-def compute_metabolite_cs(cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_ind=None, ct_specific_gene_pairs=None, interacting_cell_scores=False):
+def compute_ct_interacting_cell_scores(
+    adata: Union[str, AnnData],
+    center_counts_for_np_test: Optional[bool] = False,
+    test: Optional[Union[Literal["parametric"], Literal["non-parametric"], Literal["both"]]] = "both",
+    restrict_significance: Optional[Union[Literal["gene pairs"], Literal["metabolites"], Literal["both"]]] = "both",
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    verbose: Optional[bool] = False,
+):
+    
+    start = time.time()
+    if verbose:
+        print("Computing cell type-aware gene pair and metabolite scores...")
+    
+    adata.uns['ct_interacting_cell_results'] = {}
+
+    model = adata.uns["model"]
+    mean = adata.uns["mean"]
+    
+    if test not in ['both', 'parametric', 'non-parametric']:
+        raise ValueError('The "test" variable should be one of ["both", "parametric", "non-parametric"].')
+    
+    if restrict_significance not in ['both', 'gene pairs', 'metabolites']:
+        raise ValueError('The "restrict_significance" variable should be one of ["both", "gene pairs", "metabolites"].')
+    
+    sample_specific = 'sample_key' in adata.uns
+    
+    layer_key_p_test = adata.uns.get("layer_key_p_test", None)
+    layer_key_np_test = adata.uns.get("layer_key_np_test", None)
+    use_raw = (layer_key_p_test == "use_raw") and (layer_key_np_test == "use_raw")
+    
+    obs = adata.raw.obs if use_raw else adata.obs
+    cells = adata.raw.obs.index.values.astype(str) if use_raw else adata.obs_names.values.astype(str)
+    
+    gene_pairs = adata.uns.get('gene_pairs', None)    
+    gene_pairs_per_ct_pair = adata.uns.get("gene_pairs_per_ct_pair", None)
+    gene_pairs_per_metabolite = adata.uns['gene_pairs_per_metabolite']
+    
+    gp_metab = adata.uns['gene_pairs_per_metabolite']
+    metabolite_gene_pair_df = (
+        pd.DataFrame.from_dict(gp_metab, orient="index")
+        .rename_axis("metabolite")
+        .explode(["gene_pair", "gene_type"])
+        .reset_index()
+    )
+    
+    if 'LR_database' in adata.uns:
+        merged = metabolite_gene_pair_df.merge(
+            adata.uns['LR_database'], left_on='metabolite', right_on='interaction_name', how='left'
+        )
+        LR_df = merged.dropna(subset=['pathway_name'])
+        metabolite_gene_pair_df.loc[
+            metabolite_gene_pair_df.metabolite.isin(LR_df.metabolite), 'metabolite'] = LR_df['pathway_name'].values
+    
+    cell_type_pairs = adata.uns.get("cell_type_pairs")
+    cell_type_pairs = [tuple(x) for x in cell_type_pairs]
+
+    cell_com_gp_df = adata.uns['ct_ccc_results']['cell_com_df_gp_sig'].copy()
+    if restrict_significance in ['both', 'gene pairs']:
+        ct_pairs_gp_set = set([tuple(x) for x in cell_com_gp_df[['Cell Type 1', 'Cell Type 2']].values])
+        cell_type_pairs = [ct_pair for ct_pair in cell_type_pairs if ct_pair in ct_pairs_gp_set]
+        
+        cell_com_gp_df[['Gene 1', 'Gene 2']] = cell_com_gp_df[['Gene 1', 'Gene 2']].applymap(
+            lambda x: tuple(x) if isinstance(x, list) else x)
+
+        gene_pairs_set = set([tuple(x) for x in cell_com_gp_df[['Gene 1', 'Gene 2']].values])
+        metabolite_gene_pair_df = metabolite_gene_pair_df[metabolite_gene_pair_df['gene_pair'].isin(gene_pairs_set)]
+    
+    cell_com_m_df = adata.uns['ct_ccc_results']['cell_com_df_m_sig'].copy()
+    if restrict_significance in ['both', 'metabolites']:
+        ct_pairs_m_set = set([tuple(x) for x in cell_com_m_df[['Cell Type 1', 'Cell Type 2']].values])
+        missing_ct_pairs = [ct_pair for ct_pair in ct_pairs_m_set if ct_pair not in cell_type_pairs]
+        if len(missing_ct_pairs) > 0:
+            warnings.warn(f'The following cell type pairs are not included in the "cell_type_pairs" set: {missing_ct_pairs}')
+        
+        metabolite_set = set(cell_com_m_df['metabolite'].values)
+        metabolite_gene_pair_df = metabolite_gene_pair_df[metabolite_gene_pair_df['metabolite'].isin(metabolite_set)]
+
+    genes = adata.uns["genes"]
+    gene_pairs_sig = []
+    if gene_pairs:
+        for g1, g2 in gene_pairs:
+            g1 = tuple(g1) if isinstance(g1, list) else g1
+            g2 = tuple(g2) if isinstance(g2, list) else g2
+            if not metabolite_gene_pair_df[metabolite_gene_pair_df['gene_pair'] == (g1, g2)].empty:
+                gene_pairs_sig.append((g1, g2))
+
+    gene_pairs_sig_ind = []
+    for pair in gene_pairs_sig:
+        idx1 = [genes.index(g) for g in pair[0]] if isinstance(pair[0], list) else genes.index(pair[0])
+        idx2 = [genes.index(g) for g in pair[1]] if isinstance(pair[1], list) else genes.index(pair[1])
+        gene_pairs_sig_ind.append((idx1, idx2))
+    
+    cell_type_key = adata.uns.get("cell_type_key")
+    cell_types = obs[cell_type_key]
+    gene_pairs_per_ct_pair = adata.uns.get("gene_pairs_per_ct_pair", {})
+    
+    weights = adata.obsp["weights"]
+    
+    used_ct_pairs = list(set(ct for cell_type_pair in cell_type_pairs for ct in cell_type_pair))
+    all_cell_types = set(cell_types.unique())
+    used_ct_pairs_set = set(used_ct_pairs)
+    if used_ct_pairs_set < all_cell_types:
+        keep_mask = cell_types[cells].isin(used_ct_pairs).values
+        keep_indices = np.where(keep_mask)[0]
+        weights = weights[keep_indices][:, keep_indices]
+        cells = cells[keep_indices]
+        cell_types = cell_types.loc[cells] # Eventually only keep the cell type pairs with at least one significant gene pair
+    
+    weights_ct_pairs = create_weights_ct_pairs(weights.tocoo(), cell_types, cell_type_pairs, device)
+    
+    gene_pairs_per_ct_pair_sig = {}
+    for ct_pair in gene_pairs_per_ct_pair.keys():
+        if ct_pair not in cell_type_pairs:
+            continue
+        cell_com_df_ct_pair = cell_com_gp_df[(cell_com_gp_df['Cell Type 1'] == ct_pair[0]) & (cell_com_gp_df['Cell Type 2'] == ct_pair[1])]
+        gene_pairs_per_ct_pair_sig[ct_pair] = [tuple(x) for x in cell_com_df_ct_pair[['Gene 1', 'Gene 2']].values]
+    
+    # Cell-type pair-specific indices
+    gene_pairs_ind_per_ct_pair_sig = defaultdict(list)
+    gene_pairs_per_ct_pair_sig_ind = defaultdict(list)
+    for ct_pair, gpairs in gene_pairs_per_ct_pair_sig.items():
+        for pair in gpairs:
+            if pair not in gene_pairs_sig:
+                continue
+            idx = gene_pairs_sig.index(pair)
+            gene_pairs_ind_per_ct_pair_sig[ct_pair].append(gene_pairs_sig_ind[idx])
+            gene_pairs_per_ct_pair_sig_ind[ct_pair].append(idx)
+
+    adata.uns["gene_pairs_ind_per_ct_pair_sig"] = dict(gene_pairs_ind_per_ct_pair_sig)
+    adata.uns["gene_pairs_per_ct_pair_sig_ind"] = dict(gene_pairs_per_ct_pair_sig_ind)
+    
+    def make_hashable(pair):
+        return tuple(tuple(x) if isinstance(x, list) else x for x in pair)
+    
+    gene_pairs_sig_ind_set = {make_hashable(pair) for pair in gene_pairs_sig_ind}
+    ct_specific_gene_pairs = [
+        i for i, pairs in enumerate(gene_pairs_ind_per_ct_pair_sig.values())
+        if {make_hashable(pair) for pair in pairs} < gene_pairs_sig_ind_set
+    ]
+
+    gene_pair_dict = {}
+    for metabolite, group in metabolite_gene_pair_df.groupby("metabolite"):
+        idxs = group["gene_pair"].apply(lambda gp: gene_pairs_sig.index(gp) if gp in gene_pairs_sig else None).dropna().tolist()
+        idxs = [int(ind) for ind in idxs if ind is not None]
+        if idxs:
+            gene_pair_dict[metabolite] = idxs
+    metabolites = list(gene_pair_dict.keys())
+    
+    gene_pair_to_metabolite_indices = defaultdict(set)
+    for met_idx, met in enumerate(metabolites):
+        for gene_pair_idx in gene_pair_dict.get(met, []):
+            gene_pair_to_metabolite_indices[gene_pair_idx].add(met_idx)
+
+    ct_pair_to_metabolite_indices = {}
+    for ct_pair, gene_pair_indices in gene_pairs_per_ct_pair_sig_ind.items():
+        met_indices = set()
+        for gi in gene_pair_indices:
+            met_indices.update(gene_pair_to_metabolite_indices.get(gi, []))
+        ct_pair_to_metabolite_indices[ct_pair] = sorted(met_indices)
+    
+    def concat_tuple_elements(t, sep='_'):
+        return sep.join(
+            s for item in t
+            for s in (item if isinstance(item, (list, tuple)) else [item])
+        )
+    
+    if test in ['parametric', 'both']:
+
+        if verbose:
+            print("Running the parametric test...")
+        
+        adata.uns['ct_interacting_cell_results']['p'] = {
+            'gp': {},
+            'm': {}
+        }
+        
+        # Load counts
+        counts = counts_from_anndata(adata[cells, genes], layer_key_p_test, dense=True)
+        counts = torch.tensor(counts, dtype=torch.float64, device=device)
+        num_umi = counts.sum(dim=0)
+        
+        # Prepare counts_1 and counts_2
+        counts_1 = []
+        counts_2 = []
+        for (idx1, idx2) in gene_pairs_sig_ind:
+            if isinstance(idx1, list):
+                c1 = counts[idx1, :].mean(dim=0) if mean == 'algebraic' else torch.exp(torch.log(counts[idx1, :] + 1e-8).mean(dim=0))
+            else:
+                c1 = counts[idx1, :]
+            if isinstance(idx2, list):
+                c2 = counts[idx2, :].mean(dim=0) if mean == 'algebraic' else torch.exp(torch.log(counts[idx2, :] + 1e-8).mean(dim=0))
+            else:
+                c2 = counts[idx2, :]
+            counts_1.append(c1)
+            counts_2.append(c2)
+
+        counts_1 = torch.stack(counts_1)
+        counts_2 = torch.stack(counts_2)
+        
+        counts_1 = standardize_ct_counts(adata[cells,:], counts_1, model, num_umi, sample_specific, cell_types)
+        counts_2 = standardize_ct_counts(adata[cells,:], counts_2, model, num_umi, sample_specific, cell_types)
+        
+        cs_gp = torch.zeros((len(cell_type_pairs), counts_1.shape[1], counts_1.shape[0]), device=counts_1.device)
+        for ct_pair in range(len(cell_type_pairs)):
+            W = weights_ct_pairs[ct_pair].coalesce()
+            WX2t = torch.sparse.mm(W, counts_2.T)
+            cs_gp[ct_pair] = counts_1.T * WX2t
+        adata.uns['ct_interacting_cell_results']['p']['gp']['cs'] = cs_gp.detach().cpu().numpy()
+        
+        cs_m = compute_metabolite_cs_ct(cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_sig_ind, ct_specific_gene_pairs, interacting_cell_scores=True)
+        adata.uns['ct_interacting_cell_results']['p']['m']['cs'] = cs_m.detach().cpu().numpy()
+        
+        column_names = []
+        scores = []
+        for i, ct_pair in enumerate(gene_pairs_per_ct_pair_sig_ind.keys()):
+            gp_list = gene_pairs_per_ct_pair_sig_ind[ct_pair]
+            for gp in gp_list:
+                if np.all(adata.uns['ct_interacting_cell_results']['p']['gp']['cs'][i, :, gp] == 0):
+                    continue
+                column_names.append(f'{" - ".join(ct_pair)}: {concat_tuple_elements(gene_pairs_sig[gp])}')
+                scores.append(adata.uns['ct_interacting_cell_results']['p']['gp']['cs'][i, :, gp])
+
+        cs_gp_df = pd.DataFrame({column_names[i]: array for i, array in enumerate(scores)}, index=cells)
+        if used_ct_pairs_set < all_cell_types:
+            cs_gp_df = cs_gp_df.reindex(adata.obs_names, fill_value=0)
+        adata.obsm['ct_interacting_cell_results_p_gp_cs_df'] = cs_gp_df
+        
+        column_names = []
+        scores = []
+        for i, ct_pair in enumerate(ct_pair_to_metabolite_indices.keys()):
+            metab_list = ct_pair_to_metabolite_indices[ct_pair]
+            for metab in metab_list:
+                if np.all(adata.uns['ct_interacting_cell_results']['p']['m']['cs'][i, :, metab] == 0):
+                    continue
+                column_names.append(f'{" - ".join(ct_pair)}: {metabolites[metab]}')
+                scores.append(adata.uns['ct_interacting_cell_results']['p']['m']['cs'][i, :, metab])
+
+        cs_m_df = pd.DataFrame({column_names[i]: array for i, array in enumerate(scores)}, index=cells)
+        if used_ct_pairs_set < all_cell_types:
+            cs_m_df = cs_m_df.reindex(adata.obs_names, fill_value=0)
+        adata.obsm['ct_interacting_cell_results_p_m_cs_df'] = cs_m_df
+        
+        if verbose:
+            print("Parametric test finished.")
+
+        
+    if test in ["non-parametric", "both"]:
+
+        if verbose:
+            print("Running the non-parametric test...")
+        
+        adata.uns['ct_interacting_cell_results']['np'] = {
+            'gp': {},
+            'm': {}
+        }
+        
+        # Load counts
+        counts = counts_from_anndata(adata[cells, genes], layer_key_np_test, dense=True)
+        counts = torch.tensor(counts, dtype=torch.float64, device=device)
+        
+        # Prepare counts_1 and counts_2
+        counts_1 = []
+        counts_2 = []
+        for (idx1, idx2) in gene_pairs_sig_ind:
+            if isinstance(idx1, tuple):
+                c1 = counts[idx1, :].mean(dim=0) if mean == 'algebraic' else torch.exp(torch.log(counts[idx1, :] + 1e-8).mean(dim=0))
+            else:
+                c1 = counts[idx1, :]
+            if isinstance(idx2, tuple):
+                c2 = counts[idx2, :].mean(dim=0) if mean == 'algebraic' else torch.exp(torch.log(counts[idx2, :] + 1e-8).mean(dim=0))
+            else:
+                c2 = counts[idx2, :]
+            counts_1.append(c1)
+            counts_2.append(c2)
+
+        counts_1 = torch.stack(counts_1)
+        counts_2 = torch.stack(counts_2)
+        
+        if center_counts_for_np_test:
+            num_umi = counts.sum(dim=0)
+            counts_1 = standardize_counts(adata, counts_1, model, num_umi, sample_specific)
+            counts_2 = standardize_counts(adata, counts_2, model, num_umi, sample_specific)
+        
+        n_cells = counts_1.shape[1]
+        same_gene_mask = torch.tensor([g1 == g2 for g1, g2 in gene_pairs_sig], device=device)
+        
+        if center_counts_for_np_test and test == 'both':
+            adata.uns['ct_interacting_cell_results']['np']['gp']['cs'] = np.array(adata.uns['ct_interacting_cell_results']['p']['gp']['cs'])
+            adata.uns['ct_interacting_cell_results']['np']['m']['cs'] = np.array(adata.uns['ct_interacting_cell_results']['p']['m']['cs'])
+        else:
+            cs_gp = torch.zeros((len(cell_type_pairs), counts_1.shape[1], counts_1.shape[0]), device=counts_1.device)
+            for ct_pair in range(len(cell_type_pairs)):
+                W = weights_ct_pairs[ct_pair].coalesce()
+                WX2t = torch.sparse.mm(W, counts_2.T)
+                cs_gp[ct_pair] = counts_1.T * WX2t
+            adata.uns['ct_interacting_cell_results']['np']['gp']['cs'] = cs_gp.detach().cpu().numpy()
+            cs_m = compute_metabolite_cs_ct(cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_sig_ind, ct_specific_gene_pairs, interacting_cell_scores=True)
+            adata.uns['ct_interacting_cell_results']['np']['m']['cs'] = cs_m.detach().cpu().numpy()
+        
+        column_names = []
+        scores = []
+        for i, ct_pair in enumerate(gene_pairs_per_ct_pair_sig_ind.keys()):
+            gp_list = gene_pairs_per_ct_pair_sig_ind[ct_pair]
+            for gp in gp_list:
+                if np.all(adata.uns['ct_interacting_cell_results']['np']['gp']['cs'][i, :, gp] == 0):
+                    continue
+                column_names.append(f'{" - ".join(ct_pair)}: {concat_tuple_elements(gene_pairs_sig[gp])}')
+                scores.append(adata.uns['ct_interacting_cell_results']['np']['gp']['cs'][i, :, gp])
+
+        cs_gp_df = pd.DataFrame({column_names[i]: array for i, array in enumerate(scores)}, index=cells)
+        if used_ct_pairs_set < all_cell_types:
+            cs_gp_df = cs_gp_df.reindex(adata.obs_names, fill_value=0)
+        adata.obsm['ct_interacting_cell_results_np_gp_cs_df'] = cs_gp_df
+        
+        column_names = []
+        scores = []
+        for i, ct_pair in enumerate(ct_pair_to_metabolite_indices.keys()):
+            metab_list = ct_pair_to_metabolite_indices[ct_pair]
+            for metab in metab_list:
+                if np.all(adata.uns['ct_interacting_cell_results']['np']['m']['cs'][i, :, metab] == 0):
+                    continue
+                column_names.append(f'{" - ".join(ct_pair)}: {metabolites[metab]}')
+                scores.append(adata.uns['ct_interacting_cell_results']['np']['m']['cs'][i, :, metab])
+
+        cs_m_df = pd.DataFrame({column_names[i]: array for i, array in enumerate(scores)}, index=cells)
+        if used_ct_pairs_set < all_cell_types:
+            cs_m_df = cs_m_df.reindex(adata.obs_names, fill_value=0)
+        adata.obsm['ct_interacting_cell_results_np_m_cs_df'] = cs_m_df
+        
+        if verbose:
+            print("Non-parametric test finished.")
+            
+    if verbose:
+        print("Finished computing cell type-aware gene pair and metabolite scores in %.3f seconds" %(time.time()-start))
+    
+    return
+
+
+def compute_metabolite_cs(
+    cs_gp: torch.Tensor,
+    gene_pair_dict: dict,
+    interacting_cell_scores: bool = False
+) -> torch.Tensor:
+    """
+    Computes metabolite-level communication scores from gene-pair scores.
+
+    Parameters
+    ----------
+    cs_gp : torch.Tensor
+        - If interacting_cell_scores is False: shape (gene_pairs,)
+        - If interacting_cell_scores is True: shape (cells, gene_pairs)
+    gene_pair_dict : dict
+        Maps metabolite names to a list of indices (ints) referring to gene-pairs.
+    interacting_cell_scores : bool, optional
+        Whether cs_gp contains per-cell scores.
+
+    Returns
+    -------
+    cs_m : torch.Tensor
+        - If interacting_cell_scores is False: shape (num_metabolites,)
+        - If interacting_cell_scores is True: shape (cells, num_metabolites)
+    """
+    device = cs_gp.device
+    scores = []
+
+    for indices in gene_pair_dict.values():
+        idx_tensor = torch.tensor(indices, device=device, dtype=torch.long)
+        if interacting_cell_scores:
+            summed = cs_gp[:, idx_tensor].sum(dim=1)  # shape: (cells,)
+        else:
+            summed = cs_gp[idx_tensor].sum()          # scalar
+        scores.append(summed)
+
+    if interacting_cell_scores:
+        cs_m = torch.stack(scores, dim=1)  # shape: (cells, metabolites)
+    else:
+        cs_m = torch.stack(scores)        # shape: (metabolites,)
+    
+    return cs_m
+
+
+def compute_metabolite_cs_ct(cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_ind=None, ct_specific_gene_pairs=None, interacting_cell_scores=False):
+    if cell_type_key and ct_specific_gene_pairs:
+        for i, ct_pair in enumerate(gene_pairs_per_ct_pair_ind.keys()):
+            if i not in ct_specific_gene_pairs:
+                continue
+            mask_dim = 2 if interacting_cell_scores else 1
+            mask = np.ones(cs_gp.shape[mask_dim], dtype=bool)
+            mask[gene_pairs_per_ct_pair_ind[ct_pair]] = False
+            if interacting_cell_scores:
+                cs_gp[i, :, mask] = 0
+            else:
+                cs_gp[i, mask] = 0
+    
+    device = cs_gp.device
+    scores = []
+
+    for indices in gene_pair_dict.values():
+        idx_tensor = torch.tensor(indices, device=device, dtype=torch.long)
+        if interacting_cell_scores:
+            summed = cs_gp[:, :, idx_tensor].sum(dim=2)  # shape: (cells,)
+        else:
+            summed = cs_gp[:, idx_tensor].sum(dim=1)  # scalar
+        scores.append(summed)
+
+    if interacting_cell_scores:
+        cs_m = torch.stack(scores, dim=2)  # shape: (cells, metabolites)
+    else:
+        cs_m = torch.stack(scores, dim=1) 
+    
+    return cs_m
+
+
+def compute_metabolite_cs_old(cs_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_ind=None, ct_specific_gene_pairs=None, interacting_cell_scores=False):
     if cell_type_key and ct_specific_gene_pairs:
         for i, ct_pair in enumerate(gene_pairs_per_ct_pair_ind.keys()):
             if i not in ct_specific_gene_pairs:
@@ -1615,7 +2718,7 @@ def compute_int_CCC_scores(
     return scores
 
 
-def get_ct_pair_weights(weights, cell_type_pairs, cell_types, spatial):
+def get_ct_pair_weights(weights, cell_type_pairs, cell_types):
 
     w_nrow, w_ncol = weights.shape
     n_ct_pairs = len(cell_type_pairs)
@@ -1625,7 +2728,6 @@ def get_ct_pair_weights(weights, cell_type_pairs, cell_types, spatial):
         weights=weights,
         cell_type_pairs=cell_type_pairs,
         cell_types=cell_types,
-        spatial=spatial,
     )
     results = list(map(extract_weights_results, cell_type_pairs))
 
@@ -1639,7 +2741,7 @@ def get_ct_pair_weights(weights, cell_type_pairs, cell_types, spatial):
     return weights_ct_pairs
 
 
-def extract_ct_pair_weights(ct_pair, weights, cell_type_pairs, cell_types, spatial):
+def extract_ct_pair_weights(ct_pair, weights, cell_type_pairs, cell_types):
 
     i = cell_type_pairs.index(ct_pair)
 
@@ -1658,12 +2760,10 @@ def extract_ct_pair_weights(ct_pair, weights, cell_type_pairs, cell_types, spati
     w_col_coords = w_col_coords.ravel()
     w_new_coords = np.vstack((w_row_coords, w_col_coords))
 
-    if spatial:
-        w_matching_indices = np.where(np.all(np.isin(w_old_coords.T, w_new_coords.T), axis=1))[0]
-        w_new_data = weights.data[w_matching_indices]
-        w_new_coords = w_old_coords[:,w_matching_indices]
-    else:
-        w_new_data = np.full(n_ct_t * n_ct_u, 1/(n_ct_t * n_ct_u))
+    # w_matching_indices = np.where(np.all(np.isin(w_old_coords.T, w_new_coords.T), axis=1))[0]
+    w_matching_indices = (np.isin(w_old_coords[0], ct_t_mask_coords.flatten()) & np.isin(w_old_coords[1], ct_u_mask_coords.flatten()))
+    w_new_data = weights.data[w_matching_indices]
+    w_new_coords = w_old_coords[:,w_matching_indices]
 
     w_coord_3d = np.full(w_new_coords.shape[1], fill_value=i)
     w_new_coords_3d = np.vstack((w_coord_3d, w_new_coords))
@@ -1718,7 +2818,88 @@ def conditional_eg2_gp_score(counts, weights):
     return out_eg2s
 
 
-def compute_p_results(ct_pair, cell_type_pairs, cs_gp, cs_m, gene_pairs_ind, gene_pairs_ind_per_ct_pair, Wtot2, eg2s_gp, cell_type_key, gene_pair_dict):
+def compute_ct_p_results(C_gp, C_m, gene_pairs_per_ct_pair_ind, ct_specific_gene_pairs, EG2_gp, cell_type_key, gene_pair_dict):
+
+    EG2_gp = EG2_gp.unsqueeze(1).expand(-1, C_gp.shape[1]) if len(EG2_gp.shape) == 1 else EG2_gp
+    
+    stdG = torch.sqrt(EG2_gp)
+    stdG[stdG == 0] = 1
+    
+    Z_gp = C_gp / stdG
+
+    EG2_m = compute_metabolite_cs_ct(EG2_gp, cell_type_key, gene_pair_dict, gene_pairs_per_ct_pair_ind, ct_specific_gene_pairs, interacting_cell_scores=False)
+    if not isinstance(EG2_m, torch.Tensor):
+        device = EG2_gp.device
+        EG2_m = torch.tensor(EG2_m, device=device, dtype=torch.float64)
+
+    stdG_m = torch.sqrt(EG2_m)
+    stdG_m[stdG_m == 0] = 1
+
+    Z_m = C_m / stdG_m
+
+    return Z_gp, Z_m
+
+
+def compute_p_results(C_gp, C_m, gene_pairs_ind, Wtot2, eg2s_gp, gene_pair_dict):
+    
+    device = Wtot2.device
+    n_gp = len(gene_pairs_ind)
+
+    # Convert indices
+    same_gene_mask = torch.tensor([
+        (isinstance(g1, int) and isinstance(g2, int) and g1 == g2) or
+        (isinstance(g1, list) and isinstance(g2, list) and sorted(g1) == sorted(g2))
+        for g1, g2 in gene_pairs_ind
+    ], device=device)
+    
+    # Unpack second moments
+    EG2_a = eg2s_gp[0].clone()
+    EG2_b = eg2s_gp[1].clone()
+    EG2_a[same_gene_mask] = Wtot2
+    EG2_b[same_gene_mask] = Wtot2
+
+    stdG_a = torch.sqrt(EG2_a)
+    stdG_b = torch.sqrt(EG2_b)
+    stdG_a[stdG_a == 0] = 1
+    stdG_b[stdG_b == 0] = 1
+    
+    # Compute gene-pair Z-scores
+    if isinstance(C_gp, tuple):
+        C_gp_0, C_gp_1 = C_gp
+        z_0 = C_gp_0 / stdG_a
+        z_1 = C_gp_1 / stdG_b
+        mask = torch.abs(z_0) < torch.abs(z_1)
+        Z_gp = torch.where(mask, z_0, z_1)
+        EG2_gp = torch.where(mask, EG2_a, EG2_b)
+    else:
+        C_gp = C_gp
+        z_a = C_gp / stdG_a
+        z_b = C_gp / stdG_b
+        mask = torch.abs(z_a) < torch.abs(z_b)
+        Z_gp = torch.where(mask, z_a, z_b)
+        EG2_gp = torch.where(mask, EG2_a, EG2_b)
+
+    # Compute metabolite-level expected variance
+    EG2_m = compute_metabolite_cs(EG2_gp, gene_pair_dict, interacting_cell_scores=False)
+    if not isinstance(EG2_m, torch.Tensor):
+        EG2_m = torch.tensor(EG2_m, device=device, dtype=torch.float64)
+
+    stdG_m = torch.sqrt(EG2_m)
+    stdG_m[stdG_m == 0] = 1
+
+    # Compute metabolite Z-scores
+    if isinstance(C_m, tuple):
+        C_m_0, C_m_1 = C_m
+        z_0 = C_m_0 / stdG_m
+        z_1 = C_m_1 / stdG_m
+        Z_m = torch.where(torch.abs(z_0) < torch.abs(z_1), z_0, z_1)
+    else:
+        Z_m = C_m / stdG_m
+
+    return Z_gp, Z_m
+
+
+def compute_p_results_old(ct_pair, cell_type_pairs, cs_gp, cs_m, gene_pairs_ind, gene_pairs_ind_per_ct_pair, Wtot2, eg2s_gp, cell_type_key, gene_pair_dict):
     i = cell_type_pairs.index(ct_pair)
     gene_pair_cor_ct = (cs_gp[0][i, :], cs_gp[1][i, :]) if isinstance(cs_gp, tuple) else cs_gp[i, :]
     C_m = (cs_m[0][i, :], cs_m[1][i, :]) if isinstance(cs_m, tuple) else cs_m[i, :]
@@ -1761,8 +2942,8 @@ def compute_p_results(ct_pair, cell_type_pairs, cs_gp, cs_m, gene_pairs_ind, gen
         Z_gp_a = [(C_gp[i] - EG[i]) / stdG_a[i] for i in range(len(gene_pairs_ind_ct_pair))]
         Z_gp_b = [(C_gp[i] - EG[i]) / stdG_b[i] for i in range(len(gene_pairs_ind_ct_pair))]
     
-    EG2_m_a = compute_metabolite_cs(np.array(EG2_a), cell_type_key=None, gene_pair_dict=gene_pair_dict, interacting_cell_scores=False)
-    EG2_m_b = compute_metabolite_cs(np.array(EG2_b), cell_type_key=None, gene_pair_dict=gene_pair_dict, interacting_cell_scores=False)
+    EG2_m_a = compute_metabolite_cs_old(np.array(EG2_a), cell_type_key=None, gene_pair_dict=gene_pair_dict, interacting_cell_scores=False)
+    EG2_m_b = compute_metabolite_cs_old(np.array(EG2_b), cell_type_key=None, gene_pair_dict=gene_pair_dict, interacting_cell_scores=False)
 
     # Metabolites
 
@@ -1782,54 +2963,6 @@ def compute_p_results(ct_pair, cell_type_pairs, cs_gp, cs_m, gene_pairs_ind, gen
         Z_m_b = [(C_m[i] - EG[i]) / stdG_b[i] for i in range(len(gene_pair_dict.keys()))]
 
     return (C_gp, Z_gp_a, Z_gp_b, C_m, Z_m_a, Z_m_b)
-
-
-def compute_p_results_no_ct(C_gp, C_m, gene_pairs_ind, Wtot2, eg2s_gp, cell_type_key, gene_pair_dict):
-
-    EG2_a = []
-    EG2_b = []
-    for i, gene_pair_ind in enumerate(gene_pairs_ind):
-        g1_ind, g2_ind = gene_pair_ind
-        if g1_ind == g2_ind:
-            eg2_a = eg2_b = Wtot2
-        else:
-            eg2_a = eg2s_gp[0][i]
-            eg2_b = eg2s_gp[1][i]
-        EG2_a.append(eg2_a)
-        EG2_b.append(eg2_b)
-        
-    # Gene pairs
-
-    EG = [0 for i in range(len(gene_pairs_ind))]
-
-    stdG_a = [(EG2_a[i] - EG[i] ** 2) ** 0.5 for i in range(len(gene_pairs_ind))]
-    stdG_a = [1 if stdG_a[i] == 0 else stdG_a[i] for i in range(len(stdG_a))]
-
-    stdG_b = [(EG2_b[i] - EG[i] ** 2) ** 0.5 for i in range(len(gene_pairs_ind))]
-    stdG_b = [1 if stdG_b[i] == 0 else stdG_b[i] for i in range(len(stdG_b))]
-
-    if isinstance(C_gp, tuple):
-        Z_gp = [(C_gp[0][i] - EG[i]) / stdG_a[i] if np.abs((C_gp[0][i] - EG[i]) / stdG_a[i]) < np.abs((C_gp[1][i] - EG[i]) / stdG_b[i]) else (C_gp[1][i] - EG[i]) / stdG_b[i] for i in range(len(gene_pairs_ind))]
-        EG2_gp = [EG2_a[i] if np.abs((C_gp[0][i] - EG[i]) / stdG_a[i]) < np.abs((C_gp[1][i] - EG[i]) / stdG_b[i]) else EG2_b[i] for i in range(len(gene_pairs_ind))]
-    else:
-        Z_gp = [(C_gp[i] - EG[i]) / stdG_a[i] if np.abs((C_gp[i] - EG[i]) / stdG_a[i]) < np.abs((C_gp[i] - EG[i]) / stdG_b[i]) else (C_gp[i] - EG[i]) / stdG_b[i] for i in range(len(gene_pairs_ind))]
-        EG2_gp = [EG2_a[i] if np.abs((C_gp[i] - EG[i]) / stdG_a[i]) < np.abs((C_gp[i] - EG[i]) / stdG_b[i]) else EG2_b[i] for i in range(len(gene_pairs_ind))]
-    
-    EG2_m = compute_metabolite_cs(np.array(EG2_gp), cell_type_key, gene_pair_dict, interacting_cell_scores=False)
-    
-    # Metabolites
-
-    EG = [0 for i in range(len(gene_pair_dict.keys()))]
-
-    stdG = [(EG2_m[i] - EG[i] ** 2) ** 0.5 for i in range(len(gene_pair_dict.keys()))]
-    stdG = [1 if stdG[i] == 0 else stdG[i] for i in range(len(stdG))]
-
-    if isinstance(C_m, tuple):
-        Z_m = [(C_m[0][i] - EG[i]) / stdG[i] if np.abs((C_m[0][i] - EG[i]) / stdG[i]) < np.abs((C_m[1][i] - EG[i]) / stdG[i]) else (C_m[1][i] - EG[i]) / stdG[i] for i in range(len(gene_pair_dict.keys()))]
-    else:
-        Z_m = [(C_m[i] - EG[i]) / stdG[i] for i in range(len(gene_pair_dict.keys()))]
-
-    return (Z_gp, Z_m)
 
 
 def compute_p_int_cell_results(ct_pair, cell_type_pairs, cs_gp, cs_m, gene_pairs_ind, gene_pairs_ind_per_ct_pair, Wtot2, eg2s_gp, cell_type_key, gene_pair_dict):
@@ -1888,47 +3021,61 @@ def compute_p_int_cell_results(ct_pair, cell_type_pairs, cs_gp, cs_m, gene_pairs
     return (C_gp, Z_gp, C_m, Z_m)
 
 
-def compute_p_int_cell_results_no_ct(C_gp, C_m, gene_pairs_ind, Wtot2, eg2s_gp, cell_type_key, gene_pair_dict):
-
-    EG2_a = []
-    EG2_b = []
-    for gene_pair_ind in gene_pairs_ind:
-        g1_ind, g2_ind = gene_pair_ind
-        if g1_ind == g2_ind:
-            eg2_a = eg2_b = Wtot2
-        else:
-            eg2_a = eg2s_gp[:, g1_ind] if type(g1_ind) is not list else np.max(eg2s_gp[:, g1_ind], axis=1)
-            eg2_b = eg2s_gp[:, g2_ind] if type(g2_ind) is not list else np.max(eg2s_gp[:, g2_ind], axis=1)
-        EG2_a.append(eg2_a)
-        EG2_b.append(eg2_b)
-
-    EG2_a = np.column_stack(EG2_a)
-    EG2_b = np.column_stack(EG2_b)
+def compute_p_int_cell_results_no_ct(C_gp, C_m, gene_pairs_ind, Wtot2, eg2s_gp, gene_pair_dict):
     
-    # Gene pairs
+    device = Wtot2.device
+    n_gp = len(gene_pairs_ind)
 
-    EG = np.zeros(C_gp.shape)
+    # Convert indices
+    same_gene_mask = torch.tensor([
+        (isinstance(g1, int) and isinstance(g2, int) and g1 == g2) or
+        (isinstance(g1, list) and isinstance(g2, list) and sorted(g1) == sorted(g2))
+        for g1, g2 in gene_pairs_ind
+    ], device=device)
+    
+    # Unpack second moments
+    EG2_a = eg2s_gp[0].clone()
+    EG2_b = eg2s_gp[1].clone()
+    EG2_a[:, same_gene_mask] = Wtot2
+    EG2_b[:, same_gene_mask] = Wtot2
 
-    stdG_a = (EG2_a - EG ** 2) ** 0.5
+    stdG_a = torch.sqrt(EG2_a)
+    stdG_b = torch.sqrt(EG2_b)
     stdG_a[stdG_a == 0] = 1
-
-    stdG_b = (EG2_b - EG ** 2) ** 0.5
     stdG_b[stdG_b == 0] = 1
-
-    Z_gp = np.where(np.abs((C_gp - EG) / stdG_a) < np.abs((C_gp - EG) / stdG_b), (C_gp - EG) / stdG_a, (C_gp - EG) / stdG_b)
-
-    EG2_gp = np.where(np.abs((C_gp - EG) / stdG_a) < np.abs((C_gp - EG) / stdG_b), EG2_a, EG2_b)
     
-    EG2_m = compute_metabolite_cs(EG2_gp, cell_type_key, gene_pair_dict, interacting_cell_scores=True)
-    
-    # Metabolites
+    # Compute gene-pair Z-scores
+    if isinstance(C_gp, tuple):
+        C_gp_0, C_gp_1 = C_gp
+        z_0 = C_gp_0 / stdG_a
+        z_1 = C_gp_1 / stdG_b
+        mask = torch.abs(z_0) < torch.abs(z_1)
+        Z_gp = torch.where(mask, z_0, z_1)
+        EG2_gp = torch.where(mask, EG2_a, EG2_b)
+    else:
+        C_gp = C_gp
+        z_a = C_gp / stdG_a
+        z_b = C_gp / stdG_b
+        mask = torch.abs(z_a) < torch.abs(z_b)
+        Z_gp = torch.where(mask, z_a, z_b)
+        EG2_gp = torch.where(mask, EG2_a, EG2_b)
 
-    EG = np.zeros(C_m.shape)
+    # Compute metabolite-level expected variance
+    EG2_m = compute_metabolite_cs(EG2_gp, gene_pair_dict, interacting_cell_scores=True)
+    if not isinstance(EG2_m, torch.Tensor):
+        EG2_m = torch.tensor(EG2_m, device=device, dtype=torch.float64)
 
-    stdG = (EG2_m - EG ** 2) ** 0.5
-    stdG[stdG == 0] = 1
+    stdG_m = torch.sqrt(EG2_m)
+    stdG_m[stdG_m == 0] = 1
 
-    Z_m = (C_m - EG) / stdG
+    # Compute metabolite Z-scores
+    if isinstance(C_m, tuple):
+        C_m_0, C_m_1 = C_m
+        z_0 = C_m_0 / stdG_m
+        z_1 = C_m_1 / stdG_m
+        Z_m = torch.where(torch.abs(z_0) < torch.abs(z_1), z_0, z_1)
+    else:
+        Z_m = C_m / stdG_m
 
     return (Z_gp, Z_m)
 
@@ -1969,7 +3116,118 @@ def compute_np_results(ct_pair, cell_type_pairs, cs_gp, cs_m, pvals_gp, pvals_m,
     return (C_gp, p_values_gp_a, p_values_gp_b, C_m, p_values_m_a, p_values_m_a)
 
 
-def get_cell_communication_results(
+def get_ct_cell_communication_results(
+    adata, 
+    genes,
+    cells,
+    layer_key_p_test,
+    layer_key_np_test,
+    model, 
+    cell_types, 
+    cell_type_pairs,
+    D,
+    test,
+    device,
+):
+    
+    gene_pairs_ind_per_ct_pair = adata.uns['gene_pairs_ind_per_ct_pair']
+    gene_pair_dict = adata.uns["gene_pair_dict"]
+    genes = adata.uns["genes"]
+    
+    sample_specific = 'sample_key' in adata.uns
+    
+    if isinstance(D, np.ndarray):
+        D = torch.tensor(D, dtype=torch.float64, device=device)
+    
+    def idx_to_gene(idx):
+        return [genes[i] for i in idx] if isinstance(idx, list) else genes[idx]
+
+    records = [
+        {
+            "Cell Type 1": ct1,
+            "Cell Type 2": ct2,
+            "Gene 1": idx_to_gene(gp[0]),
+            "Gene 2": idx_to_gene(gp[1]),
+        }
+        for (ct1, ct2), gp_list in gene_pairs_ind_per_ct_pair.items()
+        for gp in gp_list
+    ]
+    cell_com_df_gp = pd.DataFrame.from_records(records)
+
+    # Generate metabolite interaction table
+    ct_pairs = list(gene_pairs_ind_per_ct_pair.keys())
+    metabolites = list(gene_pair_dict.keys())
+    cell_com_df_m = pd.DataFrame([
+        {"Cell Type 1": ct1, "Cell Type 2": ct2, "metabolite": m}
+        for (ct1, ct2), m in itertools.product(ct_pairs, metabolites)
+    ])
+
+    if test in ["parametric", "both"]:
+        suffix = "p"
+        # Gene pair
+        c_values = adata.uns['ct_ccc_results'][suffix]['gp']['cs']
+        z_values = adata.uns['ct_ccc_results'][suffix]['gp']['Z']
+        p_values = adata.uns['ct_ccc_results'][suffix]['gp']['Z_pval']
+        fdr_values = adata.uns['ct_ccc_results'][suffix]['gp']['Z_FDR']
+        cell_com_df_gp[f'C_{suffix}'] = c_values.flatten()
+        cell_com_df_gp['Z'] = z_values.flatten()
+        cell_com_df_gp['Z_pval'] = p_values.flatten()
+        cell_com_df_gp['Z_FDR'] = fdr_values.flatten()
+        
+        counts = counts_from_anndata(adata[:, genes], layer_key_p_test, dense=True)
+        counts = torch.tensor(counts, dtype=torch.float64, device=device)
+        num_umi = counts.sum(dim=0)
+        counts_std = standardize_ct_counts(adata, counts, model, num_umi, sample_specific, cell_types)
+
+        c_values_norm = normalize_ct_values(counts_std, cell_types, cell_type_pairs, gene_pairs_ind_per_ct_pair, c_values, D)
+        adata.uns['ct_ccc_results'][suffix]['gp']['cs_norm'] = c_values_norm.cpu().numpy()
+        cell_com_df_gp[f'C_norm_{suffix}'] = c_values_norm.cpu().numpy().flatten()
+        
+        # Metabolite
+        c_values = adata.uns['ct_ccc_results'][suffix]['m']['cs']
+        z_values = adata.uns['ct_ccc_results'][suffix]['m']['Z']
+        p_values = adata.uns['ct_ccc_results'][suffix]['m']['Z_pval']
+        fdr_values = adata.uns['ct_ccc_results'][suffix]['m']['Z_FDR']
+        cell_com_df_m[f'C_{suffix}'] = c_values.flatten()
+        cell_com_df_m['Z'] = z_values.flatten()
+        cell_com_df_m['Z_pval'] = p_values.flatten()
+        cell_com_df_m['Z_FDR'] = fdr_values.flatten()
+
+    if test in ["non-parametric", "both"]:
+        suffix = "np"
+        # Gene pair
+        c_values = adata.uns['ct_ccc_results'][suffix]['gp']['cs']
+        p_values = adata.uns['ct_ccc_results'][suffix]['gp']['pval']
+        fdr_values = adata.uns['ct_ccc_results'][suffix]['gp']['FDR']
+        cell_com_df_gp[f'C_{suffix}'] = c_values.flatten()
+        cell_com_df_gp[f'pval_{suffix}'] = p_values.flatten()
+        cell_com_df_gp[f'FDR_{suffix}'] = fdr_values.flatten()
+        
+        counts = counts_from_anndata(adata[:, genes], layer_key_np_test, dense=True)
+        counts = torch.tensor(counts, dtype=torch.float64, device=device)
+        if adata.uns.get('center_counts_for_np_test', False):
+            num_umi = counts.sum(dim=0)
+            counts = standardize_ct_counts(adata, counts, model, num_umi, sample_specific, cell_types)
+        
+        c_values_norm = normalize_ct_values(counts, cell_types, cell_type_pairs, gene_pairs_ind_per_ct_pair, c_values, D)
+        adata.uns['ct_ccc_results'][suffix]['gp']['cs_norm'] = c_values_norm.cpu().numpy()
+        cell_com_df_gp[f'C_norm_{suffix}'] = c_values_norm.cpu().numpy().flatten()
+
+        # Metabolite
+        c_values = adata.uns['ct_ccc_results'][suffix]['m']['cs']
+        p_values = adata.uns['ct_ccc_results'][suffix]['m']['pval']
+        fdr_values = adata.uns['ct_ccc_results'][suffix]['m']['FDR']
+        cell_com_df_m[f'C_{suffix}'] = c_values.flatten()
+        cell_com_df_m[f'pval_{suffix}'] = p_values.flatten()
+        cell_com_df_m[f'FDR_{suffix}'] = fdr_values.flatten()
+
+    adata.uns['ct_ccc_results']['cell_com_df_gp'] = cell_com_df_gp
+    adata.uns['ct_ccc_results']['cell_com_df_m'] = cell_com_df_m
+    
+    return
+
+
+def get_cell_communication_results_old(
     adata, 
     genes,
     cells,
@@ -2008,19 +3266,19 @@ def get_cell_communication_results(
 
     if test in ["parametric", "both"]:
         # Gene pair
-        c_values = adata.uns['ccc_results']['p']['gp']['cs']
+        c_values = adata.uns['ct_ccc_results']['p']['gp']['cs']
         cell_com_df_gp['C_p'] = c_values.flatten()
-        z_values_a = adata.uns['ccc_results']['p']['gp']['Z_a']
+        z_values_a = adata.uns['ct_ccc_results']['p']['gp']['Z_a']
         cell_com_df_gp['Z_a'] = z_values_a.flatten()
-        z_values_b = adata.uns['ccc_results']['p']['gp']['Z_b']
+        z_values_b = adata.uns['ct_ccc_results']['p']['gp']['Z_b']
         cell_com_df_gp['Z_b'] = z_values_b.flatten()
-        p_values_a = adata.uns['ccc_results']['p']['gp']['Z_pval_a']
+        p_values_a = adata.uns['ct_ccc_results']['p']['gp']['Z_pval_a']
         cell_com_df_gp['Z_pval_a'] = p_values_a.flatten()
-        p_values_b = adata.uns['ccc_results']['p']['gp']['Z_pval_b']
+        p_values_b = adata.uns['ct_ccc_results']['p']['gp']['Z_pval_b']
         cell_com_df_gp['Z_pval_b'] = p_values_b.flatten()
-        FDR_values_a = adata.uns['ccc_results']['p']['gp']['Z_FDR_a']
+        FDR_values_a = adata.uns['ct_ccc_results']['p']['gp']['Z_FDR_a']
         cell_com_df_gp['Z_FDR_a'] = FDR_values_a.flatten()
-        FDR_values_b = adata.uns['ccc_results']['p']['gp']['Z_FDR_b']
+        FDR_values_b = adata.uns['ct_ccc_results']['p']['gp']['Z_FDR_b']
         cell_com_df_gp['Z_FDR_b'] = FDR_values_b.flatten()
 
         counts = counts_from_anndata(adata[cells, genes], layer_key_p_test, dense=True)
@@ -2028,37 +3286,37 @@ def get_cell_communication_results(
         counts_std = counts_std = create_centered_counts_ct(counts, model, num_umi, cell_types)
         counts_std = np.nan_to_num(counts_std)
 
-        c_values_norm = normalize_values(counts_std, cell_types, cell_type_pairs, gene_pairs_ind_per_ct_pair, c_values, D)
-        adata.uns['ccc_results']['p']['gp']['cs_norm'] = c_values_norm
+        c_values_norm = normalize_values_old(counts_std, cell_types, cell_type_pairs, gene_pairs_ind_per_ct_pair, c_values, D)
+        adata.uns['ct_ccc_results']['p']['gp']['cs_norm'] = c_values_norm
         cell_com_df_gp['C_norm_p'] = c_values_norm.flatten()
         
         # Metabolite
-        c_values = adata.uns['ccc_results']['p']['m']['cs']
+        c_values = adata.uns['ct_ccc_results']['p']['m']['cs']
         cell_com_df_m['C_p'] = c_values.flatten()
-        z_values_a = adata.uns['ccc_results']['p']['m']['Z_a']
+        z_values_a = adata.uns['ct_ccc_results']['p']['m']['Z_a']
         cell_com_df_m['Z_a'] = z_values_a.flatten()
-        z_values_b = adata.uns['ccc_results']['p']['m']['Z_b']
+        z_values_b = adata.uns['ct_ccc_results']['p']['m']['Z_b']
         cell_com_df_m['Z_b'] = z_values_b.flatten()
-        p_values_a = adata.uns['ccc_results']['p']['m']['Z_pval_a']
+        p_values_a = adata.uns['ct_ccc_results']['p']['m']['Z_pval_a']
         cell_com_df_m['Z_pval_a'] = p_values_a.flatten()
-        p_values_b = adata.uns['ccc_results']['p']['m']['Z_pval_b']
+        p_values_b = adata.uns['ct_ccc_results']['p']['m']['Z_pval_b']
         cell_com_df_m['Z_pval_b'] = p_values_b.flatten()
-        FDR_values_a = adata.uns['ccc_results']['p']['m']['Z_FDR_a']
+        FDR_values_a = adata.uns['ct_ccc_results']['p']['m']['Z_FDR_a']
         cell_com_df_m['Z_FDR_a'] = FDR_values_a.flatten()
-        FDR_values_b = adata.uns['ccc_results']['p']['m']['Z_FDR_b']
+        FDR_values_b = adata.uns['ct_ccc_results']['p']['m']['Z_FDR_b']
         cell_com_df_m['Z_FDR_b'] = FDR_values_b.flatten()
 
     if test in ["non-parametric", "both"]:
         # Gene pair
-        c_values = adata.uns['ccc_results']['np']['gp']['cs']
+        c_values = adata.uns['ct_ccc_results']['np']['gp']['cs']
         cell_com_df_gp['C_np'] = c_values.flatten()
-        p_values_a = adata.uns['ccc_results']['np']['gp']['pval_a']
+        p_values_a = adata.uns['ct_ccc_results']['np']['gp']['pval_a']
         cell_com_df_gp['pval_np_a'] = p_values_a.flatten()
-        p_values_b = adata.uns['ccc_results']['np']['gp']['pval_b']
+        p_values_b = adata.uns['ct_ccc_results']['np']['gp']['pval_b']
         cell_com_df_gp['pval_np_b'] = p_values_b.flatten()
-        FDR_values_a = adata.uns['ccc_results']['np']['gp']['FDR_a']
+        FDR_values_a = adata.uns['ct_ccc_results']['np']['gp']['FDR_a']
         cell_com_df_gp['FDR_np_a'] = FDR_values_a.flatten()
-        FDR_values_b = adata.uns['ccc_results']['np']['gp']['FDR_b']
+        FDR_values_b = adata.uns['ct_ccc_results']['np']['gp']['FDR_b']
         cell_com_df_gp['FDR_np_b'] = FDR_values_b.flatten()
 
         counts = counts_from_anndata(adata[:, genes], layer_key_np_test, dense=True)
@@ -2066,29 +3324,29 @@ def get_cell_communication_results(
             num_umi = counts.sum(axis=0)
             counts = create_centered_counts(counts, model, num_umi)
             counts = np.nan_to_num(counts)
-        c_values_norm = normalize_values(counts, cell_types, cell_type_pairs, gene_pairs_ind_per_ct_pair, c_values, D)
-        adata.uns['ccc_results']['np']['gp']['cs_norm'] = c_values_norm
+        c_values_norm = normalize_values_old(counts, cell_types, cell_type_pairs, gene_pairs_ind_per_ct_pair, c_values, D)
+        adata.uns['ct_ccc_results']['np']['gp']['cs_norm'] = c_values_norm
         cell_com_df_gp['C_norm_np'] = c_values_norm.flatten()
 
         # Metabolite
-        c_values = adata.uns['ccc_results']['np']['m']['cs']
+        c_values = adata.uns['ct_ccc_results']['np']['m']['cs']
         cell_com_df_m['C_np'] = c_values.flatten()
-        p_values_a = adata.uns['ccc_results']['np']['m']['pval_a']
+        p_values_a = adata.uns['ct_ccc_results']['np']['m']['pval_a']
         cell_com_df_m['pval_np_a'] = p_values_a.flatten()
-        p_values_b = adata.uns['ccc_results']['np']['m']['pval_b']
+        p_values_b = adata.uns['ct_ccc_results']['np']['m']['pval_b']
         cell_com_df_m['pval_np_b'] = p_values_b.flatten()
-        FDR_values_a = adata.uns['ccc_results']['np']['m']['FDR_a']
+        FDR_values_a = adata.uns['ct_ccc_results']['np']['m']['FDR_a']
         cell_com_df_m['FDR_np_a'] = FDR_values_a.flatten()
-        FDR_values_b = adata.uns['ccc_results']['np']['m']['FDR_b']
+        FDR_values_b = adata.uns['ct_ccc_results']['np']['m']['FDR_b']
         cell_com_df_m['FDR_np_b'] = FDR_values_b.flatten()
 
-    adata.uns['ccc_results']['cell_com_df_gp'] = cell_com_df_gp
-    adata.uns['ccc_results']['cell_com_df_m'] = cell_com_df_m
+    adata.uns['ct_ccc_results']['cell_com_df_gp'] = cell_com_df_gp
+    adata.uns['ct_ccc_results']['cell_com_df_m'] = cell_com_df_m
     
     return
 
 
-def get_cell_communication_results_no_ct(
+def get_cell_communication_results(
     adata, 
     genes,
     layer_key_p_test,
@@ -2096,74 +3354,80 @@ def get_cell_communication_results_no_ct(
     model,
     D,
     test,
+    device,
 ):
     
     gene_pairs = adata.uns['gene_pairs']
     gene_pairs_ind = adata.uns['gene_pairs_ind']
     gene_pair_dict = adata.uns["gene_pair_dict"]
 
-    cell_com_df_gp = pd.DataFrame(gene_pairs)
-    cell_com_df_gp = cell_com_df_gp.rename(columns={0: "Gene 1", 1: "Gene 2"})
+    sample_specific = 'sample_key' in adata.uns
     
-    cell_com_df_m = pd.DataFrame(gene_pair_dict.keys())
-    cell_com_df_m = cell_com_df_m.rename(columns={0: "Metabolite"})
+    if isinstance(D, np.ndarray):
+        D = torch.tensor(D, dtype=torch.float64, device=device)
+    
+    # Initialize dataframes
+    cell_com_df_gp = pd.DataFrame(gene_pairs, columns=["Gene 1", "Gene 2"])
+    cell_com_df_m = pd.DataFrame({"Metabolite": list(gene_pair_dict.keys())})
 
     if test in ["parametric", "both"]:
+        suffix = "p"
         # Gene pair
-        c_values = adata.uns['ccc_results']['p']['gp']['cs']
-        cell_com_df_gp['C_p'] = c_values
-        z_values = adata.uns['ccc_results']['p']['gp']['Z']
+        c_values = adata.uns['ccc_results'][suffix]['gp']['cs']
+        z_values = adata.uns['ccc_results'][suffix]['gp']['Z']
+        p_values = adata.uns['ccc_results'][suffix]['gp']['Z_pval']
+        fdr_values = adata.uns['ccc_results'][suffix]['gp']['Z_FDR']
+        cell_com_df_gp[f'C_{suffix}'] = c_values
         cell_com_df_gp['Z'] = z_values
-        p_values = adata.uns['ccc_results']['p']['gp']['Z_pval']
         cell_com_df_gp['Z_pval'] = p_values
-        FDR_values = adata.uns['ccc_results']['p']['gp']['Z_FDR']
-        cell_com_df_gp['Z_FDR'] = FDR_values
+        cell_com_df_gp['Z_FDR'] = fdr_values
 
         counts = counts_from_anndata(adata[:, genes], layer_key_p_test, dense=True)
-        num_umi = counts.sum(axis=0)
-        counts_std = create_centered_counts(counts, model, num_umi)
-        counts_std = np.nan_to_num(counts_std)
-
-        c_values_norm = normalize_values_no_ct(counts_std, gene_pairs_ind, c_values, D)
-        adata.uns['ccc_results']['p']['gp']['cs_norm'] = c_values_norm
-        cell_com_df_gp['C_norm_p'] = c_values_norm
+        counts = torch.tensor(counts, dtype=torch.float64, device=device)
+        num_umi = counts.sum(dim=0)
+        counts_std = standardize_counts(adata, counts, model, num_umi, sample_specific)
         
+        c_values_norm = normalize_values(counts_std, gene_pairs_ind, c_values, D)
+        adata.uns['ccc_results'][suffix]['gp']['cs_norm'] = c_values_norm.cpu().numpy()
+        cell_com_df_gp[f'C_norm_{suffix}'] = c_values_norm.cpu().numpy()
+
         # Metabolite
-        c_values = adata.uns['ccc_results']['p']['m']['cs']
-        cell_com_df_m['C_p'] = c_values
-        z_values = adata.uns['ccc_results']['p']['m']['Z']
+        c_values = adata.uns['ccc_results'][suffix]['m']['cs']
+        z_values = adata.uns['ccc_results'][suffix]['m']['Z']
+        p_values = adata.uns['ccc_results'][suffix]['m']['Z_pval']
+        fdr_values = adata.uns['ccc_results'][suffix]['m']['Z_FDR']
+        cell_com_df_m[f'C_{suffix}'] = c_values
         cell_com_df_m['Z'] = z_values
-        p_values = adata.uns['ccc_results']['p']['m']['Z_pval']
         cell_com_df_m['Z_pval'] = p_values
-        FDR_values = adata.uns['ccc_results']['p']['m']['Z_FDR']
-        cell_com_df_m['Z_FDR'] = FDR_values
+        cell_com_df_m['Z_FDR'] = fdr_values
 
     if test in ["non-parametric", "both"]:
+        suffix = "np"
         # Gene pair
-        c_values = adata.uns['ccc_results']['np']['gp']['cs']
-        cell_com_df_gp['C_np'] = c_values
-        p_values = adata.uns['ccc_results']['np']['gp']['pval']
-        cell_com_df_gp['pval_np'] = p_values
-        FDR_values = adata.uns['ccc_results']['np']['gp']['FDR']
-        cell_com_df_gp['FDR_np'] = FDR_values
+        c_values = adata.uns['ccc_results'][suffix]['gp']['cs']
+        p_values = adata.uns['ccc_results'][suffix]['gp']['pval']
+        fdr_values = adata.uns['ccc_results'][suffix]['gp']['FDR']
+        cell_com_df_gp[f'C_{suffix}'] = c_values
+        cell_com_df_gp[f'pval_{suffix}'] = p_values
+        cell_com_df_gp[f'FDR_{suffix}'] = fdr_values
 
         counts = counts_from_anndata(adata[:, genes], layer_key_np_test, dense=True)
-        if adata.uns['center_counts_for_np_test']:
-            num_umi = counts.sum(axis=0)
-            counts = create_centered_counts(counts, model, num_umi)
-            counts = np.nan_to_num(counts)
+        counts = torch.tensor(counts, dtype=torch.float64, device=device)
+        if adata.uns.get('center_counts_for_np_test', False):
+            num_umi = counts.sum(dim=0)
+            counts = standardize_counts(adata, counts, model, num_umi, sample_specific)
         
-        c_values_norm = normalize_values_no_ct(counts, gene_pairs_ind, c_values, D)
-        adata.uns['ccc_results']['np']['gp']['cs_norm'] = c_values_norm
-        cell_com_df_gp['C_norm_np'] = c_values_norm
+        c_values_norm = normalize_values(counts, gene_pairs_ind, c_values, D)
+        adata.uns['ccc_results'][suffix]['gp']['cs_norm'] = c_values_norm.cpu().numpy()
+        cell_com_df_gp[f'C_norm_{suffix}'] = c_values_norm.cpu().numpy()
         
         # Metabolite
-        c_values = adata.uns['ccc_results']['np']['m']['cs']
-        cell_com_df_m['C_np'] = c_values
-        p_values = adata.uns['ccc_results']['np']['m']['pval']
-        cell_com_df_m['pval_np'] = p_values
-        FDR_values = adata.uns['ccc_results']['np']['m']['FDR']
-        cell_com_df_m['FDR_np'] = FDR_values
+        c_values = adata.uns['ccc_results'][suffix]['m']['cs']
+        p_values = adata.uns['ccc_results'][suffix]['m']['pval']
+        fdr_values = adata.uns['ccc_results'][suffix]['m']['FDR']
+        cell_com_df_m[f'C_{suffix}'] = c_values
+        cell_com_df_m[f'pval_{suffix}'] = p_values
+        cell_com_df_m[f'FDR_{suffix}'] = fdr_values
 
     adata.uns['ccc_results']['cell_com_df_gp'] = cell_com_df_gp
     adata.uns['ccc_results']['cell_com_df_m'] = cell_com_df_m
@@ -2171,7 +3435,58 @@ def get_cell_communication_results_no_ct(
     return
 
 
-def normalize_values(
+def normalize_ct_values(
+    counts,
+    cell_types,
+    cell_type_pairs,
+    gene_pairs_per_ct_pair_ind,
+    lcs,
+    D,
+):
+    
+    if isinstance(cell_types, pd.Series):
+        cell_types = cell_types.values
+    
+    if isinstance(lcs, np.ndarray):
+        lcs = torch.tensor(lcs, dtype=counts.dtype, device=counts.device)
+
+    c_values_norm = torch.empty_like(lcs, dtype=counts.dtype, device=counts.device)
+
+    for i, ct_pair in enumerate(cell_type_pairs):
+        ct_t, _ = ct_pair
+
+        ct_mask = (cell_types == ct_t)
+        if isinstance(ct_mask, np.ndarray):
+            ct_mask = torch.tensor(ct_mask, device=counts.device)
+
+        counts_ct = counts[:, ct_mask]
+        D_ct = D[i][ct_mask]
+        gene_pairs_ind = gene_pairs_per_ct_pair_ind[ct_pair]
+
+        lc_maxs = compute_max_cs(D_ct, counts_ct, gene_pairs_ind)
+        lc_maxs = torch.where(lc_maxs == 0, torch.tensor(1.0, device=counts.device), lc_maxs)
+
+        c_values = lcs[i] if lcs.ndim == 2 else lcs[i:i+1]  # allow 1D or 2D lcs
+        c_values_norm[i] = c_values / lc_maxs
+        c_values_norm[i] = torch.where(torch.isinf(c_values_norm[i]), torch.tensor(1.0, device=counts.device), c_values_norm[i])
+    
+    return c_values_norm
+
+
+def normalize_values(counts, gene_pairs_ind, lcs, D):
+    """
+    Normalize communication scores (lcs) using maximum possible score estimates.
+    """
+    lc_maxs = compute_max_cs(D, counts, gene_pairs_ind)
+    lc_maxs = torch.where(lc_maxs == 0, torch.tensor(1.0, device=lc_maxs.device), lc_maxs)
+    if isinstance(lcs, np.ndarray):
+        lcs = torch.tensor(lcs, dtype=lc_maxs.dtype, device=lc_maxs.device)
+    c_values_norm = lcs / lc_maxs
+    c_values_norm = torch.where(torch.isinf(c_values_norm), torch.tensor(1.0, device=c_values_norm.device), c_values_norm)
+    return c_values_norm
+
+
+def normalize_values_old(
     counts,
     cell_types,
     cell_type_pairs,
@@ -2189,7 +3504,7 @@ def normalize_values(
         counts_ct_t = counts[:,cell_type_t_mask]
         D_ct_t = D[i][cell_type_t_mask]
         gene_pairs_ind = gene_pairs_per_ct_pair_ind[ct_pair]
-        lc_maxs = compute_max_cs(D_ct_t, counts_ct_t, gene_pairs_ind)
+        lc_maxs = compute_max_cs_old(D_ct_t, counts_ct_t, gene_pairs_ind)
         lc_maxs[lc_maxs == 0] = 1
         c_values_norm[i] = lcs[i] / lc_maxs
         c_values_norm[i][np.isinf(c_values_norm[i])] = 1
@@ -2197,40 +3512,87 @@ def normalize_values(
     return c_values_norm
 
 
-def normalize_values_no_ct(
-    counts,
-    gene_pairs_ind,
-    lcs,
-    D,
-):
-    
-    c_values_norm = np.zeros(len(lcs))
-    lc_maxs = compute_max_cs(D, counts, gene_pairs_ind)
-    lc_maxs[lc_maxs == 0] = 1
-    c_values_norm = lcs / lc_maxs
-    c_values_norm[np.isinf(c_values_norm)] = 1
-    
-    return c_values_norm
-
-
 def compute_max_cs(node_degrees, counts, gene_pairs_ind):
+    """
+    Compute max communication scores per gene pair.
+    """
+    result = torch.empty(len(gene_pairs_ind), dtype=counts.dtype, device=counts.device)
+    
+    for i, (g1, _) in enumerate(gene_pairs_ind):
+        if isinstance(g1, list):
+            vals = counts[g1].mean(dim=0)
+        else:
+            vals = counts[g1]
+        result[i] = compute_max_cs_gp(vals, node_degrees)
+    
+    return result
+
+
+def compute_max_cs_old(node_degrees, counts, gene_pairs_ind):
 
     result = np.zeros(len(gene_pairs_ind))
     for i, gene_pair_ind in enumerate(gene_pairs_ind):
         vals = counts[gene_pair_ind[0]] if type(gene_pair_ind[0]) is not list else np.mean(counts[gene_pair_ind[0]], axis=0)
-        result[i] = compute_max_cs_gp(vals, node_degrees)
+        result[i] = compute_max_cs_gp_old(vals, node_degrees)
 
     return result
 
 
-@jit(nopython=True)
 def compute_max_cs_gp(vals, node_degrees):
+    """
+    Compute max communication score for a single gene (vector).
+    """
+    return 0.5 * torch.sum(node_degrees * vals ** 2)
+
+
+@jit(nopython=True)
+def compute_max_cs_gp_old(vals, node_degrees):
     tot = 0.0
 
     for i in range(node_degrees.size):
         tot += node_degrees[i] * (vals[i] ** 2)
 
     return tot / 2
+
+
+def center_ct_counts_torch(counts, num_umi, model, cell_types):
+    """
+    counts: Tensor [genes, cells]
+    num_umi: Tensor [cells]
+    model: 'bernoulli', 'danb', 'normal', or 'none'
+    
+    Returns:
+        Centered counts within cell types: Tensor [genes, cells]
+    """
+    # Binarize if using Bernoulli
+    if model == 'bernoulli':
+        counts = (counts > 0).double()
+        mu, var, _ = models.apply_model_per_cell_type(
+            models.bernoulli_model_torch, counts, num_umi, cell_types
+        )
+    elif model == 'danb':
+        mu, var, _ = models.apply_model_per_cell_type(
+            models.danb_model_torch, counts, num_umi, cell_types
+        )
+    elif model == 'normal':
+        mu, var, _ = models.apply_model_per_cell_type(
+            models.normal_model_torch, counts, num_umi, cell_types
+        )
+    elif model == 'none':
+        mu, var, _ = models.apply_model_per_cell_type(
+            models.none_model_torch, counts, num_umi, cell_types
+        )
+    else:
+        raise ValueError(f"Unsupported model type: {model}")
+    
+    # Avoid division by zero
+    std = torch.sqrt(var)
+    std[std == 0] = 1.0
+
+    centered = (counts - mu) / std
+    centered[centered == 0] = 0  # Optional: to match old behavior
+    
+    return centered
 
 
 def create_centered_counts(counts, model, num_umi):
@@ -2379,52 +3741,6 @@ def expand_ct_pairs_cellcom(pairs, vals, N):
             v = vals[k][i]
 
             out[k][x, y] = v
-
-    return out
-
-
-def expand_gene_pairs_cellcom(pairs, ct_pairs, cell_types, vals, N):
-
-    pairs_new = []
-    for pair in pairs:
-        p1, p2 = pair
-        if ([p1, p2] not in pairs_new) and ([p2, p1] not in pairs_new):
-            pairs_new.append([p1, p2])
-
-    out = [np.zeros((N, N)) for k in range(len(pairs_new))]
-
-    for k in range(len(out)):
-        p1, p2 = pairs[k]
-        for i in range(len(ct_pairs)):
-            ct_1, ct_2 = ct_pairs[i]
-            x = np.where(cell_types == ct_1)[0]
-            y = np.where(cell_types == ct_2)[0]
-            if p1 == p2:
-                j = np.where((pairs[:, 0] == p1) & (pairs[:, 1] == p2))[0]
-                v = vals[i][j]
-                out[k][x, y] = v
-            else:
-                j1 = np.where((pairs[:, 0] == p1) & (pairs[:, 1] == p2))[0]
-                j2 = np.where((pairs[:, 0] == p2) & (pairs[:, 1] == p1))[0]
-                v1 = vals[i][j1]
-                v2 = vals[i][j2]
-                out[k][x, y] = v1
-                out[k][y, x] = v2
-
-    return out, pairs_new
-
-
-@njit
-def expand_pairs(pairs, vals, N):
-    out = np.zeros((N, N))
-
-    for i in range(len(pairs)):
-        x = pairs[i, 0]
-        y = pairs[i, 1]
-        v = vals[i]
-
-        out[x, y] = v
-        out[y, x] = v
 
     return out
 
@@ -2636,163 +3952,6 @@ def extract_ct_pair_counts_weights_null(permutation, permutations, counts_ct_pai
     return (c_perm_data_t, c_perm_coords_4d_t, c_perm_data_u, c_perm_coords_4d_u, w_perm_data_all, w_perm_coords_4d_u)
 
 
-def process_communication_output(
-        adata: AnnData,
-        cell_communication_df: pd.DataFrame,
-        m2h_info: Optional[dict] = '',
-        transporter_info: Optional[pd.DataFrame] = '',
-        pathway_dict: Optional[dict] = None,
-        org: Optional[Union[Literal["Mouse"], Literal["Human"]]] = "Mouse",
-    ):
-    """Compute gene pair and metabolite scores for each cell.
-
-    Parameters
-    ----------
-    adata
-        AnnData object to compute communication scores for.
-
-    """
-
-    transporter_df = pd.read_csv(transporter_info, index_col=0) if type(transporter_info) == str else transporter_info
-
-    if type(m2h_info) == str:
-        with open(m2h_info) as json_file:
-            m2h_dict = json.load(json_file)
-    else:
-        m2h_dict = m2h_info
-
-    cell_communication_df["cell_type_pair"] = cell_communication_df.apply(lambda row: (row['Cell Type 1'], row['Cell Type 2']), axis=1)
-    cell_communication_df["gene_pair"] = cell_communication_df.apply(lambda row: (row['Gene 1'], row['Gene 2']), axis=1)
-
-    cell_communication_df['cells'] = cell_communication_df['interacting_cells'].apply(lambda x: x['cells'])
-    cell_communication_df['scores'] = cell_communication_df['interacting_cells'].apply(lambda x: x['scores'])
-
-    gene_pairs_per_metabolite = adata.uns["gene_pairs_per_metabolite"]
-
-    metabolite_gene_pair_df = pd.DataFrame.from_dict(gene_pairs_per_metabolite, orient="index").reset_index()
-    metabolite_gene_pair_df = metabolite_gene_pair_df.rename(columns={"index": "metabolite"})
-
-    metabolite_gene_pair_df['gene_pair'] = metabolite_gene_pair_df['gene_pair'].apply(lambda arr: [(sub_array[0], sub_array[1]) for sub_array in arr])
-    metabolite_gene_pair_df['gene_type'] = metabolite_gene_pair_df['gene_type'].apply(lambda arr: [(sub_array[0], sub_array[1]) for sub_array in arr])
-
-    metabolite_gene_pair_df = pd.concat(
-        [
-            metabolite_gene_pair_df['metabolite'],
-            metabolite_gene_pair_df.explode('gene_pair')['gene_pair'],
-            metabolite_gene_pair_df.explode('gene_type')['gene_type'],
-        ],
-        axis=1,
-    )
-    metabolite_gene_pair_df = metabolite_gene_pair_df.reset_index(drop=True)
-
-    metabolite_gene_pair_df = metabolite_gene_pair_df.groupby(["gene_pair", "gene_type"])[
-        "metabolite"
-    ].apply(tuple).reset_index()
-    metabolite_gene_pair_df = metabolite_gene_pair_df.drop_duplicates()
-
-    ct_pair_gene_pair_metab_df = cell_communication_df.merge(
-        metabolite_gene_pair_df, on="gene_pair", validate="many_to_many"
-    )
-
-    if pathway_dict is not None:
-        for pathway_id in pathway_dict.keys():
-            ct_pair_gene_pair_metab_df[pathway_dict[pathway_id]] = ct_pair_gene_pair_metab_df.gene_pair.apply(get_metabolic_pathway, m2h_dict=m2h_dict, transporter_df=transporter_df, org=org, col=pathway_id)
-
-
-    return ct_pair_gene_pair_metab_df
-
-
-def NMF_interacting_cell_scores(
-    adata: AnnData,
-    interaction_type: Optional[Union[Literal["metabolite"], Literal["gene_pair"]]] = "metabolite",
-    only_sig_values: Optional[bool] = False,
-    use_FDR: Optional[bool] = True,
-    n_factors: Optional[int] = 5,
-    normalize_values: Optional[bool] = True,
-):
-    
-    if interaction_type not in ["metabolite", "gene_pair"]:
-        raise ValueError('The "interaction_type" variable should be one of ["metabolite", "gene_pair"].')
-    
-    interaction_type_str = 'm' if interaction_type == 'metabolite' else 'gp'
-
-    if only_sig_values:
-        sig_str = 'FDR' if use_FDR else 'pval'
-        X = adata.uns[f'interacting_cell_scores_{interaction_type_str}_sig_{sig_str}']
-    else:
-        X = adata.uns[f'interacting_cell_scores_{interaction_type_str}']
-    
-    if normalize_values:
-        X = X.apply(lambda x: (x - x.min()) / (x.max() - x.min()), axis=0) #We apply min-max normalization
-
-    nmf_model = NMF(n_components=n_factors, init='random', random_state=42)
-
-    W = nmf_model.fit_transform(X)  # Observations x Factors matrix
-    H = nmf_model.components_ 
-
-    factors = ['Factor ' + str(fac) for fac in range(1, n_factors+1)]
-    W = pd.DataFrame(W, index=X.index, columns=factors)
-    H = pd.DataFrame(H, index=factors, columns=X.columns)
-
-    NMF_results_key_W = f'NMF_W_{interaction_type_str}_{n_factors}_sig_{sig_str}' if only_sig_values else f'NMF_W_{interaction_type_str}_{n_factors}'
-    NMF_results_key_H = f'NMF_H_{interaction_type_str}_{n_factors}_sig_{sig_str}' if only_sig_values else f'NMF_H_{interaction_type_str}_{n_factors}'
-
-    if "NMF_results" not in adata.uns.keys():
-        adata.uns["NMF_results"] = {}
-    adata.uns["NMF_results"][NMF_results_key_W] = W
-    adata.uns["NMF_results"][NMF_results_key_H] = H
-
-    return
-
-
-def compute_score_autocorrelation(
-    adata: AnnData,
-    score: Optional[Union[Literal["metabolite"], Literal["gene_pair"], Literal["module"], Literal["factor"]]] = "metabolite",
-    only_sig_values: Optional[bool] = False,
-    use_FDR: Optional[bool] = True,
-    latent_key: Optional[str] = 'spatial',
-    NMF_interaction_type: Optional[Union[Literal["metabolite"], Literal["gene_pair"]]] = "metabolite",
-    n_factors: Optional[int] = 5,
-):
-    
-    if score not in ["metabolite", "gene_pair", "module", "factor"]:
-        raise ValueError('The "score" variable should be one of ["metabolite", "gene_pair", "module", "factor"].')
-    
-    if only_sig_values:
-        sig_str = 'FDR' if use_FDR else 'pval'
-    
-    if score in ["metabolite", "gene_pair"]:
-        score_str = 'm' if score == 'metabolite' else 'gp'
-        X = adata.uns[f'interacting_cell_scores_{score_str}_sig_{sig_str}'] if only_sig_values else adata.uns[f'interacting_cell_scores_{score_str}']
-    
-    elif score == "factor":
-        NMF_interaction_type_str = 'm' if NMF_interaction_type == 'metabolite' else 'gp'
-        NMF_results_key_W = f'NMF_W_{NMF_interaction_type_str}_{n_factors}_sig_{sig_str}' if only_sig_values else f'NMF_W_{NMF_interaction_type_str}_{n_factors}'
-        
-        if NMF_results_key_W not in adata.uns["NMF_results"].keys():
-            raise ValueError("The provided parameters haven't been used to compute NMF. Input the correct parameters.")
-        
-        X = adata.uns['NMF_results'][NMF_results_key_W]
-    
-    else:
-        X = adata.obsm['module_scores']
-        
-    X = zscore(X, axis=0)
-    
-    score_adata = AnnData(X)
-    score_adata.obs_names = X.index
-    score_adata.var_names = X.columns
-    score_adata.obsm[latent_key] = adata.obsm[latent_key]
-    score_adata.obsp['weights'] = adata.obsp['weights']
-
-    compute_local_autocorrelation(score_adata, model="none", use_metabolic_genes=False)
-
-    adata.uns[f'{score}_autocorrelation_results'] = score_adata.uns['gene_autocorrelation_results']
-    adata.uns[f'{score}_autocorrelation_results'].index.name = score
-    
-    return
-
-
 def compute_interaction_module_correlation(
     adata: AnnData,
     cor_method: Optional[Union[Literal["pearson"], Literal["spearman"]]] = 'pearson',
@@ -2870,408 +4029,3 @@ def compute_interaction_module_correlation(
     adata.uns["interaction_module_correlation_FDR"] = cor_FDR_df
 
     return
-
-
-def compute_tensor_factorization(adata, rank=5, z_scores=True):
-
-    gene_pairs_ind = adata.uns["gene_pairs_ind_new"]
-    cell_types = adata.uns["cell_type_list"]
-    genes = adata.uns["genes"]
-
-    tensor_3d = adata.uns['lc_zs_3d'] if z_scores is True else adata.uns['lcs_3d']
-
-    factors = tl.decomposition.parafac(tensor_3d, rank=rank)
-    factor_names = [f'Factor {i+1}' for i in range(rank)]
-    gene_pairs = [(genes[gp1], genes[gp2]) for gp1, gp2 in gene_pairs_ind]
-
-    gene_pair_factors = pd.DataFrame(factors.factors[0], index=gene_pairs, columns=factor_names)
-    ct_1_factors = pd.DataFrame(factors.factors[1], index=cell_types, columns=factor_names)
-    ct_2_factors = pd.DataFrame(factors.factors[2], index=cell_types, columns=factor_names)
-
-    return (gene_pair_factors, ct_1_factors, ct_2_factors)
-
-
-def compute_communication_scores(
-        adata: AnnData,
-        ct_pair_gene_pair_metab_df: pd.DataFrame,
-        layer_key: Optional[Union[Literal["use_raw"], str]] = None,
-        var: Optional[list] = None,
-        var_subset: Optional[Union[list, dict]] = None,
-        per_ct: Optional[bool] = None,
-        per_ct_pair: Optional[bool] = None,
-    ):
-    """Compute gene pair and metabolite scores for each cell.
-
-    Parameters
-    ----------
-    adata
-        AnnData object to compute communication scores for.
-
-    """
-    default_vars = ['gene_pair', 'cell_type', 'cell_type_pair']
-    var = list(np.unique(var + default_vars)) if var is not None else default_vars
-
-    ct_pair_gene_pair_metab_df = pd.concat(
-        [
-            ct_pair_gene_pair_metab_df.drop(['cells', 'scores'] ,axis=1),
-            ct_pair_gene_pair_metab_df.explode('cells')['cells'],
-            ct_pair_gene_pair_metab_df.explode('scores')['scores'],
-        ],
-        axis=1,
-    )
-    ct_pair_gene_pair_metab_df['gene'] = ct_pair_gene_pair_metab_df['gene_pair'].copy()
-    ct_pair_gene_pair_metab_df = ct_pair_gene_pair_metab_df.explode(['gene', 'cells']).reset_index(drop=True)
-
-    use_raw = layer_key == "use_raw"
-    index = adata.raw.obs.index if use_raw else adata.obs_names
-
-    genes = ct_pair_gene_pair_metab_df['gene'].unique()
-
-    gene_scores_df = pd.DataFrame(index=index, columns=genes, data=np.zeros((len(index), len(genes))))
-
-    for gene in tqdm(genes):
-        ct_pair_gene_pair_metab_df_g = ct_pair_gene_pair_metab_df[
-            ct_pair_gene_pair_metab_df.gene == gene
-        ].copy()
-
-        gene_scores_tmp = ct_pair_gene_pair_metab_df_g.groupby(["cells", "gene_pair"])["scores"].sum()
-        gene_scores_df[gene] = gene_scores_tmp.groupby('cells').mean()
-
-        # Cell type pairs
-
-        if per_ct_pair:
-            cell_type_pairs = ct_pair_gene_pair_metab_df_g.cell_type_pair.unique()
-            cell_type_pairs_str = [ct1 + '_' + ct2 for ct1, ct2 in cell_type_pairs]
-            gene_ct_pair_scores_df = pd.DataFrame(
-                index=index, columns=cell_type_pairs_str, data=np.zeros((len(index), len(cell_type_pairs_str)))
-            )
-            gene_ct_pair_scores_df_tmp = (
-                ct_pair_gene_pair_metab_df_g.groupby(["cells", "cell_type_pair", "gene_pair"])["scores"].sum().groupby(['cells', "cell_type_pair"]).mean().unstack(level=1)
-            )
-            for ct_pair in cell_type_pairs:
-                ct1, ct2 = ct_pair
-                gene_ct_pair_scores_df[ct1 + '_' + ct2] = gene_ct_pair_scores_df_tmp[ct_pair]
-            adata.obsm[f"{gene}_ct_pair_scores"] = gene_ct_pair_scores_df.fillna(0)
-
-        # Cell types
-
-        if per_ct:
-            ct_pair_gene_pair_metab_df_g = ct_pair_gene_pair_metab_df_g.explode('cell_type_pair').reset_index(drop=True)
-            ct_pair_gene_pair_metab_df_g = ct_pair_gene_pair_metab_df_g.rename(columns={'cell_type_pair': 'cell_type'})
-            cell_types = ct_pair_gene_pair_metab_df_g.cell_type.unique()
-            gene_ct_scores_df = pd.DataFrame(
-                index=index, columns=cell_types, data=np.zeros((len(index), len(cell_types)))
-            )
-            gene_ct_scores_df_tmp = (
-                ct_pair_gene_pair_metab_df_g.groupby(["cells", "cell_type", "gene_pair"])["scores"].sum().groupby(['cells', "cell_type"]).mean().unstack(level=1)
-            )
-            for ct in cell_types:
-                gene_ct_scores_df[ct] = gene_ct_scores_df_tmp[ct]
-            adata.obsm[f"{gene}_ct_scores"] = gene_ct_scores_df.fillna(0)
-
-    adata.obsm["gene_scores"] = gene_scores_df.fillna(0)
-
-
-    if 'gene_pair' in var:
-        gene_pairs = ct_pair_gene_pair_metab_df.gene_pair.unique()
-
-        gene_pairs_dict = {}
-        for gene_pair in gene_pairs:
-            pair1, pair2 = gene_pair
-            if (pair1 + '_' + pair2 in gene_pairs_dict.keys()):
-                gene_pairs_dict[pair1 + '_' + pair2].append(gene_pair)
-            elif (pair2 + '_' + pair1 in gene_pairs_dict.keys()):
-                gene_pairs_dict[pair2 + '_' + pair1].append(gene_pair)
-            else:
-                gene_pairs_dict[pair1 + '_' + pair2] = []
-                gene_pairs_dict[pair1 + '_' + pair2].append(gene_pair)
-
-        gene_pair_scores_df = pd.DataFrame(index=index, columns=gene_pairs_dict.keys(), data=np.zeros((len(index), len(gene_pairs_dict.keys()))))
-
-        for gene_pair in tqdm(gene_pairs_dict.keys()):
-            ct_pair_gene_pair_metab_df_gp = ct_pair_gene_pair_metab_df[
-                ct_pair_gene_pair_metab_df.gene_pair.isin(gene_pairs_dict[gene_pair])
-            ].copy()
-
-            gene_pair_scores_df[gene_pair] = ct_pair_gene_pair_metab_df_gp.groupby("cells")["scores"].sum()
-
-            # Cell type pairs
-
-            if per_ct_pair:
-                cell_type_pairs = ct_pair_gene_pair_metab_df_gp.cell_type_pair.unique()
-                cell_type_pairs_str = [ct1 + '_' + ct2 for ct1, ct2 in cell_type_pairs]
-                gene_pair_ct_pair_scores_df = pd.DataFrame(
-                    index=index, columns=cell_type_pairs_str, data=np.zeros((len(index), len(cell_type_pairs_str)))
-                )
-                gene_pair_ct_pair_scores_df_tmp = (
-                    ct_pair_gene_pair_metab_df_gp.groupby(["cells", "cell_type_pair"])["scores"].sum().unstack(level=1)
-                )
-                for ct_pair in cell_type_pairs:
-                    ct1, ct2 = ct_pair
-                    gene_pair_ct_pair_scores_df[ct1 + '_' + ct2] = gene_pair_ct_pair_scores_df_tmp[ct_pair]
-                adata.obsm[f"{gene_pair}_ct_pair_scores"] = gene_pair_ct_pair_scores_df.fillna(0)
-
-            # Cell types
-
-            if per_ct:
-                ct_pair_gene_pair_metab_df_gp = ct_pair_gene_pair_metab_df_gp.explode('cell_type_pair').reset_index(drop=True)
-                ct_pair_gene_pair_metab_df_gp = ct_pair_gene_pair_metab_df_gp.rename(columns={'cell_type_pair': 'cell_type'})
-                cell_types = ct_pair_gene_pair_metab_df_gp.cell_type.unique()
-                gene_pair_ct_scores_df = pd.DataFrame(
-                    index=index, columns=cell_types, data=np.zeros((len(index), len(cell_types)))
-                )
-                gene_pair_ct_scores_df_tmp = (
-                    ct_pair_gene_pair_metab_df_gp.groupby(["cells", "cell_type"])["scores"].sum().unstack(level=1)
-                )
-                for ct in cell_types:
-                    gene_pair_ct_scores_df[ct] = gene_pair_ct_scores_df_tmp[ct]
-                adata.obsm[f"{gene_pair}_ct_scores"] = gene_pair_ct_scores_df.fillna(0)
-
-        adata.obsm["gene_pair_scores"] = gene_pair_scores_df.fillna(0)
-
-
-    var = [v for v in var if v not in default_vars]
-
-    for v in var:
-        print(f"Computing scores for the '{v}' variable...")
-
-        ct_pair_gene_pair_metab_df_v = ct_pair_gene_pair_metab_df.explode(v).reset_index(drop=True)
-        if len(var) == 1 and type(var_subset) is list:
-            ct_pair_gene_pair_metab_df_v = ct_pair_gene_pair_metab_df_v[ct_pair_gene_pair_metab_df_v[v].isin(var_subset)]
-        elif len(var) > 1 and type(var_subset) is dict and v in var_subset.keys():
-            ct_pair_gene_pair_metab_df_v = ct_pair_gene_pair_metab_df_v[ct_pair_gene_pair_metab_df_v[v].isin(var_subset[v])]
-
-        v_elems = ct_pair_gene_pair_metab_df_v[v].unique().tolist()
-
-        v_scores_df = pd.DataFrame(index=index, columns=v_elems, data=np.zeros((len(index), len(v_elems))))
-
-        for v_elem in v_elems:
-            ct_pair_gene_pair_metab_df_v_elem = ct_pair_gene_pair_metab_df_v[
-            ct_pair_gene_pair_metab_df_v[v] == v_elem
-            ].copy()
-
-            v_scores_df[v_elem] = ct_pair_gene_pair_metab_df_v_elem.groupby("cells")["scores"].sum()
-
-            # Cell type pairs
-
-            if per_ct_pair:
-                cell_type_pairs = ct_pair_gene_pair_metab_df_v_elem.cell_type_pair.unique()
-                v_ct_pair_scores_df = pd.DataFrame(
-                    index=index, columns=cell_type_pairs, data=np.zeros((len(index), len(cell_type_pairs)))
-                )
-                v_ct_pair_scores_df_tmp = (
-                    ct_pair_gene_pair_metab_df_v_elem.groupby(["cells", "cell_type_pair"])["scores"].sum().unstack(level=1)
-                )
-                for ct_pair in cell_type_pairs:
-                    v_ct_pair_scores_df[ct_pair] = v_ct_pair_scores_df_tmp[ct_pair]
-                adata.obsm[f"{v_elem}_ct_pair_scores"] = v_ct_pair_scores_df.fillna(0)
-
-            # Cell types
-
-            if per_ct:
-                ct_pair_gene_pair_metab_df_v_elem = ct_pair_gene_pair_metab_df_v_elem.explode('cell_type_pair').reset_index(drop=True)
-                ct_pair_gene_pair_metab_df_v_elem = ct_pair_gene_pair_metab_df_v_elem.rename(columns={'cell_type_pair': 'cell_type'})
-                cell_types = ct_pair_gene_pair_metab_df_v_elem.cell_type.unique()
-                v_ct_scores_df = pd.DataFrame(
-                    index=index, columns=cell_types, data=np.zeros((len(index), len(cell_types)))
-                )
-                v_ct_scores_df_tmp = (
-                    ct_pair_gene_pair_metab_df_v_elem.groupby(["cells", "cell_type"])["scores"].sum().unstack(level=1)
-                )
-                for ct in cell_types:
-                    v_ct_scores_df[ct] = v_ct_scores_df_tmp[ct]
-                adata.obsm[f"{v_elem}_ct_scores"] = v_ct_scores_df.fillna(0)
-
-
-        adata.obsm[f"{v}_scores"] = v_scores_df.fillna(0)
-
-
-def compute_communication_modules(adata, layer_key, height=0.15):
-    metab_scores_df = adata.obsm["metabolite_scores"].T
-    gene_pair_scores_df = adata.obsm["gene_pair_scores"].T
-
-    # Metabolites
-
-    print("Computing metabolite modules for {} metabolites...".format(metab_scores_df.shape[0]))
-
-    pairwise_metab_correlations = np.corrcoef(metab_scores_df.rank(axis=1))
-    pairwise_metab_correlations[np.arange(metab_scores_df.shape[0]), np.arange(metab_scores_df.shape[0])] = 1.0
-    pairwise_metab_correlations = (pairwise_metab_correlations + pairwise_metab_correlations.T) / 2
-    assert np.all(pairwise_metab_correlations == pairwise_metab_correlations.T)
-
-    Z_metab = hcluster.complete(squareform(1 - pairwise_metab_correlations))
-
-    metab_modules_map = hcluster.fcluster(Z_metab, height, criterion="distance")
-    metab_modules_map = ["Module " + str(mod) for mod in metab_modules_map]
-
-    metab_modules_dict = {}
-
-    for i in range(len(metab_modules_map)):
-        metab = metab_scores_df.index[i]
-        module = metab_modules_map[i]
-        if module not in metab_modules_dict.keys():
-            metab_modules_dict[module] = []
-        metab_modules_dict[module].append(metab)
-
-    metab_modules = list(metab_modules_dict.keys())
-
-    use_raw = layer_key == "use_raw"
-    index = adata.raw.obs.index if use_raw else adata.obs_names
-    metab_module_scores = pd.DataFrame(
-        index=index, columns=metab_modules, data=np.zeros((len(index), len(metab_modules)))
-    )
-
-    metab_module_loadings_dict = {}
-
-    for metab_module in tqdm(metab_modules):
-        metabs_mod = metab_modules_dict[metab_module]
-        metab_mod_scores_df = metab_scores_df.loc[metabs_mod]
-
-        X = scale(metab_mod_scores_df.T)
-        pca = PCA(n_components=1)
-        scores = pca.fit_transform(X)
-        loadings = pca.components_.T
-
-        sign = pca.components_.mean()  # may need to flip
-        if sign < 0:
-            scores = scores * -1
-            loadings = loadings * -1
-
-        scores = scores[:, 0]
-        loadings = loadings[:, 0]
-
-        metab_module_scores[metab_module] = scores
-        metab_module_loadings_dict[metab_module] = pd.Series(loadings, index=metabs_mod)
-
-    # metab_module_scores = metab_scores_df.join(pd.DataFrame(metab_modules_map, columns=["metab_module_id"], index = metab_scores_df.index)).groupby("metab_module_id").mean()
-
-    adata.obsm["metabolite_module_scores"] = metab_module_scores
-    adata.uns["metabolite_module_loadings"] = metab_module_loadings_dict
-    adata.uns["metabolite_modules_dict"] = metab_modules_dict
-
-    # Gene pairs
-
-    print("Computing gene pair modules for {} gene pairs...".format(gene_pair_scores_df.shape[0]))
-
-    pairwise_gene_pair_correlations = np.corrcoef(gene_pair_scores_df.rank(axis=1))
-    pairwise_gene_pair_correlations[
-        np.arange(gene_pair_scores_df.shape[0]), np.arange(gene_pair_scores_df.shape[0])
-    ] = 1.0
-    pairwise_gene_pair_correlations = (pairwise_gene_pair_correlations + pairwise_gene_pair_correlations.T) / 2
-    assert np.all(pairwise_gene_pair_correlations == pairwise_gene_pair_correlations.T)
-
-    Z_gene_pair = hcluster.complete(squareform(1 - pairwise_gene_pair_correlations))
-
-    gene_pair_modules_map = hcluster.fcluster(Z_gene_pair, height, criterion="distance")
-    gene_pair_modules_map = ["Module " + str(mod) for mod in gene_pair_modules_map]
-
-    gene_pair_modules_dict = {}
-
-    for i in range(len(gene_pair_modules_map)):
-        gene_pair = gene_pair_scores_df.index[i]
-        module = gene_pair_modules_map[i]
-        if module not in gene_pair_modules_dict.keys():
-            gene_pair_modules_dict[module] = []
-        gene_pair_modules_dict[module].append(gene_pair)
-
-    gene_pair_modules = list(gene_pair_modules_dict.keys())
-
-    gene_pair_module_scores = pd.DataFrame(
-        index=index, columns=gene_pair_modules, data=np.zeros((len(index), len(gene_pair_modules)))
-    )
-
-    gene_pair_module_loadings_dict = {}
-
-    for gene_pair_module in tqdm(gene_pair_modules):
-        gene_pairs_mod = gene_pair_modules_dict[gene_pair_module]
-        gene_pair_mod_scores_df = gene_pair_scores_df.loc[gene_pairs_mod]
-
-        X = scale(gene_pair_mod_scores_df.T)
-        pca = PCA(n_components=1)
-        scores = pca.fit_transform(X)
-        loadings = pca.components_.T
-
-        sign = pca.components_.mean()  # may need to flip
-        if sign < 0:
-            scores = scores * -1
-            loadings = loadings * -1
-
-        scores = scores[:, 0]
-        loadings = loadings[:, 0]
-
-        gene_pair_module_scores[gene_pair_module] = scores
-        gene_pair_module_loadings_dict[gene_pair_module] = pd.Series(loadings, index=gene_pairs_mod)
-
-    # gene_pair_module_scores = gene_pair_scores_df.join(pd.DataFrame(gene_pair_modules_map, columns=["gene_pair_module_id"], index = gene_pair_scores_df.index)).groupby("gene_pair_module_id").mean()
-
-    adata.obsm["gene_pair_module_scores"] = gene_pair_module_scores
-    adata.uns["gene_pair_module_loadings"] = gene_pair_module_loadings_dict
-    adata.uns["gene_pair_modules_dict"] = gene_pair_modules_dict
-
-
-def get_metabolic_process(genes, m2h_dict, transporter_df, org='Mouse'):
-
-    genes_list = genes.split('/')
-    metab_process = []
-    for gene in genes_list:
-        gene = gene.strip()
-        if org == 'Mouse':
-            if gene in m2h_dict.keys():
-                gene_h = m2h_dict[gene]
-            else:
-                continue
-        else:
-            gene_h = gene
-
-        if gene_h in transporter_df.index:
-            gene_h_shape = transporter_df.loc[[gene_h]].shape[0]
-            if gene_h_shape > 1:
-                for i in range(gene_h_shape):
-                    system = transporter_df.loc[gene_h].iloc[i]['System']
-            else:
-                system = transporter_df.loc[gene_h]['System']
-            if system not in metab_process:
-                metab_process.append(system)
-        else:
-            continue
-
-    if len(metab_process) == 0:
-        metab_process = 'Unknown'
-    else:
-        metab_process = ' / '.join(metab_process)
-
-    return metab_process
-
-
-def get_metabolic_pathway(genes, m2h_dict, transporter_df, org, col):
-
-    genes_list = list(genes)
-    metab_pathway = []
-    for gene in genes_list:
-        gene = gene.strip()
-        if org == 'Mouse':
-            if gene in m2h_dict.keys():
-                gene_h = m2h_dict[gene]
-            else:
-                continue
-        else:
-            gene_h = gene
-
-        if gene_h in transporter_df.index:
-            gene_h_shape = transporter_df.loc[[gene_h]].shape[0]
-            if gene_h_shape > 1:
-                for i in range(gene_h_shape):
-                    pathway = transporter_df.loc[gene_h].iloc[i][col]
-            else:
-                pathway = transporter_df.loc[gene_h][col]
-            if pathway not in metab_pathway:
-                metab_pathway.append(pathway)
-        else:
-            continue
-
-    if len(metab_pathway) == 0:
-        metab_pathway = ('Unknown',)
-    else:
-        metab_pathway = tuple(metab_pathway)
-
-    return metab_pathway

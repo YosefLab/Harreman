@@ -13,7 +13,7 @@ from scipy.stats import norm
 
 from . import models
 from ..preprocessing.anndata import counts_from_anndata
-from .local_autocorrelation import compute_local_cov_max, center_counts_torch
+from .local_autocorrelation import compute_local_cov_max, standardize_counts
 from ..tools.knn import make_weights_non_redundant
 
 
@@ -22,6 +22,7 @@ def compute_local_correlation(
     genes: Optional[list] = None,
     permutation_test: Optional[bool] = False,
     M: Optional[int] = 1000,
+    seed: Optional[int] = 42,
     check_analytic_null: Optional[bool] = False,
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     verbose: Optional[bool] = False,
@@ -45,6 +46,8 @@ def compute_local_correlation(
         Whether to compute an empirical p-value and null distribution by permuting the data.
     M : int, optional (default: 1000)
         Number of permutations to perform if `permutation_test` is True.
+    seed : int, optional (default: 42)
+        A random seed for the permutation testing.
     check_analytic_null : bool, optional (default: False)
         Whether to compute an analytic null distribution for the local correlation scores.
     device : torch.device, optional
@@ -80,23 +83,9 @@ def compute_local_correlation(
     # Convert to tensors
     num_umi = torch.tensor(adata.uns["umi_counts"], dtype=torch.float64, device=device)
     counts = torch.tensor(counts, dtype=torch.float64, device=device)
-
-    # if sample_specific:
-    #     sample_key = adata.uns['sample_key']
-    #     for sample in adata.obs[sample_key].unique():
-    #         subset = np.where(adata.obs[sample_key] == sample)[0]
-    #         counts[:,subset] = create_centered_counts(counts[:,subset], model, num_umi[subset])
-    # else:
-    #     counts = create_centered_counts(counts, model, num_umi)
     
     # Center values
-    if sample_specific:
-        sample_key = adata.uns['sample_key']
-        for sample in adata.obs[sample_key].unique():
-            subset = np.where(adata.obs[sample_key] == sample)[0]
-            counts[:, subset] = center_counts_torch(counts[:, subset], num_umi[subset], model)
-    else:
-        counts = center_counts_torch(counts, num_umi, model)
+    counts = standardize_counts(adata, counts, model, num_umi, sample_specific)
         
     # Compute weights
     weights = make_weights_non_redundant(adata.obsp["weights"]).tocoo()
@@ -110,8 +99,6 @@ def compute_local_correlation(
     row_degrees = torch.sparse.sum(weights, dim=1).to_dense()
     col_degrees = torch.sparse.sum(weights, dim=0).to_dense()
     D = row_degrees + col_degrees
-
-    # lcs = counts @ weights @ counts.T + counts @ weights.T @ counts.T
     
     # Pairwise correlation
     WXt = torch.sparse.mm(weights, counts.T)  # (cells x genes)
@@ -120,9 +107,6 @@ def compute_local_correlation(
     
     # Compute second moments of H
     eg2s = (WXt + WtXt).pow(2).sum(dim=0)
-    
-    # eg2s = (((weights + weights.T) @ counts.T) ** 2).sum(axis=0)
-    # The equation above is equivalent to (((weights @ counts.T) + (counts @ weights).T) ** 2).sum(axis=0)
     
     # Results
     results = compute_pairwise_correlation_results(
@@ -134,6 +118,7 @@ def compute_local_correlation(
         D=D,
         M=M,
         permutation_test=permutation_test,
+        seed=seed,
         check_analytic_null=check_analytic_null,
         device=device,
     )
@@ -145,22 +130,19 @@ def compute_local_correlation(
     if verbose:
         print(f"Pair-wise local correlation results are stored in adata.uns with the following keys: {list(results.keys())}")
     
-    if verbose:
         print("Finished computing pair-wise local correlation in %.3f seconds" %(time.time()-start))
 
     return
 
 
 def compute_pairwise_correlation_results(
-    counts, weights, lcs, eg2s, genes, D, M, permutation_test, check_analytic_null, device
+    counts, weights, lcs, eg2s, genes, D, M, permutation_test, seed, check_analytic_null, device
 ):
     
     results = {}
     
     lc_zs = compute_cor_Z_scores_torch(lcs, eg2s)
-    # lc_zs = compute_cor_Z_scores(lcs, eg2s)
-    
-    # lc_z_pvals = norm.sf(lc_zs)
+
     lc_z_pvals = norm.sf(lc_zs.cpu().numpy())
     lc_z_FDR = multipletests(lc_z_pvals.flatten(), method="fdr_bh")[1].reshape(lc_z_pvals.shape)
     
@@ -169,40 +151,27 @@ def compute_pairwise_correlation_results(
     if permutation_test:
         n_genes, n_cells = counts.shape
         perm_array = torch.empty((n_genes, n_genes, M), dtype=torch.float16, device=device)
-        # perm_array = np.zeros((counts.shape[0], counts.shape[0], M)).astype(np.float16)
         if check_analytic_null:
-            # lc_zs_perm_array = np.zeros((counts.shape[0], counts.shape[0], M)).astype(np.float16)
-            # lc_pvals_perm_array = np.zeros((counts.shape[0], counts.shape[0], M)).astype(np.float16)
             lc_zs_perm_array = torch.empty_like(perm_array)
             lc_pvals_perm_array = torch.empty_like(perm_array)
+        
+        torch.manual_seed(seed)
         for i in tqdm(range(M), desc="Permutation test"):
             idx = torch.randperm(n_cells, device=device)
-            # idx = np.random.permutation(counts.shape[1])
             
             WXt_perm = torch.sparse.mm(weights, counts[:, idx].T)
             WtXt_perm = torch.sparse.mm(weights.transpose(0, 1), counts[:, idx].T)
             lcs_perm = torch.matmul(counts, WXt_perm) + torch.matmul(counts, WtXt_perm)
             
-            # lcs_perm = counts @ weights @ counts[:, idx].T + counts @ weights.T @ counts[:, idx].T
             perm_array[:, :, i] = lcs_perm.half()
-            # perm_array[:, :, i] = lcs_perm
             
             if check_analytic_null:
                 lc_zs_perm = compute_cor_Z_scores_torch(lcs_perm, eg2s)
                 lc_zs_perm_array[:, :, i] = lc_zs_perm.half()
                 lc_pvals_perm_array[:, :, i] = torch.tensor(norm.sf(lc_zs_perm.cpu().numpy()), device=device).half()
         
-        # x = np.sum(perm_array > lcs[:, :, np.newaxis], axis=2)
-        # lc_perm_pvals = (x + 1) / (M + 1)
         x = (perm_array > lcs.unsqueeze(-1)).sum(dim=2)
         lc_perm_pvals = (x + 1).float() / (M + 1)
-        
-        # lc_perm_pvals_ab = np.tril(lc_perm_pvals, k=-1)
-        # lc_perm_pvals_ba = np.tril(lc_perm_pvals.T, k=-1)
-
-        # lc_perm_pvals_sym = np.where(lc_perm_pvals_ab > lc_perm_pvals_ba, lc_perm_pvals_ab, lc_perm_pvals_ba)
-        # i_upper = np.triu_indices(lc_perm_pvals_sym.shape[0], k=1)
-        # lc_perm_pvals_sym[i_upper] = lc_perm_pvals_sym.T[i_upper]
         
         lc_perm_pvals_ab = torch.tril(lc_perm_pvals, diagonal=-1)
         lc_perm_pvals_ba = torch.tril(lc_perm_pvals.transpose(0, 1), diagonal=-1)
@@ -210,21 +179,13 @@ def compute_pairwise_correlation_results(
         i_upper = torch.triu_indices(n_genes, n_genes, offset=1)
         lc_perm_pvals_sym[i_upper[0], i_upper[1]] = lc_perm_pvals_sym[i_upper[1], i_upper[0]]
         
-        # lc_perm_pvals = pd.DataFrame(lc_perm_pvals, index=genes, columns=genes)
-        # lc_perm_pvals_sym = pd.DataFrame(lc_perm_pvals_sym, index=genes, columns=genes)
-        # results["lc_perm_pvals"] = lc_perm_pvals
-        # results["lc_perm_pvals_sym"] = lc_perm_pvals_sym
-        
         results["lc_perm_pvals"] = pd.DataFrame(lc_perm_pvals.cpu().numpy(), index=gene_index, columns=gene_index)
         results["lc_perm_pvals_sym"] = pd.DataFrame(lc_perm_pvals_sym.cpu().numpy(), index=gene_index, columns=gene_index)
         
         if check_analytic_null:
-            # results['analytic_null_lc_zs_perm'] = lc_zs_perm_array
-            # results['analytic_null_lc_pvals_perm'] = lc_pvals_perm_array
             results["analytic_null_lc_zs_perm"] = lc_zs_perm_array.cpu().numpy()
             results["analytic_null_lc_pvals_perm"] = lc_pvals_perm_array.cpu().numpy()
 
-    # lc_maxs = compute_max_correlation(D, counts)
     gene_maxs = 0.5 * torch.sum((counts ** 2) * D[None, :], dim=1)  # shape (n_genes,)
     lc_maxs = (gene_maxs[:, None] + gene_maxs[None, :]) / 2
     lcs = lcs / lc_maxs
@@ -233,9 +194,6 @@ def compute_pairwise_correlation_results(
     results["lc_zs"] = pd.DataFrame(lc_zs.cpu().numpy(), index=gene_index, columns=gene_index)
     results["lc_z_pvals"] = pd.DataFrame(lc_z_pvals, index=gene_index, columns=gene_index)
     results["lc_z_FDR"] = pd.DataFrame(lc_z_FDR, index=gene_index, columns=gene_index)
-    # results["lcs"] = pd.DataFrame(lcs, index=gene_index, columns=gene_index)
-    # results["lc_zs"] = pd.DataFrame(lc_zs, index=gene_index, columns=gene_index)
-    # results["lc_z_pvals"] = pd.DataFrame(lc_z_pvals, index=gene_index, columns=gene_index)
     
     return results
 

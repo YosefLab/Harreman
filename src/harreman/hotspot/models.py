@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from numba import njit
 import torch
+from typing import Callable, Union
 
 
 def danb_model(gene_counts, umi_counts):
@@ -453,3 +454,52 @@ def none_model_torch(counts: torch.Tensor, umi_counts: torch.Tensor):
     x2 = torch.ones(shape, device=device)
 
     return mu, var, x2
+
+
+def apply_model_per_cell_type(
+    model_fn: Callable,
+    counts: torch.Tensor,
+    umi_counts: torch.Tensor,
+    cell_types: Union[list, torch.Tensor],
+    **kwargs
+):
+    """
+    Applies a model function to each cell type separately.
+
+    Args:
+        model_fn: function of form (counts, umi_counts, **kwargs) -> (mu, var, x2)
+        counts: [genes, cells] tensor
+        umi_counts: [cells] tensor
+        cell_types: list or tensor of cell type labels, length = cells
+        kwargs: other model-specific arguments
+
+    Returns:
+        mu, var, x2: [genes, cells] tensors, concatenated across all cell types
+    """
+    device = counts.device
+
+    unique_types = cell_types.unique()
+    genes, cells = counts.shape
+
+    mu_all = torch.empty((genes, cells), dtype=torch.float64, device=device)
+    var_all = torch.empty((genes, cells), dtype=torch.float64, device=device)
+    x2_all = torch.empty((genes, cells), dtype=torch.float64, device=device)
+
+    cell_index = np.arange(cells)
+
+    for ct in unique_types:
+        
+        idx_array = cell_index[cell_types.values == ct]
+        idx = torch.tensor(idx_array, device=device)
+
+        counts_ct = counts[:, idx]
+        umi_ct = umi_counts[idx]
+
+        mu, var, x2 = model_fn(counts_ct, umi_ct, **kwargs)
+
+        mu_all[:, idx] = mu
+        var_all[:, idx] = var
+        x2_all[:, idx] = x2
+
+    return mu_all, var_all, x2_all
+

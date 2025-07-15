@@ -2,7 +2,6 @@ from typing import Literal, Optional, Union
 import time
 import numpy as np
 import pandas as pd
-import scvi
 import torch
 from anndata import AnnData
 from scipy.cluster.hierarchy import linkage
@@ -15,7 +14,6 @@ from tqdm import tqdm
 from ..vision.signature import compute_signatures_anndata
 from ..preprocessing.anndata import counts_from_anndata
 from .local_autocorrelation import center_counts_torch
-from .local_correlation import create_centered_counts_row, create_centered_counts
 from ..tools.knn import make_weights_non_redundant
 
 
@@ -131,8 +129,6 @@ def compute_scores(
             counts_sub[:,subset] = center_counts_torch(counts_sub[:,subset], num_umi[subset], model)
     else:
         counts_sub = center_counts_torch(counts_sub, num_umi, model)
-
-    # counts_sub = torch.tensor(counts_sub, dtype=torch.float64, device=device)
     
     # Smooth the counts using weights
     out = torch.matmul(weights + weights.transpose(0, 1), counts_sub.T)  # (cells x cells) @ (cells x genes)^T = (cells x genes)^T
@@ -426,6 +422,7 @@ def create_modules(
     fdr_threshold: Optional[float] = 0.05,
     z_threshold: Optional[float] = None,
     core_only: bool = False,
+    verbose: Optional[bool] = False,
 ):
     """
     Perform hierarchical clustering on gene-gene local correlation Z-scores to assign gene modules.
@@ -453,7 +450,8 @@ def create_modules(
     """
     
     start = time.time()
-    print("Creating modules...")
+    if verbose:
+        print("Creating modules...")
 
     # Determine Z_Threshold from FDR threshold
 
@@ -506,7 +504,8 @@ def create_modules(
     adata.uns["gene_modules_dict"] = gene_modules_dict
     adata.uns["linkage"] = linkage_out
 
-    print("Finished creating modules in %.3f seconds" %(time.time()-start))
+    if verbose:
+        print("Finished creating modules in %.3f seconds" %(time.time()-start))
 
     return
 
@@ -692,9 +691,36 @@ def compute_top_scoring_modules(
 
 def calculate_super_module_scores(
     adata: AnnData,
-    method: Optional[Union[Literal["mean"], Literal["PCA"]]] = 'PCA',
     super_module_dict: dict = None,
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    verbose: Optional[bool] = False,
 ):
+    """
+    Calculate super-module scores for gene super-modules across cells.
+
+    Parameters
+    ----------
+    adata : AnnData
+        Annotated data object (AnnData). Required fields in `adata.uns`:
+        - 'layer_key': name of the layer from which to extract the expression matrix
+        - 'model': statistical model used to normalize expression (e.g., 'DANB', 'normal')
+        - 'umi_counts': total UMI counts per cell
+        - 'gene_modules': dictionary mapping module IDs (as strings) to lists of gene names
+    super_module_dict: dict
+        Dictionary containing super-module IDs (integers) as keys and a list of associated modules (as integers) as values
+    device : torch.device, optional
+        Device to use for computation (e.g., CUDA or CPU). Defaults to GPU if available.
+    verbose : bool, optional (default: False)
+        Whether to print progress and status messages.
+
+    Returns
+    -------
+    None
+        The following results are stored in the `AnnData` object:
+        - `adata.obsm['super_module_scores']`: (cells x super-modules) DataFrame with per-cell super-module activity scores
+        - `adata.varm['gene_loadings_sm']`: (genes x super-modules) DataFrame with gene loadings for each super-module
+        - `adata.uns['gene_modules_sm']`: dictionary mapping super-module names to gene lists
+    """
 
     start = time.time()
 
@@ -702,50 +728,38 @@ def calculate_super_module_scores(
     
     reverse_mapping = {value: key for key, values in super_module_dict.items() for value in values}
     adata.uns["super_modules"] = adata.uns["modules"].replace(reverse_mapping)
-
-    if method == 'mean':
-        module_scores = adata.obsm['module_scores']
-
-        super_module_scores = pd.DataFrame(index=module_scores.index)
-        gene_modules_sm = {}
-        for sm, modules in super_module_dict.items():
-            super_module = f'Module {sm}'
-            modules = [f'Module {str(mod)}' for mod in modules]
-            super_module_scores[super_module] = module_scores[modules].mean(axis=1)
-            gene_modules_sm[super_module] = [item for key in modules for item in gene_modules.get(key, [])]
     
-    else:
-        layer_key = adata.uns['layer_key']
-        model = adata.uns['model']
+    super_module_dict = {key: values for key, values in super_module_dict.items() if key != -1}
 
-        use_raw = layer_key == "use_raw"
+    layer_key = adata.uns['layer_key']
+    model = adata.uns['model']
 
-        umi_counts = adata.uns['umi_counts']
+    use_raw = layer_key == "use_raw"
 
+    umi_counts = adata.uns['umi_counts']
+    
+    if verbose:
         print(f"Computing scores for {len(super_module_dict.keys())} super-modules...")
 
-        super_module_scores = {}
-        gene_loadings_sm = pd.DataFrame(index=adata.var_names)
-        gene_modules_sm = {}
-        for sm, modules in tqdm(super_module_dict.items()):
-            super_module = f'Module {sm}'
-            modules = [f'Module {str(mod)}' for mod in modules]
-            super_module_genes = [item for key in modules for item in gene_modules.get(key, [])]
-            
-            if method == 'PCA':
-                scores, loadings = compute_scores(
-                    adata[:, super_module_genes],
-                    layer_key,
-                    model,
-                    umi_counts,
-                )
-            else:
-                raise ValueError('Invalid method: Please choose either "mean" or "PCA".')
+    super_module_scores = {}
+    gene_loadings_sm = pd.DataFrame(index=adata.var_names)
+    gene_modules_sm = {}
+    for sm, modules in tqdm(super_module_dict.items()):
+        super_module = f'Module {sm}'
+        modules = [f'Module {str(mod)}' for mod in modules]
+        super_module_genes = [item for key in modules for item in gene_modules.get(key, [])]
+        
+        scores, loadings = compute_scores(
+            adata[:, super_module_genes],
+            layer_key,
+            model,
+            umi_counts,
+            device,
+        )
 
-            super_module_scores[super_module] = scores
-            gene_loadings_sm[super_module] = pd.Series(loadings, index=super_module_genes)
-            gene_modules_sm[super_module] = super_module_genes
-
+        super_module_scores[super_module] = scores
+        gene_loadings_sm[super_module] = pd.Series(loadings, index=super_module_genes)
+        gene_modules_sm[super_module] = super_module_genes
 
         super_module_scores = pd.DataFrame(super_module_scores)
         super_module_scores.index = adata.obs_names if not use_raw else adata.raw.obs.index
