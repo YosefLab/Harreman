@@ -1180,7 +1180,7 @@ def run_ct_cell_communication_analysis(
             if fix_gp:
                 indices = torch.randperm(len(cell_types)).numpy()
                 shuffled_cell_types = cell_types.iloc[indices].reset_index(drop=True)
-                weights_ct_pairs = create_weights_ct_pairs(weights, shuffled_cell_types, cell_type_pairs, device)
+                weights_ct_pairs = create_weights_ct_pairs(weights.tocoo(), shuffled_cell_types, cell_type_pairs, device)
             else:
                 cell_type_labels = torch.tensor(cell_types.astype('category').cat.codes.values, device=counts_1.device)
                 idx = torch.empty_like(cell_type_labels, dtype=torch.int64)
