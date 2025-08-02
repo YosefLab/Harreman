@@ -86,7 +86,7 @@ def compute_local_correlation(
     
     # Center values
     counts = standardize_counts(adata, counts, model, num_umi, sample_specific)
-        
+    
     # Compute weights
     weights = make_weights_non_redundant(adata.obsp["weights"]).tocoo()
     weights = torch.sparse_coo_tensor(
