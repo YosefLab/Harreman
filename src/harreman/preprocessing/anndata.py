@@ -187,38 +187,38 @@ def modify_uns_harreman(adata):
         adata.uns['LR_database']['receptor_transmembrane'] = adata.uns['LR_database']['receptor_transmembrane'].astype(str)
 
     if 'gene_pairs' in adata.uns.keys():
-        gene_pairs_tmp = [(x, ' - '.join(y) if isinstance(y, list) else y) for x, y in adata.uns['gene_pairs']]
-        gene_pairs_tmp = [(' - '.join(x) if isinstance(x, list) else x, y) for x, y in gene_pairs_tmp]
+        gene_pairs_tmp = [(x, ' - '.join(y) if isinstance(y, (list, tuple)) else y) for x, y in adata.uns['gene_pairs']]
+        gene_pairs_tmp = [(' - '.join(x) if isinstance(x, (list, tuple)) else x, y) for x, y in gene_pairs_tmp]
         adata.uns['gene_pairs'] = ['_'.join(gp) for gp in gene_pairs_tmp]
     
     if 'gene_pairs_sig' in adata.uns.keys():
-        gene_pairs_sig_tmp = [(x, ' - '.join(y) if isinstance(y, list) else y) for x, y in adata.uns['gene_pairs_sig']]
-        gene_pairs_sig_tmp = [(' - '.join(x) if isinstance(x, list) else x, y) for x, y in gene_pairs_sig_tmp]
+        gene_pairs_sig_tmp = [(x, ' - '.join(y) if isinstance(y, (list, tuple)) else y) for x, y in adata.uns['gene_pairs_sig']]
+        gene_pairs_sig_tmp = [(' - '.join(x) if isinstance(x, (list, tuple)) else x, y) for x, y in gene_pairs_sig_tmp]
         adata.uns['gene_pairs_sig'] = ['_'.join(gp) for gp in gene_pairs_sig_tmp]
 
     if 'gene_pairs_ind' in adata.uns.keys():
-        gene_pairs_ind_tmp = [(x, ' - '.join(map(str, y)) if isinstance(y, list) else str(y)) for x, y in adata.uns['gene_pairs_ind']]
-        gene_pairs_ind_tmp = [(' - '.join(map(str, x)) if isinstance(x, list) else str(x), y) for x, y in gene_pairs_ind_tmp]
+        gene_pairs_ind_tmp = [(x, ' - '.join(map(str, y)) if isinstance(y, (list, tuple)) else str(y)) for x, y in adata.uns['gene_pairs_ind']]
+        gene_pairs_ind_tmp = [(' - '.join(map(str, x)) if isinstance(x, (list, tuple)) else str(x), y) for x, y in gene_pairs_ind_tmp]
         adata.uns['gene_pairs_ind'] = ['_'.join(gp) for gp in gene_pairs_ind_tmp]
     
     if 'gene_pairs_sig_ind' in adata.uns.keys():
-        gene_pairs_sig_ind_tmp = [(x, ' - '.join(map(str, y)) if isinstance(y, list) else str(y)) for x, y in adata.uns['gene_pairs_sig_ind']]
-        gene_pairs_sig_ind_tmp = [(' - '.join(map(str, x)) if isinstance(x, list) else str(x), y) for x, y in gene_pairs_sig_ind_tmp]
+        gene_pairs_sig_ind_tmp = [(x, ' - '.join(map(str, y)) if isinstance(y, (list, tuple)) else str(y)) for x, y in adata.uns['gene_pairs_sig_ind']]
+        gene_pairs_sig_ind_tmp = [(' - '.join(map(str, x)) if isinstance(x, (list, tuple)) else str(x), y) for x, y in gene_pairs_sig_ind_tmp]
         adata.uns['gene_pairs_sig_ind'] = ['_'.join(gp) for gp in gene_pairs_sig_ind_tmp]
     
     if 'gene_pairs_per_metabolite' in adata.uns.keys():
         adata.uns['gene_pairs_per_metabolite'] = {key: {
-            'gene_pair': [(' - '.join(gp_1) if isinstance(gp_1, list) else gp_1, gp_2) for gp_1, gp_2 in subdict['gene_pair']],
+            'gene_pair': [(' - '.join(gp_1) if isinstance(gp_1, (list, tuple)) else gp_1, gp_2) for gp_1, gp_2 in subdict['gene_pair']],
             'gene_type': subdict['gene_type']
         } for key, subdict in adata.uns['gene_pairs_per_metabolite'].items()}
         adata.uns['gene_pairs_per_metabolite'] = {key: {
-            'gene_pair': [(gp_1, ' - '.join(gp_2) if isinstance(gp_2, list) else gp_2) for gp_1, gp_2 in subdict['gene_pair']],
+            'gene_pair': [(gp_1, ' - '.join(gp_2) if isinstance(gp_2, (list, tuple)) else gp_2) for gp_1, gp_2 in subdict['gene_pair']],
             'gene_type': subdict['gene_type']
         } for key, subdict in adata.uns['gene_pairs_per_metabolite'].items()}
     
     if 'gene_pairs_per_ct_pair' in adata.uns.keys():
-        adata.uns['gene_pairs_per_ct_pair'] = {key: [(x, ' - '.join(y) if isinstance(y, list) else y) for x, y in tuples_list] for key, tuples_list in adata.uns['gene_pairs_per_ct_pair'].items()}
-        adata.uns['gene_pairs_per_ct_pair'] = {key: [(' - '.join(x) if isinstance(x, list) else x, y) for x, y in tuples_list] for key, tuples_list in adata.uns['gene_pairs_per_ct_pair'].items()}
+        adata.uns['gene_pairs_per_ct_pair'] = {key: [(x, ' - '.join(y) if isinstance(y, (list, tuple)) else y) for x, y in tuples_list] for key, tuples_list in adata.uns['gene_pairs_per_ct_pair'].items()}
+        adata.uns['gene_pairs_per_ct_pair'] = {key: [(' - '.join(x) if isinstance(x, (list, tuple)) else x, y) for x, y in tuples_list] for key, tuples_list in adata.uns['gene_pairs_per_ct_pair'].items()}
         adata.uns['gene_pairs_per_ct_pair'] = {' - '.join(key): value for key, value in adata.uns['gene_pairs_per_ct_pair'].items()}
     
     if 'gene_pairs_per_ct_pair_ind' in adata.uns.keys():
@@ -228,28 +228,28 @@ def modify_uns_harreman(adata):
         adata.uns['gene_pairs_per_ct_pair_sig_ind'] = {' - '.join(key): value for key, value in adata.uns['gene_pairs_per_ct_pair_sig_ind'].items()}
     
     if 'gene_pairs_ind_per_ct_pair' in adata.uns.keys():
-        adata.uns['gene_pairs_ind_per_ct_pair'] = {key: [(x, ' - '.join(map(str, y)) if isinstance(y, list) else y) for x, y in tuples_list] for key, tuples_list in adata.uns['gene_pairs_ind_per_ct_pair'].items()}
-        adata.uns['gene_pairs_ind_per_ct_pair'] = {key: [(' - '.join(map(str, x)) if isinstance(x, list) else x, y) for x, y in tuples_list] for key, tuples_list in adata.uns['gene_pairs_ind_per_ct_pair'].items()}
+        adata.uns['gene_pairs_ind_per_ct_pair'] = {key: [(x, ' - '.join(map(str, y)) if isinstance(y, (list, tuple)) else y) for x, y in tuples_list] for key, tuples_list in adata.uns['gene_pairs_ind_per_ct_pair'].items()}
+        adata.uns['gene_pairs_ind_per_ct_pair'] = {key: [(' - '.join(map(str, x)) if isinstance(x, (list, tuple)) else x, y) for x, y in tuples_list] for key, tuples_list in adata.uns['gene_pairs_ind_per_ct_pair'].items()}
         adata.uns['gene_pairs_ind_per_ct_pair'] = {' - '.join(key): value for key, value in adata.uns['gene_pairs_ind_per_ct_pair'].items()}
     
     if 'gene_pairs_ind_per_ct_pair_sig' in adata.uns.keys():
-        adata.uns['gene_pairs_ind_per_ct_pair_sig'] = {key: [(x, ' - '.join(map(str, y)) if isinstance(y, list) else y) for x, y in tuples_list] for key, tuples_list in adata.uns['gene_pairs_ind_per_ct_pair_sig'].items()}
-        adata.uns['gene_pairs_ind_per_ct_pair_sig'] = {key: [(' - '.join(map(str, x)) if isinstance(x, list) else x, y) for x, y in tuples_list] for key, tuples_list in adata.uns['gene_pairs_ind_per_ct_pair_sig'].items()}
+        adata.uns['gene_pairs_ind_per_ct_pair_sig'] = {key: [(x, ' - '.join(map(str, y)) if isinstance(y, (list, tuple)) else y) for x, y in tuples_list] for key, tuples_list in adata.uns['gene_pairs_ind_per_ct_pair_sig'].items()}
+        adata.uns['gene_pairs_ind_per_ct_pair_sig'] = {key: [(' - '.join(map(str, x)) if isinstance(x, (list, tuple)) else x, y) for x, y in tuples_list] for key, tuples_list in adata.uns['gene_pairs_ind_per_ct_pair_sig'].items()}
         adata.uns['gene_pairs_ind_per_ct_pair_sig'] = {' - '.join(key): value for key, value in adata.uns['gene_pairs_ind_per_ct_pair_sig'].items()}
 
     if 'ccc_results' in adata.uns.keys():
-        adata.uns['ccc_results']['cell_com_df_gp'] = adata.uns['ccc_results']['cell_com_df_gp'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
-        adata.uns['ccc_results']['cell_com_df_m'] = adata.uns['ccc_results']['cell_com_df_m'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
+        adata.uns['ccc_results']['cell_com_df_gp'] = adata.uns['ccc_results']['cell_com_df_gp'].applymap(lambda x: ' - '.join(x) if isinstance(x, (list, tuple)) else x)
+        adata.uns['ccc_results']['cell_com_df_m'] = adata.uns['ccc_results']['cell_com_df_m'].applymap(lambda x: ' - '.join(x) if isinstance(x, (list, tuple)) else x)
         if 'cell_com_df_gp_sig' in adata.uns['ccc_results'].keys():
-            adata.uns['ccc_results']['cell_com_df_gp_sig'] = adata.uns['ccc_results']['cell_com_df_gp_sig'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
-            adata.uns['ccc_results']['cell_com_df_m_sig'] = adata.uns['ccc_results']['cell_com_df_m_sig'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
+            adata.uns['ccc_results']['cell_com_df_gp_sig'] = adata.uns['ccc_results']['cell_com_df_gp_sig'].applymap(lambda x: ' - '.join(x) if isinstance(x, (list, tuple)) else x)
+            adata.uns['ccc_results']['cell_com_df_m_sig'] = adata.uns['ccc_results']['cell_com_df_m_sig'].applymap(lambda x: ' - '.join(x) if isinstance(x, (list, tuple)) else x)
     
     if 'ct_ccc_results' in adata.uns.keys():
-        adata.uns['ct_ccc_results']['cell_com_df_gp'] = adata.uns['ct_ccc_results']['cell_com_df_gp'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
-        adata.uns['ct_ccc_results']['cell_com_df_m'] = adata.uns['ct_ccc_results']['cell_com_df_m'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
+        adata.uns['ct_ccc_results']['cell_com_df_gp'] = adata.uns['ct_ccc_results']['cell_com_df_gp'].applymap(lambda x: ' - '.join(x) if isinstance(x, (list, tuple)) else x)
+        adata.uns['ct_ccc_results']['cell_com_df_m'] = adata.uns['ct_ccc_results']['cell_com_df_m'].applymap(lambda x: ' - '.join(x) if isinstance(x, (list, tuple)) else x)
         if 'cell_com_df_gp_sig' in adata.uns['ct_ccc_results'].keys():
-            adata.uns['ct_ccc_results']['cell_com_df_gp_sig'] = adata.uns['ct_ccc_results']['cell_com_df_gp_sig'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
-            adata.uns['ct_ccc_results']['cell_com_df_m_sig'] = adata.uns['ct_ccc_results']['cell_com_df_m_sig'].applymap(lambda x: ' - '.join(x) if isinstance(x, list) else x)
+            adata.uns['ct_ccc_results']['cell_com_df_gp_sig'] = adata.uns['ct_ccc_results']['cell_com_df_gp_sig'].applymap(lambda x: ' - '.join(x) if isinstance(x, (list, tuple)) else x)
+            adata.uns['ct_ccc_results']['cell_com_df_m_sig'] = adata.uns['ct_ccc_results']['cell_com_df_m_sig'].applymap(lambda x: ' - '.join(x) if isinstance(x, (list, tuple)) else x)
 
     return
 

@@ -41,6 +41,8 @@ def apply_gene_filtering(
     autocorrelation_filt: Optional[bool] = False,
     expression_filt: Optional[bool] = False,
     de_filt: Optional[bool] = False,
+    umi_counts_obs_key: Optional[str] = None,
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     verbose: Optional[bool] = False,
 ):
     """
@@ -66,6 +68,10 @@ def apply_gene_filtering(
         If True, filters genes based on expression in each cell type.
     de_filt : str, optional (default: False)
         If True, filters genes based on differential expression between each cell type and the rest.
+    umi_counts_obs_key : str, optional
+        Key in `adata.obs` with total UMI counts per cell. If `None`, inferred from the expression matrix.
+    device : torch.device, optional
+        Device to use for computation (e.g., CUDA or CPU). Defaults to GPU if available.
     verbose : bool, optional (default: False)
         Whether to print progress and status messages.
 
@@ -89,10 +95,13 @@ def apply_gene_filtering(
 
     if autocorrelation_filt:
         compute_local_autocorrelation(
-            adata,
-            layer_key,
-            db_key,
-            model,
+            adata=adata,
+            layer_key=layer_key,
+            database_varm_key=db_key,
+            model=model,
+            umi_counts_obs_key=umi_counts_obs_key,
+            device=device,
+            verbose=verbose,
         )
 
     if expression_filt or de_filt:
@@ -1789,10 +1798,10 @@ def compute_interacting_cell_scores(
     if test not in ['both', 'parametric', 'non-parametric']:
         raise ValueError('The "test" variable should be one of ["both", "parametric", "non-parametric"].')
     
-    if restrict_significance not in ['both', 'gene pairs', 'metabolites']:
+    if restrict_significance is not None and restrict_significance not in ['both', 'gene pairs', 'metabolites']:
         raise ValueError('The "restrict_significance" variable should be one of ["both", "gene pairs", "metabolites"].')
     
-    if compute_significance not in ['both', 'parametric', 'non-parametric']:
+    if compute_significance is not None and compute_significance not in ['both', 'parametric', 'non-parametric']:
         raise ValueError('The "compute_significance" variable should be one of ["both", "parametric", "non-parametric"].')
     
     sample_specific = 'sample_key' in adata.uns
