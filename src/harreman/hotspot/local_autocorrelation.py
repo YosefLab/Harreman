@@ -84,11 +84,11 @@ def compute_local_autocorrelation(
     M : int, optional (default: 1000)
         Number of permutations to perform if `permutation_test` is True.
     seed : int, optional (default: 42)
-        A random seed for the permutation testing.
+        Random seed for permutation reproducibility.
     check_analytic_null : bool, optional (default: False)
         Whether to evaluate Z-scores under an analytic null distribution using permutation Z-scores.
     device : torch.device, optional
-        Device to use for computation (e.g., CUDA or CPU). Defaults to GPU if available.
+        PyTorch device to run computations on. Defaults to CUDA if available.
     verbose : bool, optional (default: False)
         Whether to print progress and status messages.
 
