@@ -410,11 +410,6 @@ def compute_cor_Z_scores(
     Z_ba = np.tril(Z.T, k=-1)
 
     Z = np.where(np.abs(Z_ab) < np.abs(Z_ba), Z_ab, Z_ba)
-    # Z = np.where(np.abs(Z_ab) > np.abs(Z_ba), Z_ab, Z_ba)
-    # Z = (Z_ab + Z_ba) / 2
-    
-    # random_choice = np.random.rand(*Z_ab.shape) < 0.5
-    # Z = np.where(random_choice, Z_ab, Z_ba)
 
     i_upper = np.triu_indices(Z.shape[0], k=1)
     Z[i_upper] = Z.T[i_upper]
