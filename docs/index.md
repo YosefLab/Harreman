@@ -48,7 +48,7 @@ Follow the latest changes to Harreman.
 :::
 
 :::{grid-item-card} GitHub {octicon}`mark-github;1em;`
-:link: https://github.com/oieretxezarreta/Harreman
+:link: https://github.com/YosefLab/Harreman
 
 Checkout our GitHub for the latest developments.
 :::
@@ -65,4 +65,4 @@ tutorials/index
 api/index
 release_notes/index
 references.md
-GitHub <https://github.com/oieretxezarreta/Harreman>
+GitHub <https://github.com/YosefLab/Harreman>
