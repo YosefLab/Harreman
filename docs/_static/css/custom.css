@@ -1,5 +1,5 @@
 body {
-    --sd-color-shadow: dimgrey;
+    --sd-color-shadow: white;
 }
 
 .wy-nav-side {
@@ -7,23 +7,15 @@ body {
 }
 
 .wy-side-nav-search {
-    background-color: #f0f0f0;
+    background-color: #ffffff;
 }
 
-/* Optional: tweak the logo itself if needed */
 .wy-side-nav-search .logo img {
     background-color: transparent;
 }
 
-.bd-sidebar .caption-text {
-    color: #1f77b4;
-    font-weight: 600;
-    text-transform: uppercase;
-}
-
-
 .wy-menu-vertical a {
-    color: #2c3e50;   /* dark gray or your preferred color */
+    color: #4292C6;   /* dark gray or your preferred color */
 }
 
 /* Sidebar link hover color */
