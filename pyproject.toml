@@ -1,0 +1,136 @@
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling"]
+
+[project]
+name = "harreman"
+version = "0.1.0"
+description = "Metabolic cell-cell communication inference in spatial transcriptomics."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = {file = "LICENSE"}
+authors = [
+  {name = "Oier Etxezarreta Arrastoa", email = "oier.etxezarreta@weizmann.ac.il"}
+]
+
+urls.Source = "https://github.com/YosefLab/Harreman"
+urls.Home-page = "https://github.com/YosefLab/Harreman"
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Natural Language :: English",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+  "numpy",
+  "scipy",
+  "anndata",
+  # add more runtime dependencies here
+]
+[project.optional-dependencies]
+dev = [
+  "sphinx",
+  "sphinx-rtd-theme",
+  "myst-parser",
+]
+docs = [
+    "docutils>=0.8,!=0.18.*,!=0.19.*",
+    "sphinx>=4.1",
+    "sphinx-book-theme>=1.0.0",
+    "myst-nb",
+    "myst-parser",
+    "sphinxcontrib-bibtex>=1.0.0",
+    "sphinx-autodoc-typehints",
+    "sphinx_rtd_theme",
+    "sphinxext-opengraph",
+    "sphinx-copybutton",
+    "sphinx-design",
+    "sphinx-hoverxref",
+    # For notebooks
+    "ipykernel",
+    "ipython",
+    "pandas",
+]
+docsbuild = [
+    "Harreman[docs]"
+]
+tests = [
+    "pytest",
+    "coverage",
+]
+tutorials = [
+    "jupyterlab",
+]
+all = ["Harreman[dev,docs,tests,tutorials]"]
+
+[tool.coverage.run]
+source = ["harreman"]
+omit = [
+    "**/test_*.py",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+xfail_strict = true
+addopts = [
+    "--import-mode=importlib",  # allow using test files with same name
+]
+
+[tool.ruff]
+src = ["src"]
+line-length = 99
+indent-width = 4
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "F",  # Errors detected by Pyflakes
+    "E",  # Error detected by Pycodestyle
+    "W",  # Warning detected by Pycodestyle
+    "I",  # isort
+    "D",  # pydocstyle
+    "B",  # flake8-bugbear
+    "TID",  # flake8-tidy-imports
+    "C4",  # flake8-comprehensions
+    "BLE",  # flake8-blind-except
+    "UP",  # pyupgrade
+    "RUF100",  # Report unused noqa directives
+    "PT", # pytest style
+    "NPY", # numpy formatting
+    "TCH", # flake8-type-checking
+    "FA", # flake8-future-annotations
+]
+ignore = [
+    # allow I, O, l as variable names -> I is the identity matrix
+    "E741",
+    # Missing docstring in public package
+    "D104",
+    # Missing docstring in public module
+    "D100",
+    # Missing docstring in __init__
+    "D107",
+    # Errors from function calls in argument defaults. These are fine when the result is immutable.
+    "B008",
+    # first line should end with a period [Bug: doesn't work with single-line docstrings]
+    "D400",
+    # First line should be in imperative mood; try rephrasing
+    "D401",
+    # We want docstrings to start immediately after the opening triple quote
+    "D213",
+    # Raising ValueError is sufficient in tests.
+    "PT011",
+    # We support np.random functions.
+    "NPY002"
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.per-file-ignores]
+"docs/*" = ["I"]
+"tests/*" = ["D"]
+"*/__init__.py" = ["F401"]
+

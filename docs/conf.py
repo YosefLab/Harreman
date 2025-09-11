@@ -8,15 +8,18 @@ HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE / "extensions"))
 
 # Project information
-info = metadata("Harreman")
-project_name = info["Name"]
-author = info["Author"]
+try:
+    info = metadata("harreman")  # distribution name, lowercase
+except Exception:
+    info = {}
+project_name = info.get("Name", "Harreman")
+author = info.get("Author") or "Oier Etxezarreta Arrastoa"
 copyright = f"{datetime.now():%Y}, {author}."
-version = info["Version"]
-repository_url = f"https://github.com/YosefLab/{project_name}"
+version = info.get("Version", "0.1.0")
+repository_url = "https://github.com/YosefLab/Harreman"
 
 # The full version, including alpha/beta/rc tags
-release = info["Version"]
+release = version
 
 bibtex_bibfiles = ["references.bib"]
 templates_path = ["_templates"]
@@ -38,7 +41,6 @@ extensions = [
     "myst_nb",
     "sphinx.ext.autodoc",
     "sphinx.ext.intersphinx",
-    "sphinx.ext.linkcode",
     "sphinx.ext.autosummary",
     "sphinx.ext.extlinks",
     "sphinx.ext.mathjax",
@@ -99,7 +101,7 @@ html_theme = 'sphinx_rtd_theme'
 html_static_path = ['_static']
 html_title = project_name
 
-html_logo = "_static/Harreman_logo.pdf"
+html_logo = "_static/Harreman_logo.png"
 
 html_theme_options = {
     "repository_url": repository_url,

@@ -19,7 +19,6 @@ src/harreman/tools/__init__.py
 src/harreman/tools/api.py
 src/harreman/tools/cell_communication.py
 src/harreman/tools/knn.py
-src/harreman/tools/main.py
 src/harreman/vision/VISION_accessor.py
 src/harreman/vision/__init__.py
 src/harreman/vision/diffexp.py
