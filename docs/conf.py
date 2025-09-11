@@ -6,8 +6,8 @@
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
-import os
 import sys
+from pathlib import Path
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE / "extensions"))
 
