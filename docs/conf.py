@@ -99,8 +99,9 @@ exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "**.ipynb_checkpoints"]
 
 html_theme = 'sphinx_rtd_theme'
 html_static_path = ['_static']
-html_title = project_name
+html_css_files = ["css/custom.css"]
 
+html_title = "Harreman"
 html_logo = "_static/Harreman_logo.png"
 
 html_theme_options = {
