@@ -12,7 +12,7 @@ license = {file = "LICENSE"}
 authors = [
   {name = "Oier Etxezarreta Arrastoa", email = "oier.etxezarreta@weizmann.ac.il"}
 ]
-
+urls.Documentation = "https://harreman.readthedocs.io/"
 urls.Source = "https://github.com/YosefLab/Harreman"
 urls.Home-page = "https://github.com/YosefLab/Harreman"
 classifiers = [

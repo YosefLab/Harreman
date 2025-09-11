@@ -11,7 +11,7 @@ sys.path.insert(0, str(HERE / "extensions"))
 try:
     info = metadata("harreman")  # distribution name, lowercase
 except Exception:
-    info = {}
+    info = "harreman"
 project_name = info.get("Name", "Harreman")
 author = info.get("Author") or "Oier Etxezarreta Arrastoa"
 copyright = f"{datetime.now():%Y}, {author}."
