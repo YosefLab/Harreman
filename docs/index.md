@@ -1,9 +1,10 @@
 
-# Welcome to Harreman's documentation!
-======================
+# Documentation
 
 Harreman (Basque for "receive" and "give") is a Python package for metabolic cell-cell communication inference in spatial transcriptomics data. Harreman is inte
 roperable with [AnnData](https://anndata.readthedocs.io/en/latest/) objects and it is developed and maintained by the [Yosef Lab](https://www.weizmann.ac.il/immunology/yosef/) at the Weizmann Institute of Science.
+
+![overview](figs/Fig_1.png)
 
 ::::{grid} 1 2 3 3
 :gutter: 2
