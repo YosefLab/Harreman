@@ -1930,6 +1930,14 @@ def compute_ct_interacting_cell_scores(
         
         metabolite_set = set(cell_com_m_df['metabolite'].values)
         metabolite_gene_pair_df = metabolite_gene_pair_df[metabolite_gene_pair_df['metabolite'].isin(metabolite_set)]
+    
+    if metabolite_gene_pair_df.empty:
+        if restrict_significance == 'both':
+            raise ValueError("There are no significant gene pairs that belong to a significant metabolite.")
+        if restrict_significance == 'gene pairs':
+            raise ValueError("There are no significant gene pairs.")
+        if restrict_significance == 'metabolites':
+            raise ValueError("There are no significant metabolites.")
 
     genes = adata.uns["genes"]
     gene_pairs_sig = []

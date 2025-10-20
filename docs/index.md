@@ -28,7 +28,7 @@ with the code.
 :link: tutorials/index
 :link-type: doc
 
-Learn by following example applications of MintFlow.
+Learn by following example applications of Harreman.
 :::
 
 :::{grid-item-card} API reference {octicon}`book;1em;`
