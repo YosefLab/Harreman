@@ -8,11 +8,7 @@ HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE / "extensions"))
 
 # Project information
-# try:
-#     info = metadata("harreman")  # distribution name, lowercase
-# except Exception:
-#     info = "harreman"
-info = metadata("Harreman")
+info = metadata("harreman")
 project_name = info.get("Name", "Harreman")
 project = project_name
 author = info.get("Author") or "Oier Etxezarreta Arrastoa"
