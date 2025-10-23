@@ -166,7 +166,8 @@ def build_metabolite_df(metab_dict, key):
 def extract_lr_pairs(adata, species):
     """Extracting LR pairs from CellChatDB."""
     
-    BASE = "/home/projects/nyosef/oier/Harreman/data/CellChatDB"
+    HERE = Path(__file__).resolve()
+    BASE = HERE.parents[3] / "data" / "CellChatDB"
     interaction_path = f"{BASE}/interaction_input_CellChatDB_v2_{species}.csv"
     complex_path = f"{BASE}/complex_input_CellChatDB_v2_{species}.csv"
 
