@@ -3,7 +3,7 @@ build-backend = "hatchling.build"
 requires = ["hatchling"]
 
 [project]
-name = "harreman"
+name = "Harreman"
 version = "0.1.0"
 description = "Metabolic cell-cell communication inference in spatial transcriptomics."
 readme = "README.md"
