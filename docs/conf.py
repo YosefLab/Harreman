@@ -14,6 +14,7 @@ sys.path.insert(0, str(HERE / "extensions"))
 #     info = "harreman"
 info = metadata("Harreman")
 project_name = info.get("Name", "Harreman")
+project = project_name
 author = info.get("Author") or "Oier Etxezarreta Arrastoa"
 copyright = f"{datetime.now():%Y}, {author}."
 version = info.get("Version", "0.1.0")
