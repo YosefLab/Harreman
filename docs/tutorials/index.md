@@ -5,6 +5,6 @@ Get started with Harreman by following our tutorials.
 ```{toctree}
 :maxdepth: 2
 
-training_tutorials
-akanother_section
+hotspot_tutorials
+harreman_tutorials
 ```
