@@ -8,15 +8,17 @@ HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE / "extensions"))
 
 # Project information
-try:
-    info = metadata("harreman")  # distribution name, lowercase
-except Exception:
-    info = "harreman"
+# try:
+#     info = metadata("harreman")  # distribution name, lowercase
+# except Exception:
+#     info = "harreman"
+info = metadata("Harreman")
 project_name = info.get("Name", "Harreman")
 author = info.get("Author") or "Oier Etxezarreta Arrastoa"
 copyright = f"{datetime.now():%Y}, {author}."
 version = info.get("Version", "0.1.0")
-repository_url = "https://github.com/YosefLab/Harreman"
+# repository_url = "https://github.com/YosefLab/Harreman"
+repository_url = urls["Source"]
 
 # The full version, including alpha/beta/rc tags
 release = version
