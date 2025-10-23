@@ -11,9 +11,9 @@ sys.path.insert(0, str(HERE / "extensions"))
 info = metadata("harreman")
 project_name = info.get("Name", "Harreman")
 project = project_name
-author = info["Author"]
+author = info.get("Author") or "Oier Etxezarreta Arrastoa"
 copyright = f"{datetime.now():%Y}, {author}."
-version = info["Version"]
+version = info.get("Version", "0.1.0")
 urls = dict(pu.split(", ") for pu in info.get_all("Project-URL"))
 repository_url = urls["Source"]
 
