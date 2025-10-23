@@ -7,6 +7,7 @@ import pandas as pd
 import time
 from anndata import AnnData
 from scipy.sparse import issparse
+from pathlib import Path
 
 IMPORT_METAB_KEY = "IMPORT"
 EXPORT_METAB_KEY = "EXPORT"
@@ -113,7 +114,8 @@ def extract_transporter_info(
 ) -> Dict[str, Dict[str, List[str]]]:
     """Read csv file to extract the metabolite database."""
     
-    BASE = "/home/projects/nyosef/oier/Harreman/data/HarremanDB"
+    HERE = Path(__file__).resolve()
+    BASE = HERE.parents[3] / "data" / "HarremanDB"
     filenames = {
         'extracellular': f"{BASE}/HarremanDB_{species}_extracellular.csv",
         'all': f"{BASE}/HarremanDB_{species}.csv",

@@ -9,6 +9,7 @@ from scipy.stats import norm
 from scipy.sparse import csr_matrix
 from statsmodels.stats.multitest import multipletests
 from tqdm import tqdm
+from pathlib import Path
 
 from . import models
 from ..preprocessing.anndata import counts_from_anndata
@@ -30,13 +31,12 @@ def load_metabolic_genes(
     -------
     List of metabolic genes.
     """
-
-    metabolic_genes_paths = {
-        'human': "/home/projects/nyosef/oier/Harreman_files/metabolic_genes/human_metabolic_genes.csv",
-        'mouse': "/home/projects/nyosef/oier/Harreman_files/metabolic_genes/mouse_metabolic_genes.csv"
-    }
-
-    metabolic_genes = pd.read_csv(metabolic_genes_paths[species], index_col=0)['0'].tolist()
+    
+    HERE = Path(__file__).resolve()
+    BASE = HERE.parents[3] / "data" / "metabolic_genes"
+    
+    metabolic_genes_path = f"{BASE}/{species}_metabolic_genes.csv"
+    metabolic_genes = pd.read_csv(metabolic_genes_path, index_col=0)['0'].tolist()
 
     return metabolic_genes
 
