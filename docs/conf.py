@@ -17,6 +17,7 @@ project_name = info.get("Name", "Harreman")
 author = info.get("Author") or "Oier Etxezarreta Arrastoa"
 copyright = f"{datetime.now():%Y}, {author}."
 version = info.get("Version", "0.1.0")
+urls = dict(pu.split(", ") for pu in info.get_all("Project-URL"))
 # repository_url = "https://github.com/YosefLab/Harreman"
 repository_url = urls["Source"]
 
