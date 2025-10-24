@@ -1,4 +1,9 @@
 
+import subprocess
+import os
+import importlib
+import inspect
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +16,7 @@ sys.path.insert(0, str(HERE / "extensions"))
 info = metadata("harreman")
 project_name = info.get("Name", "Harreman")
 project = project_name
+package_name = "harreman"
 author = info.get("Author") or "Oier Etxezarreta Arrastoa"
 copyright = f"{datetime.now():%Y}, {author}."
 version = info.get("Version", "0.1.0")
