@@ -46,11 +46,11 @@ Harreman provides a series of formulas to perform spatial correlation and charac
 ```
 ```{eval-rst}
 .. card:: Level 9: Do genes *a* and *b* interact when *a* is expressed by cell *i* (that belongs to cell type *t*) and *b* by spatially nearby cells (that belong to cell type *u*)?
-    :link: level_9
+    :link: level_8
     :link-type: doc
 ```
 ```{eval-rst}
 .. card:: Level 10: Is metabolite *m* exchanged by cell *i* (that belongs to cell type *t*) and other spatially proximal cells (that belong to cell type *u*)?
-    :link: level_10
+    :link: level_8
     :link-type: doc
 ```
