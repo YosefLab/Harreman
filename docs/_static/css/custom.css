@@ -27,7 +27,7 @@ body {
 .wy-menu-vertical li.current > a,
 .wy-menu-vertical li.toctree-l1.current > a {
     color: #ffffff;          /* white text */
-    background-color: #BDBDBD;  /* dark background */
+    background-color: #000000;  /* dark background */
 }
 
 .icon.icon-home,
