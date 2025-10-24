@@ -54,3 +54,10 @@ Harreman provides a series of formulas to perform spatial correlation and charac
     :link: level_10
     :link-type: doc
 ```
+
+```{toctree}
+:maxdepth: 2
+
+level_1
+level_2
+```
