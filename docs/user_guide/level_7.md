@@ -1,6 +1,6 @@
 # Level 7: Do genes *a* and *b* interact when *a* is expressed by cell *i* and *b* by spatially nearby cells?
 
-The results obtained using the cell type-agnostic approach described in Level 3 can be visualized in space in a way such that each cell/spot is assigned a score aggregating the communication with neighboring cells/spots through a given gene pair $(a,b)$:
+The results obtained using the cell type-agnostic approach described in [Level 3](level_3.md) can be visualized in space in a way such that each cell/spot is assigned a score aggregating the communication with neighboring cells/spots through a given gene pair $(a,b)$:
 
 $$ H_{i} (ab) = \sum_{j}^{} w_{ij}(X_{ai}X_{bj} + X_{bi}X_{aj}) $$
 
@@ -8,7 +8,7 @@ If $a = b$:
 
 $$ H_{i} (a) = \sum_{j}^{} w_{ij}X_{ai}X_{aj} $$
 
-Statistical significance assessment is considered optional in this case, as it is possible to apply the above formula to just visualize the scores in space without filtering out non-significant values. However, a theoretical and an empirical approach have also been implemented for the purpose of avoiding considering interactions with low signal, and therefore visualizing only those cells or spots with significant scores. The second moments were computed using the same procedure as in Levels 1 and 2, giving rise to the equations below:
+Statistical significance assessment is considered optional in this case, as it is possible to apply the above formula to just visualize the scores in space without filtering out non-significant values. However, a theoretical and an empirical approach have also been implemented for the purpose of avoiding considering interactions with low signal, and therefore visualizing only those cells or spots with significant scores. The second moments were computed using the same procedure as in Levels [1](level_1.md) and [2](level_2.md), giving rise to the equations below:
 
 $$ E\left[{\hat{H}_i(ab)}^{2}\right]= \left(\sum_{j \in N(i)}^{} w_{ij}\hat{X}_{bj}\right)^2 $$
 
