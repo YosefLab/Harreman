@@ -28,9 +28,9 @@ P-values are then adjusted using the Benjamini-Hochberg procedure.
 
 In the empirical test setting, if genes _a_ and _b_ are different, cell IDs in the counts matrix corresponding to gene _a_ (or _b_) are shuffled _M_ times ($M=1,000$ by default) and eventually the most conservative p-values are selected. If gene $a=b$, though, the cell IDs in the counts matrix are shuffled. Then, the correlation values for each gene according to the equations below are computed in each iteration, respectively:
 
-$$ \hat{Z}_i(ab) = \frac{\hat{H}_i(ab) - E[\hat{H}_i(ab)]}{var(\hat{H}_i(ab))^\frac{1}{2}} = \frac{\sum_{j}^{} w_{ij}(X_{ai}X_{bj} + X_{bi}X_{aj})}{\left(\sum_{j \in N(i)}^{} w_{ij}\hat{X}_{bj}\right)^2} $$
+$$ H_{i} (ab) = \sum_{j}^{} w_{ij}(X_{ai}X_{bj} + X_{bi}X_{aj}) $$
 
-$$ \hat{Z}_i(a) = \frac{\hat{H}_i(a) - E[\hat{H}_i(a)]}{var(\hat{H}_i(a))^\frac{1}{2}} = \frac{\sum_{j}^{} w_{ij}X_{ai}X_{aj}}{(\sum_{j}^{} w_{ij}^2)^\frac{1}{2}} $$
+$$ H_{i} (a) = \sum_{j}^{} w_{ij}X_{ai}X_{aj} $$
 
 To calculate the p-value, the equation below is used:
 
