@@ -16,7 +16,7 @@ and p-values are obtained for every metabolite by comparing the Z values to the 
 
 For significance testing using the empirical test, the following equation is computed in every shuffling iteration:
 
-$$ \hat{Z}_i(a) = \frac{\hat{H}_i(a) - E[\hat{H}_i(a)]}{var(\hat{H}_i(a))^\frac{1}{2}} = \frac{\sum_{j}^{} w_{ij}X_{ai}X_{aj}}{(\sum_{j}^{} w_{ij}^2)^\frac{1}{2}} $$
+$$ H_{i}(m) = \sum_{a,b \in m}^{} H_{i} (ab) $$
 
 This is done separately for genes _a_ and _b_ because, when _a_ and _b_ are different, the cell IDs corresponding to the counts matrices of both gene _a_ and _b_ are shuffled, giving rise to $H_i(m)(a)$ and $H_i(m)(b)$. However, if gene $a=b$, then the same output is considered for both $H_i(m)(a)$ and $H_i(m)(b)$. Then, two sets of p-values are obtained through the $p-value = \frac{x+1}{M+1}$ equation, and eventually the most conservative p-values are selected. P-values are also adjusted using the Benjamini-Hochberg procedure.
 
