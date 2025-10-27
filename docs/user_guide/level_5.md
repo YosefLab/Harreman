@@ -32,6 +32,9 @@ To test significance and evaluate expectations for _H_, a null model is needed. 
 
 Then, the correlation values for each cell type pair and gene pair are computed according to the equation below in each iteration:
 
-$$ \hat{Z}_{m} = \frac{\hat{H}_{m} - E[\hat{H}_{m}]}{var(\hat{H}_{m})^\frac{1}{2}} = \frac{\sum_{a,b \in m}^{}\hat{H}_{ab}}{\left(\sum_{a,b \in m}^{}E[\hat{H}_{ab}^2]\right)^\frac{1}{2}} $$
+$$ H_{ab}^{t,u} = \sum_{\substack{
+(i, j) \in E \\
+i \in C_t, j \in C_u
+}}^{} w_{ij}X_{ai}X_{bj} $$
 
 and $p-value = \frac{x+1}{M+1}$ is used to calculate the p-value. P-values are finally adjusted using the Benjamini-Hochberg approach.
