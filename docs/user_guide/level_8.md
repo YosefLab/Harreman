@@ -1,10 +1,10 @@
 # Level 8: Is metabolite *m* exchanged by cell *i* and other spatially proximal cells?
 
-Visualizing the individual cell/spot contributions of the results obtained using the metabolite-based approach described in Level 4 is also useful. For this, the equation below can be used for every metabolite (or LR pathway), where the scores of the gene pairs (defined in $H_{i} (ab) = \sum_{j}^{} w_{ij}(X_{ai}X_{bj} + X_{bi}X_{aj})$ and $H_{i} (a) = \sum_{j}^{} w_{ij}X_{ai}X_{aj}$) that are associated with a given metabolite are summed up:
+Visualizing the individual cell/spot contributions of the results obtained using the metabolite-based approach described in [Level 4](level_4.md) is also useful. For this, the equation below can be used for every metabolite (or LR pathway), where the scores of the gene pairs (defined in $H_{i} (ab) = \sum_{j}^{} w_{ij}(X_{ai}X_{bj} + X_{bi}X_{aj})$ and $H_{i} (a) = \sum_{j}^{} w_{ij}X_{ai}X_{aj}$) that are associated with a given metabolite are summed up:
 
 $$ H_{i}(m) = \sum_{a,b \in m}^{} H_{i} (ab) $$
 
-To test for statistical significance using the theoretical test, a very similar approach to the one described in Level 4 is used, where the second moments of $H_{i}(ab)$ are summed up for every metabolite depending on the gene pairs that are associated with it:
+To test for statistical significance using the theoretical test, a very similar approach to the one described in [Level 4](level_4.md) is used, where the second moments of $H_{i}(ab)$ are summed up for every metabolite depending on the gene pairs that are associated with it:
 
 $$ E\left[{\hat{H}_i (m)}^{2}\right]= \sum_{a,b \in m}^{} E\left[{\hat{H}_i (ab)}^{2}\right] $$
 
