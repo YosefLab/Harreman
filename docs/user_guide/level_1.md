@@ -4,7 +4,7 @@ When performing tissue zonation, having a limited set of informative genes is us
 
 $$ H_{a} = \sum_{i}^{}\sum_{j}^{} w_{ij}X_{ai}X_{aj} $$
 
-where _a_ and _b_ are two different genes expressed by cells _i_ and _j_, respectively, and _X_ refers to the gene expression matrix of dimension _genes_ x _cells_.
+where _a_ is a gene expressed by cells _i_ and _j_, and _X_ refers to the gene expression matrix of dimension _genes_ x _cells_.
 
 The weight $w_{ij}$ represents communication strength between neighboring cells. It is positive if _i_ and _j_ are neighbors and 0 otherwise, and the lower the distance in the similarity graph, meaning a more similar neighbor, the higher the value. To calculate them, a Gaussian kernel is used, which is defined by the following equation:
 
@@ -52,7 +52,7 @@ $$ \hat{Z}_a = \frac{\hat{H}_{a} - E[\hat{H}_{a}]}{var(\hat{H}_{a})^\frac{1}{2}}
 
 Lastly, p-values are adjusted using the Benjamini-Hochberg procedure.
 
-In the empirical test setting, either raw gene counts, log-normalized values, standardized gene expression values, or counts normalized in any desired way can be used. Cell IDs from the counts matrix are shuffled _M_ times ($M=1,000$ by default), and the correlation values for each gene according to $H_{a} = \sum_{i}^{}\sum_{j}^{} w_{ij}X_{ai}X_{aj}$ are computed in each iteration. Then, the equation below is used to calculate the p-value, where _x_ represents the number of permuted _H_ values that are higher than the observed one and _M_ is the total number of permutations.
+In the empirical test setting, either raw gene counts, log-normalized values, standardized gene expression values, or counts normalized in any other desired way can be used. Cell IDs from the counts matrix are shuffled _M_ times ($M=1,000$ by default), and the correlation values for each gene according to $H_{a} = \sum_{i}^{}\sum_{j}^{} w_{ij}X_{ai}X_{aj}$ are computed in each iteration. Then, the equation below is used to calculate the p-value, where _x_ represents the number of permuted _H_ values that are higher than the observed one and _M_ is the total number of permutations.
 
 $$ p-value = \frac{x+1}{M+1} $$
 
