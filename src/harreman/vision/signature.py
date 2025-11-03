@@ -418,7 +418,8 @@ def compute_signatures_anndata(
             sig_matrix = sig_matrix.to_numpy()
         sig_matrix = csr_matrix(sig_matrix)
     is_sparse = issparse(gene_expr)
-    gene_expr = gene_expr.A if is_sparse else gene_expr
+    # gene_expr = gene_expr.A if is_sparse else gene_expr
+    gene_expr = gene_expr.toarray() if is_sparse else gene_expr
     cell_signature_matrix = gene_expr @ sig_matrix
     # cell_signature_matrix = (gene_expr @ sig_matrix).toarray()
     sig_df = pd.DataFrame(data=cell_signature_matrix, columns=cols, index=adata.obs_names)
