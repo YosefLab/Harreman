@@ -12,7 +12,7 @@ exclude = [
 
 [project]
 name = "harreman"
-version = "0.1.1"
+version = "0.1.2"
 description = "Metabolic cell-cell communication inference in spatial transcriptomics."
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
