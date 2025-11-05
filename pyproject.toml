@@ -28,6 +28,7 @@ dependencies = [
   "numpy",
   "scipy",
   "anndata",
+  "matplotlib",
   # add more runtime dependencies here
 ]
 [project.optional-dependencies]
