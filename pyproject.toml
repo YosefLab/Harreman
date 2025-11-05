@@ -2,6 +2,14 @@
 build-backend = "hatchling.build"
 requires = ["hatchling"]
 
+[tool.hatch.build]
+exclude = [
+    "data",
+    "notebooks",
+    "docs",
+    "tests",
+]
+
 [project]
 name = "harreman"
 version = "0.1.1"
