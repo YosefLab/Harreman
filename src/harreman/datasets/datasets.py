@@ -30,7 +30,7 @@ def load_visium_mouse_colon_dataset(
     
     if sample:
         if sample not in samples_path_dict.keys():
-            raise ValueError(f'"sample" needs to be one of: {samples_path_dict.keys()}')
+            raise ValueError(f'"sample" needs to be one of: {list(samples_path_dict.keys())}')
         else:
             adata_path = os.path.join(temp_dir_obj.name, f"{dataset_prefix}_{sample}.h5ad")
             backup_url = samples_path_dict[sample]
@@ -69,7 +69,7 @@ def load_slide_seq_human_lung_dataset(
 
     if sample:
         if sample not in samples_path_dict.keys():
-            raise ValueError(f'"sample" needs to be one of: {samples_path_dict.keys()}')
+            raise ValueError(f'"sample" needs to be one of: {list(samples_path_dict.keys())}')
         else:
             adata_path = os.path.join(temp_dir_obj.name, f"{dataset_prefix}_{sample}.h5ad")
             backup_url = samples_path_dict[sample]
