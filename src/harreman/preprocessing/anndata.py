@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import Optional
 import time
 import anndata
 import numpy as np

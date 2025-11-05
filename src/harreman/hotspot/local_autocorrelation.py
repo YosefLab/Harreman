@@ -6,7 +6,6 @@ import torch
 from anndata import AnnData
 from numba import jit, njit
 from scipy.stats import norm
-from scipy.sparse import csr_matrix
 from statsmodels.stats.multitest import multipletests
 from tqdm import tqdm
 from pathlib import Path

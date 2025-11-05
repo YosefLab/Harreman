@@ -26,8 +26,11 @@ classifiers = [
 ]
 dependencies = [
   "numpy",
+  "pandas",
   "scipy",
+  "scanpy",
   "anndata",
+  "torch",
   "matplotlib",
   "seaborn",
 ]

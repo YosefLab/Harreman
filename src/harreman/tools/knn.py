@@ -1,10 +1,8 @@
 import itertools
 import warnings
 import time
-from functools import partial
 from math import ceil
-from re import compile, match
-from typing import Dict, List, Literal, Optional, Sequence, Tuple, Union
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -12,9 +10,7 @@ import scanpy as sc
 import sparse
 from anndata import AnnData
 from numba import jit
-from pynndescent import NNDescent
-from scipy.sparse import csr_matrix, triu, lil_matrix, coo_matrix, vstack
-from scipy.spatial import KDTree
+from scipy.sparse import csr_matrix, lil_matrix
 from sklearn.neighbors import NearestNeighbors, radius_neighbors_graph
 from sklearn.preprocessing import normalize
 from tqdm import tqdm

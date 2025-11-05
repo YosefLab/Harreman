@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 import sparse
 import torch
-from scipy.sparse import csr_matrix
 from anndata import AnnData
 from numba import jit, njit
 from tqdm import tqdm

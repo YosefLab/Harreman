@@ -1,5 +1,4 @@
 import itertools
-import json
 import ast
 from functools import partial
 from random import random
@@ -8,21 +7,14 @@ import time
 import torch
 import numpy as np
 import pandas as pd
-import scipy.cluster.hierarchy as hcluster
 from collections import defaultdict
 import sparse
 import warnings
-import tensorly as tl
 from anndata import AnnData
 from numba import jit, njit
-from scipy.spatial.distance import squareform
-from scipy.stats import norm, zscore, pearsonr, spearmanr
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import scale
+from scipy.stats import norm, pearsonr, spearmanr
 from statsmodels.stats.multitest import multipletests
 from tqdm import tqdm
-from threadpoolctl import threadpool_limits
-from scipy.stats.mstats import gmean
 from scipy.stats import mannwhitneyu
 from ..hotspot import models
 

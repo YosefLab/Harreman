@@ -1,12 +1,11 @@
 from itertools import zip_longest
 from re import compile, match
-from typing import Dict, List, Literal, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Literal, Optional
 import os
 import numpy as np
 import pandas as pd
 import time
 from anndata import AnnData
-from scipy.sparse import issparse
 from pathlib import Path
 
 IMPORT_METAB_KEY = "IMPORT"
