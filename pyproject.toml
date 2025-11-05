@@ -29,7 +29,7 @@ dependencies = [
   "scipy",
   "anndata",
   "matplotlib",
-  # add more runtime dependencies here
+  "seaborn",
 ]
 [project.optional-dependencies]
 dev = [
