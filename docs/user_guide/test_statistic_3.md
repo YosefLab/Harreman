@@ -1,21 +1,19 @@
-# Level 3: Are genes *a* and *b* interacting with each other?
+# Test statistic 3: Is metabolite *m* spatially autocorrelated?
 
-After having defined metabolic zones in the tissue, a relevant question is which interactions happen in those tissue regions. To infer metabolite exchange (or LRI) events present in the tissue without adding the cell type constraint, a cell-type-agnostic approach has also been implemented. This analysis, despite not making use of any novel formulas, is based on gene pairs defined in HarremanDB and/or CellChatDB, therefore restricting the communication analysis to already defined gene pairs that are known to interact with each other. As gene pairs can be made up of either different or the same genes, the formula needs to be adapted to each case. For the former case, the pairwise Hotspot correlation formula is used, that is, $H_{ab} = \sum_{i}^{}\sum_{j}^{} w_{ij} \left(X_{ai}X_{bj} + X_{bi}X_{aj}\right)$, while for the latter, that is, if $a = b$, the spatial autocorrelation formula is used, that is, $H_{a} = \sum_{i}^{}\sum_{j}^{} w_{ij}X_{ai}X_{aj}$.
+Apart from getting interaction event information at the gene pair level, those results can be integrated to study one additional layer of intracellular interactions. As each gene pair used to compute _H_ is associated with a given metabolite (HarremanDB) or ligand-receptor (LR) pathway (CellChatDB; Jin et al., _Nature protocols_, 2024), the above formulas can be summed over all gene pairs that exchange a given metabolite (or interact through a given LR pathway):
 
-For genes composed of multiple subunits, we compute either an algebraic or a geometric mean as done in SpatialDM (Li et al., _Nature communications_, 2023). These formulas are applied before standardizing the gene expression counts:
+$$ H_{m} = \sum_{a,b \in m}^{}H_{ab} $$
 
-$$ X_{ai} = \frac{\sum_{l \in S_l}^{} X_{a_li}}{|S_l|}; X_{bj} = \frac{\sum_{r \in S_r}^{} X_{b_rj}}{|S_r|} $$
+where _m_ is a given metabolite that is being exchanged by genes _a_ and _b_ (or $a = b$). In this setting, we would be assessing the spatial autocorrelation of metabolite _m_.
 
-$$ X_{ai} = \left( \prod_{l \in S_l}^{} X_{a_li} \right)^{1/L}; X_{bj} = \left( \prod_{r \in S_r}^{} X_{b_rj} \right)^{1/R} $$
+To test for statistical significance using the theoretical test, the same procedure is applied on the second moments of _H_, giving rise to the equation below:
 
-where _l_ is a subunit for gene _a_ that belongs to the set of subunits $S_L$, and _r_ is a subunit for gene _b_ that belongs to the set of subunits $S_R$. $|S_l|$ and $|S_r|$ denote the number of subunits for genes _a_ and _b_, respectively. The geometric mean is a more stringent approach, as genes with at least one subunit with zero expression will lead to an inactive gene.
+$$ E[\hat{H}_{m}^2]= \sum_{a,b \in m}^{}E[\hat{H}_{ab}^2] $$
 
-For significance testing using the parametric approach, the equations defined in Levels [1](level_1.md) and [2](level_2.md) are used, depending on whether the gene pairs are made up of the same or different genes. For the former case, the equation below is used to compute the Z-scores for the theoretical test:
+Eventually, Z-scores can be computed using the following equation:
 
-$$ \hat{Z}_a = \frac{\hat{H}_{a} - E[\hat{H}_{a}]}{var(\hat{H}_{a})^\frac{1}{2}} = \frac{\sum_{i}^{}\sum_{j}^{} w_{ij}\hat{X}_{ai}\hat{X}_{aj}}{\left(\sum_{i}^{}\sum_{j}^{} w_{ij}^2\right)^\frac{1}{2}} $$ 
+$$ \hat{Z}_{m} = \frac{\hat{H}_{m} - E[\hat{H}_{m}]}{var(\hat{H}_{m})^\frac{1}{2}} = \frac{\sum_{a,b \in m}^{}\hat{H}_{ab}}{\left(\sum_{a,b \in m}^{}E[\hat{H}_{ab}^2]\right)^\frac{1}{2}} $$
 
-while the equation below is used for the latter:
+and p-values are obtained for every metabolite by comparing the Z values to the normal distribution. P-values are then adjusted using the Benjamini-Hochberg approach.
 
-$$ \hat{Z}_{ab} = \frac{\hat{H}_{ab} - E[\hat{H}_{ab}]}{var(\hat{H}_{ab})^\frac{1}{2}} = \frac{\sum_{i}^{}\sum_{j}^{} w_{ij} \left(\hat{X}_{ai}\hat{X}_{bj} + \hat{X}_{bi}\hat{X}_{aj}\right)}{\left(\sum_{i}^{}\sum_{j}^{} w_{ij}^2\right)^\frac{1}{2}} $$
-
-The approach to perform the empirical test is also identical to the autocorrelation and pairwise correlation cases, where if gene $a=b$, the cell IDs in the counts matrix are shuffled. However, when _a_ and _b_ are different, the cell IDs corresponding to the count matrices of both gene _a_ and _b_ are shuffled, and eventually the most conservative p-values are selected. P-values from both tests are also adjusted using the Benjamini-Hochberg procedure.
+For significance testing using the empirical test, the first equation defined in this section is computed in every shuffling iteration. This is done separately for genes _a_ and _b_ because, when _a_ and _b_ are different, the cell IDs corresponding to the counts matrices of both gene _a_ and _b_ are shuffled, giving rise to $H_m (a)$ and $H_m (b)$. However, if gene $a=b$, then the same output is considered for both $H_m (a)$ and $H_m (b)$. Then, two sets of p-values are obtained through $p-value = \frac{x+1}{M+1}$, and eventually the most conservative p-values are selected. P-values are also adjusted using the Benjamini-Hochberg procedure.
