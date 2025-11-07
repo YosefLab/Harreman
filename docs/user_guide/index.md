@@ -26,7 +26,7 @@ where _l_ is a subunit for the protein encoded by gene _a_ that belongs to the s
     :link-type: doc
 ```
 ```{eval-rst}
-.. card:: Test statistic 4: Are metabolites $m_{1}$ and $m_{2}$ spatially co-localized?
+.. card:: Test statistic 4: Are metabolites *m1* and *m2* spatially co-localized?
     :link: test_statistic_4
     :link-type: doc
 ```
