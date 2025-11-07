@@ -1,6 +1,6 @@
-# Level 1: Is gene *a* spatially autocorrelated?
+# Test statistic 1: Is gene *a* spatially autocorrelated?
 
-When performing tissue zonation, having a limited set of informative genes is useful to constrain the analysis to spatially autocorrelated genes. For this, the equation defined in the Hotspot algorithm (DeTomaso and Yosef, _Cell systems_, 2021) is used on the set of metabolic genes used by the Compass algorithm (Wagner et al., _Cell_, 2021):
+When performing tissue zonation, having a limited set of informative genes is useful to constrain the analysis to spatially autocorrelated genes. The set of genes used for the equation depends on whether tissue zonation or cellular crosstalk (explained in [Test statistic 2](test_statistic_2.md)) is inferred. In the former case, the set of metabolic genes used by the Compass algorithm (Wagner et al., _Cell_, 2021) is considered, while for the latter case, we use the transporters and ligand-receptor (LR) pairs present in HarremanDB and CellChatDB (Jin et al., _Nature protocols_, 2024), respectively. Additionally, this statistic is also used when inferring cell-type-agnostic crosstalk (explained in [Test statistic 2](test_statistic_2.md)) but for the case of gene $a = b$. The equation used is equivalent to the one defined in the Hotspot algorithm (DeTomaso and Yosef, _Cell systems_, 2021):
 
 $$ H_{a} = \sum_{i}^{}\sum_{j}^{} w_{ij}X_{ai}X_{aj} $$
 
@@ -10,7 +10,7 @@ The weight $w_{ij}$ represents communication strength between neighboring cells.
 
 $$ \hat{w}_{ij} = e^{-d_{ij}^2/\sigma_{i}^2} $$
 
-where $d_{ij}$ corresponds to the distance between two neighboring cells and $\sigma_{i}$ refers to the selected bandwidth for cell _i_, which by default is set to $K/3$, where _K_ represents the number of chosen neighbors in the K-nearest-neighbors (kNN) graph or the last neighbor at a distance smaller than _d_ micrometers, with the most appropriate values being between 50 and 200 micrometers to focus on local neighborhoods. An unweighted option is also available, where the value is 1 if two cells are neighbors and 0 otherwise.
+where $d_{ij}$ corresponds to the distance between two neighboring cells and $\sigma_{i}$ refers to the selected bandwidth for cell _i_, which by default is set to $K/3$, where _K_ represents the number of chosen neighbors in the K-nearest-neighbors (kNN) graph or the number of neighbors at a distance smaller than _d_ micrometers, with the most appropriate values being between 50 and 200 micrometers to focus on local neighborhoods. An unweighted option is also available, where the value is 1 if two cells are neighbors and 0 otherwise.
 
 Weights are also normalized across cells to sum 1 for each cell (this is only done in the weighted case).
 
@@ -46,7 +46,7 @@ Therefore, the second moment of _H_ is as follows:
 
 $$ E\left[\hat{H}_{a}^2\right]= \sum_{i}^{}\sum_{j}^{} w_{ij}^2 $$
 
-To assess communication significance, like with the autocorrelation statistic, $H_{ab}$ is converted into a Z-score using the equation below, and a significance value is obtained for every gene pair by comparing the Z values to the normal distribution:
+To assess communication significance, $H_{a}$ is converted into a Z-score using the equation below, and a significance value is obtained for every gene pair by comparing the Z values to the normal distribution:
 
 $$ \hat{Z}_a = \frac{\hat{H}_{a} - E[\hat{H}_{a}]}{var(\hat{H}_{a})^\frac{1}{2}} = \frac{\sum_{i}^{}\sum_{j}^{} w_{ij}\hat{X}_{ai}\hat{X}_{aj}}{\left(\sum_{i}^{}\sum_{j}^{} w_{ij}^2\right)^\frac{1}{2}} $$
 
