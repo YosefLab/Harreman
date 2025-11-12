@@ -1,5 +1,3 @@
-<img src="docs/_static/Harreman_logo.png" alt="Alt text" width="300">
-
 # Harreman
 
 [![License](https://img.shields.io/badge/License-BSD_3--Clause-blue.svg)](https://github.com/YosefLab/Harreman/blob/main/LICENSE)
