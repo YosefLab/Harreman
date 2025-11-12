@@ -169,3 +169,18 @@ html_theme_options = {
 
 pygments_style = "default"
 
+
+# -- Config for hoverxref -------------------------------------------
+
+hoverxref_domains = ["py"]
+hoverxref_role_types = dict.fromkeys(
+    ["ref", "class", "func", "meth", "attr", "exc", "data", "mod", "obj"],
+    "tooltip",
+)
+hoverxref_intersphinx = [
+    "python",
+    "numpy",
+    "anndata",
+]
+if os.environ.get("READTHEDOCS"):
+    hoverxref_api_host = "/_"
