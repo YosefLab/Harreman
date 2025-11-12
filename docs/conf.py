@@ -9,10 +9,12 @@ from datetime import datetime
 from pathlib import Path
 from importlib.metadata import metadata
 
-HERE = Path(__file__).parent
-sys.path.insert(0, str(HERE / "extensions"))
 
-# Project information
+HERE = Path(__file__).parent
+sys.path[:0] = [str(HERE.parent), str(HERE / "extensions")]
+
+# -- Project information -----------------------------------------------------
+
 info = metadata("harreman")
 project_name = info.get("Name", "Harreman")
 project = project_name
