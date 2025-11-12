@@ -18,7 +18,7 @@ import harreman
    :toctree: reference/
    :nosignatures:
 
-   tl.compute_knn_graph
+   tools.compute_knn_graph
 ```
 
 ## Gene autocorrelation
@@ -28,7 +28,7 @@ import harreman
    :toctree: reference/
    :nosignatures:
 
-   hs.compute_local_autocorrelation
+   hotspot.compute_local_autocorrelation
 ```
 
 ## Pairwise correlation
@@ -38,7 +38,7 @@ import harreman
    :toctree: reference/
    :nosignatures:
 
-   hs.compute_local_correlation
+   hotspot.compute_local_correlation
 ```
 
 ## Create modules and calculate module scores
@@ -48,8 +48,8 @@ import harreman
    :toctree: reference/
    :nosignatures:
 
-   hs.create_modules
-   hs.calculate_module_scores
+   hotspot.create_modules
+   hotspot.calculate_module_scores
 ```
 
 ## Cell-cell communication
@@ -59,10 +59,10 @@ import harreman
    :toctree: reference/
    :nosignatures:
 
-   tl.compute_cell_communication
-   tl.compute_ct_cell_communication
-   tl.compute_interacting_cell_scores
-   tl.compute_ct_interacting_cell_scores
+   tools.compute_cell_communication
+   tools.compute_ct_cell_communication
+   tools.compute_interacting_cell_scores
+   tools.compute_ct_interacting_cell_scores
 ```
 
 ## Visualization
@@ -72,5 +72,5 @@ import harreman
    :toctree: reference/
    :nosignatures:
 
-   pl.local_correlation_plot
+   plots.local_correlation_plot
 ```
