@@ -10,6 +10,12 @@ exclude = [
     "tests",
 ]
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/harreman"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/harreman"]
+
 [project]
 name = "harreman"
 version = "0.1.2"
