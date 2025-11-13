@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import time
 from anndata import AnnData
-from pathlib import Path
+from importlib.resources import files
 
 IMPORT_METAB_KEY = "IMPORT"
 EXPORT_METAB_KEY = "EXPORT"
@@ -113,8 +113,12 @@ def extract_transporter_info(
 ) -> Dict[str, Dict[str, List[str]]]:
     """Read csv file to extract the metabolite database."""
     
-    HERE = Path(__file__).resolve()
-    BASE = HERE.parents[3] / "data" / "HarremanDB"
+    BASE = (
+        files("harreman") 
+        / "data" 
+        / "HarremanDB" 
+    )
+    
     filenames = {
         'extracellular': f"{BASE}/HarremanDB_{species}_extracellular.csv",
         'all': f"{BASE}/HarremanDB_{species}.csv",
@@ -164,9 +168,13 @@ def build_metabolite_df(metab_dict, key):
 
 def extract_lr_pairs(adata, species):
     """Extracting LR pairs from CellChatDB."""
+        
+    BASE = (
+        files("harreman") 
+        / "data" 
+        / "CellChatDB" 
+    )
     
-    HERE = Path(__file__).resolve()
-    BASE = HERE.parents[3] / "data" / "CellChatDB"
     interaction_path = f"{BASE}/interaction_input_CellChatDB_v2_{species}.csv"
     complex_path = f"{BASE}/complex_input_CellChatDB_v2_{species}.csv"
 

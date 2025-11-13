@@ -4,11 +4,16 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build]
 exclude = [
-    "data",
     "notebooks",
     "docs",
     "tests",
 ]
+include = [
+    "src/**",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/harreman"]
 
 [project]
 name = "harreman"

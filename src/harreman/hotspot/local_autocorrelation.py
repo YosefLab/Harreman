@@ -8,7 +8,7 @@ from numba import jit, njit
 from scipy.stats import norm
 from statsmodels.stats.multitest import multipletests
 from tqdm import tqdm
-from pathlib import Path
+from importlib.resources import files
 
 from . import models
 from ..preprocessing.anndata import counts_from_anndata
@@ -31,10 +31,13 @@ def load_metabolic_genes(
     List of metabolic genes.
     """
     
-    HERE = Path(__file__).resolve()
-    BASE = HERE.parents[3] / "data" / "metabolic_genes"
-    
-    metabolic_genes_path = f"{BASE}/{species}_metabolic_genes.csv"
+    metabolic_genes_path = (
+        files("harreman") 
+        / "data" 
+        / "metabolic_genes" 
+        / f"{species}_metabolic_genes.csv"
+    )
+
     metabolic_genes = pd.read_csv(metabolic_genes_path, index_col=0)['0'].tolist()
 
     return metabolic_genes
