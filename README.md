@@ -42,3 +42,7 @@ All test statistics available in the Harreman pipeline are described in the [Use
 - [Test statistic 9](https://harreman.readthedocs.io/en/latest/user_guide/test_statistic_9.html): Do genes *a* and *b* interact when *a* is expressed by cell *i* (that belongs to cell type *t*) and *b* by spatially nearby cells (that belong to cell type *u*)?
 - [Test statistic 10](https://harreman.readthedocs.io/en/latest/user_guide/test_statistic_10.html): Is metabolite *m* exchanged by cell *i* (that belongs to cell type *t*) and other spatially proximal cells (that belong to cell type *u*)?
 
+## Reference
+- **Metabolic zonation and characterization of tissue slices with spatial transcriptomics**.
+  *bioRxiv, 2025*. https://doi.org/10.1101/2025.11.11.687271
+
