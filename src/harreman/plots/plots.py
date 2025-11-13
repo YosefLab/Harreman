@@ -21,6 +21,29 @@ def local_correlation_plot(
     use_super_modules=False,
     show=True,
 ):
+    """
+    Plot a hierarchical-clustered heatmap of pairwise correlation Z-scores.
+
+    Parameters
+    ----------
+    adata : AnnData
+        AnnData object containing:
+        - ``uns['lc_zs']``: DataFrame of pairwise correlation Z-scores
+        - ``uns['modules']`` or ``uns['super_modules']``
+        - ``uns['linkage']``: scipy linkage matrix
+    mod_cmap : str, default "tab10"
+        Colormap for module color annotations.
+    vmin, vmax : float, default -10 and 10, respectively
+        Limits for the heatmap color scale.
+    z_cmap : str, default "RdBu_r"
+        Colormap for the Z-score heatmap.
+    yticklabels : bool, default False
+        Whether to show y-axis tick labels.
+    use_super_modules : bool, default False
+        Whether to use ``uns['super_modules']`` instead of ``uns['modules']``.
+    show : bool, default True
+        If ``True``, display the plot.
+    """
     
     local_correlation_z = adata.uns["lc_zs"]
     modules = adata.uns["super_modules"] if use_super_modules else adata.uns["modules"]
@@ -118,6 +141,34 @@ def average_local_correlation_plot(
     super_module_dict=None,
     show=True,
 ):
+    """
+    Plot the average pairwise correlation Z-scores between modules.
+
+    Parameters
+    ----------
+    adata : AnnData
+        AnnData object containing:
+        - ``uns['lc_zs']``: DataFrame of pairwise correlation Z-scores
+        - ``uns['modules']`` or ``uns['super_modules']``  
+        - ``uns['mod_reordered']``: ordering from `local_correlation_plot`
+    mod_cmap : str, default "tab10"
+        Colormap for module annotations.
+    vmin, vmax : float, default -10 and 10, respectively
+        Color scale limits for Z-scores.
+    cor_cmap : str, default "RdBu_r"
+        Colormap for the averaged correlation matrix.
+    yticklabels : bool, default False
+        Whether to display module labels on the heatmap.
+    row_cluster, col_cluster : bool, default True
+        Whether to apply clustering along rows/columns.
+    use_super_modules : bool, default False
+        Whether to use super-modules.
+    super_module_dict : dict, optional
+        Map of super-module → list of modules, used to color modules by their
+        parent super-module.
+    show : bool, default True
+        Whether to display the plot.
+    """
     
     local_correlation_z = adata.uns["lc_zs"]
     modules = adata.uns["super_modules"] if use_super_modules else adata.uns["modules"]
@@ -222,6 +273,35 @@ def module_score_correlation_plot(
     col_cluster=True,
     show=True,
 ):
+    """
+    Plot correlations between module scores across cells.
+
+    Parameters
+    ----------
+    adata : AnnData
+        Must contain:
+        - ``obsm['module_scores']`` or ``obsm['super_module_scores']``
+        - ``uns['modules']`` or ``uns['super_modules']``
+        - ``uns['mod_reordered']``
+    mod_cmap : str, default "tab10"
+        Colormap for module annotations.
+    vmin, vmax : float, default -1 and 1, respectively
+        Color scale limits for the correlation heatmap.
+    cor_cmap : str, default "RdBu_r"
+        Colormap for correlation values.
+    yticklabels : bool, default False
+        Whether to show y-axis labels.
+    method : {"pearson", "spearman"}, default "pearson"
+        Correlation method.
+    use_super_modules : bool, default False
+        Whether to use super-module scores.
+    super_module_dict : dict, optional
+        Coloring scheme based on parent super-modules.
+    row_cluster, col_cluster : bool, default True
+        Whether to cluster rows/columns before plotting.
+    show : bool, default True
+        Whether to display the plot.
+    """
     
     module_scores = adata.obsm['super_module_scores'] if use_super_modules else adata.obsm['module_scores']
     modules = adata.uns["super_modules"] if use_super_modules else adata.uns["modules"]
@@ -310,7 +390,6 @@ def module_score_correlation_plot(
 
 def plot_interacting_cell_scores(
     adata: AnnData,
-    cell_type_pair: Optional[list] = None,
     interactions: Optional[list] = None,
     coords_obsm_key: Optional[str] = None,
     test: Optional[Union[Literal["parametric"], Literal["non-parametric"]]] = None,
@@ -326,6 +405,41 @@ def plot_interacting_cell_scores(
     colorbar: Optional[bool] = True,
     swap_y_axis: Optional[bool] = False,
 ):
+    """
+    Plot spatial maps of interacting cell scores for selected gene pairs or metabolites.
+
+    Parameters
+    ----------
+    adata : AnnData
+        Must contain interacting cell statistics in:
+        ``uns['interacting_cell_results'][test]['gp'/'m']``.
+    interactions : list of str
+        Gene pairs or metabolites to plot.
+    coords_obsm_key : str
+        Key in ``adata.obsm`` containing spatial coordinates.
+    test : {"parametric", "non-parametric"}
+        Determines which statistical results to load.
+    only_sig_values : bool, default False
+        If True, plot only significant values (FDR or p-value).
+    use_FDR : bool, default True
+        If ``only_sig_values=True``, choose FDR instead of raw p-values.
+    normalize_values : bool, default False
+        Apply per-interaction min–max normalization.
+    sample_specific : bool, default False
+        Plot each sample separately, using ``uns['sample_key']``.
+    s : float
+        Dot size.
+    vmin, vmax : float or str ("p5", "p95"), optional
+        Color scale limits; percentiles allowed.
+    figsize: tuple, default (10,10)
+        Figure size.
+    cmap : str, default "Reds"
+        Colormap for the score intensity.
+    colorbar : bool, default True
+        Show or hide the colorbar.
+    swap_y_axis : bool, default False
+        Flip the y-axis for visualization conventions.
+    """
     
     if isinstance(vmin, str) and 'p' not in vmin:
         raise ValueError('"vmin" needs to be either a numeric value or a percentile: e.g. "p5".')
@@ -410,6 +524,44 @@ def plot_ct_interacting_cell_scores(
     colorbar: Optional[bool] = True,
     swap_y_axis: Optional[bool] = False,
 ):
+    """
+    Plot cell-type–specific interacting cell scores (for gene pairs or metabolites) across spatial coordinates.
+
+    Parameters
+    ----------
+    adata : AnnData
+        AnnData containing per-cell-type interaction scores.
+    deconv_adata : AnnData, optional
+        If provided, interaction results are copied from this object into `adata`.
+    cell_type_pair : list of str or list of tuple
+        Cell type pairs to visualize  
+        - tuple: ("T cell", "Macrophage")  
+        - string: "T cell" (matches any pair containing this cell type)
+    interactions : list of str
+        Gene pairs or metabolites to visualize.
+    coords_obsm_key : str
+        Key for spatial coordinates in ``obsm``.
+    test : {"parametric", "non-parametric"}
+        Statistical test used during computation.
+    agg_only : bool, default False
+        Whether to plot only aggregated per-cell-type interactions.
+    normalize_values : bool, default False
+        Apply min–max normalization to each column.
+    sample_specific : bool, default False
+        Plot one figure per sample.
+    s : float
+        Dot size.
+    vmin, vmax : float or str ("p5"), optional
+        Color scale limits; percentiles allowed.
+    figsize : tuple, default (10,10)
+        Figure size.
+    cmap : str, default "Reds"
+        Colormap for plotting.
+    colorbar : bool, default True
+        Whether to display the colorbar.
+    swap_y_axis : bool, default False
+        Flip y-axis orientation.
+    """
     
     if isinstance(vmin, str) and 'p' not in vmin:
         raise ValueError('"vmin" needs to be either a numeric value or a percentile: e.g. "p5".')

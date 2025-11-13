@@ -60,8 +60,7 @@ def compute_local_autocorrelation(
     verbose: Optional[bool] = False,
 ):
     """
-    Computes gene-level local spatial autocorrelation statistics (G, G_max, Z-score, p-value, FDR)
-    for a given AnnData object using spatial weights and centered gene expression values.
+    Computes gene-level spatial autocorrelation statistics using spatial weights and centered gene expression values.
 
     Parameters
     ----------

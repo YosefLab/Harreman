@@ -28,7 +28,7 @@ def compute_knn_graph(
     tree = None,
     verbose: Optional[bool] = False,
 ):
-    """Compute KNN graph.
+    """Computes the spatial proximity graph.
 
     Parameters
     ----------
@@ -52,8 +52,8 @@ def compute_knn_graph(
         Root tree node. Can be created using ete3.Tree
     verbose
         Whether to print progress and status messages.
-
     """
+    
     start = time.time()
     
     if n_neighbors is None and neighborhood_radius is None:

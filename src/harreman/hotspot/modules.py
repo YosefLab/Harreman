@@ -670,7 +670,28 @@ def compute_top_scoring_modules(
     adata: AnnData,
     sd: Optional[float] = 1,
     use_super_modules: Optional[bool] = False,
-):    
+):
+    """
+    Identify the top-scoring module (or super-module) for each cell.
+
+    Parameters
+    ----------
+    adata : AnnData
+        Must contain a matrix of module or super-module scores in:
+        - ``obsm['module_scores']`` or  
+        - ``obsm['super_module_scores']``
+    sd : float, default 1
+        Standard deviation threshold to determine strong module activation.
+        Only modules with ``zscore > sd`` are considered strictly activated.
+    use_super_modules : bool, default False
+        If True, select among super-modules instead of standard modules.
+
+    Returns
+    -------
+    pandas.Series
+        A Series indexed by cell, containing the name of the top-scoring
+        module/super-module for each cell.
+    """
     
     MODULE_KEY = 'super_module_scores' if use_super_modules else 'module_scores'
     

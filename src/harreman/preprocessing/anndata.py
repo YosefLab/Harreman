@@ -258,6 +258,22 @@ def write_h5ad(
     adata: anndata.AnnData, 
     filename: Optional[str] = None,
 ):
+    """
+    Save an AnnData object to disk with Harreman-compatible preprocessing.
+
+    Parameters
+    ----------
+    adata : AnnData
+        The AnnData object to save.
+    filename : str, optional
+        Path to the output `.h5ad` file. If omitted, an error is raised.
+
+    Notes
+    -----
+    The wrapper ensures that custom Harreman/Hotspot fields remain fully restorable
+    when loading the file with `read_h5ad()`.
+    """
+    
     if filename is None:
         raise ValueError('Please provide the path to save the file.')
     elif not filename.endswith('h5ad'):
@@ -390,7 +406,23 @@ def recover_uns_harreman(adata):
     return
 
 
-def read_h5ad(filename):
+def read_h5ad(
+    filename: str,
+):
+    """
+    Load an AnnData object from disk and restore Harreman-specific metadata.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the `.h5ad` file to load.
+
+    Returns
+    -------
+    AnnData
+        The fully restored AnnData object with Harreman metadata recovered.
+    """
+    
     adata = anndata.read_h5ad(filename)
 
     if 'genes' in adata.uns:

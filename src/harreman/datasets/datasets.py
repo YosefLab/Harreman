@@ -13,12 +13,12 @@ def load_visium_mouse_colon_dataset(
     sample: Optional[str] = None,
 ) -> "sc.AnnData":
     """
-    Load the mouse colon Visium dataset.
+    Load the mouse colon 10x Visium dataset.
 
     Returns
     -------
     adata : AnnData
-        The loaded Visium dataset.
+        The loaded 10x Visium dataset.
     """
     
     dataset_prefix = 'Parigi_et_al_mouse_colon'

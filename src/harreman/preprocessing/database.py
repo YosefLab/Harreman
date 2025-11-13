@@ -21,7 +21,7 @@ def extract_interaction_db(
     extracellular_only: Optional[bool] = True,
     verbose: Optional[bool] = False,
 ) -> None:
-    """Extract the metabolite transporter or LR database from .csv files.
+    """Extract the metabolite transporter or ligand-receptor (LR) database from .csv files.
 
     Parameters
     ----------

@@ -1416,6 +1416,30 @@ def select_significant_interactions(
     use_FDR: Optional[bool] = True,
     threshold: Optional[float] = 0.05,
 ):
+    """
+    Select significant gene pairs or metabolite-mediated interactions based on
+    FDR/p-value thresholds and (optionally) cell-type–aware tests.
+
+    Parameters
+    ----------
+    adata : AnnData
+        AnnData object containing:
+        - ``uns['ccc_results']`` or ``uns['ct_ccc_results']``, each of which includes:
+            * ``cell_com_df_gp``: DataFrame with statistics for gene pairs  
+            * ``cell_com_df_m``:  DataFrame with statistics for metabolites
+    ct_aware : bool, default False
+        If True, use cell-type–aware CCC results (``uns['ct_ccc_results']``).
+        If False, use cell-type-agnostic CCC results (``uns['ccc_results']``).
+    test : {"parametric", "non-parametric"}, default "parametric"
+        Determines which statistical columns to use:
+        - Parametric: ``Z_FDR`` / ``Z_pval``, ``C_p``  
+        - Non-parametric: ``FDR_np`` / ``pval_np``, ``C_np``
+    use_FDR : bool, default True
+        If True, threshold significance using FDR values.
+        If False, use raw p-values.
+    threshold : float, default 0.05
+        Significance cutoff applied to the selected statistic (FDR or p-value).
+    """
     
     ccc_key = 'ct_ccc_results' if ct_aware else 'ccc_results'
     sig_key = 'FDR' if use_FDR else 'pval'
@@ -1458,6 +1482,41 @@ def compute_interacting_cell_scores(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     verbose: Optional[bool] = False,
 ):
+    """
+    Compute interacting cell scores for gene pairs and metabolites.
+
+    Parameters
+    ----------
+    adata : AnnData or str
+        AnnData object containing:
+        - ``uns['model']`` and ``uns['mean']`` (expression normalization model)
+        - ``uns['gene_pairs']``, ``uns['gene_pairs_per_metabolite']``
+        - ``obsp['weights']``: sparse spatial weight matrix
+        - ``uns['ccc_results']`` (for significance filtering)
+    center_counts_for_np_test : bool, optional
+        If True, center/normalize counts prior to the non-parametric test.
+    test : {"parametric", "non-parametric", "both"}
+        Which interacting cell score tests to compute.
+    restrict_significance : {"gene pairs", "metabolites", "both"}
+        Use only significant gene pairs/metabolites from CCC results.
+    compute_significance : {"parametric", "non-parametric", "both"}
+        Whether to compute significance (p-values, FDR) in each test.
+    M : int, default 1000
+        Number of permutations for the non-parametric test.
+    seed : int, default 42
+        Random seed for permutation reproducibility.
+    check_analytic_null : bool, default False
+        If True, evaluate the analytic null distribution during permutations.
+    device : torch.device
+        CPU or GPU device for tensor operations.
+    verbose : bool, default False
+        Print status updates.
+
+    Returns
+    -------
+    None
+        Results are stored in ``adata.uns['interacting_cell_results']``.
+    """
     
     start = time.time()
     if verbose:
@@ -1854,6 +1913,30 @@ def compute_ct_interacting_cell_scores(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     verbose: Optional[bool] = False,
 ):
+    """
+    Compute cell-type–aware interacting cell scores for gene pairs and metabolites.
+
+    Parameters
+    ----------
+    adata : AnnData or str
+        Must contain:
+        - ``uns['model']``, ``uns['mean']``
+        - ``uns['cell_type_key']`` and ``obs[cell_type_key]`` for cell types
+        - ``uns['gene_pairs']``, ``uns['gene_pairs_per_ct_pair']``
+        - ``uns['gene_pairs_per_metabolite']``
+        - ``uns['ct_ccc_results']`` with significance information
+        - ``obsp['weights']`` (spatial proximity matrix)
+    center_counts_for_np_test : bool, default False
+        Whether to standardize counts before the non-parametric test.
+    test : {"parametric", "non-parametric", "both"}
+        Which statistical test(s) to run.
+    restrict_significance : {"gene pairs", "metabolites", "both"}
+        Only use cell-type-pair interactions that were significant in cell-type-aware CCC results.
+    device : torch.device
+        CPU or GPU device for PyTorch computations.
+    verbose : bool, default False
+        Print detailed progress messages.
+    """
     
     start = time.time()
     if verbose:
@@ -3575,6 +3658,35 @@ def compute_interaction_module_correlation(
     use_FDR: Optional[bool] = True,
     use_super_modules: Optional[bool] = False,
 ):
+    """
+    Compute correlations between interacting cell scores and module scores.
+
+    Parameters
+    ----------
+    adata : AnnData
+        Must contain:
+        - ``uns['interacting_cell_results']`` (parametric or non-parametric interacting cell scores)
+        - ``obsm['module_scores']`` or ``obsm['super_module_scores']``
+        - ``uns['metabolites']`` or ``uns['gene_pairs_sig_names']``
+    cor_method : {"pearson", "spearman"}, default "pearson"
+        Statistical method used to compute correlations.
+    test : {"parametric", "non-parametric"}
+        Which interacting-cell score set to use.
+        - `"parametric"` → uses ``uns['interacting_cell_results']['p']``
+        - `"non-parametric"` → uses ``uns['interacting_cell_results']['np']``
+    interaction_type : {"metabolite", "gene_pair"}, default "metabolite"
+        Select whether to correlate:
+        - metabolite scores, or  
+        - gene pair scores.
+    only_sig_values : bool, default False
+        If True, use only significant interacting cell score values (`cs_sig_pval` or `cs_sig_FDR`).
+    normalize_values : bool, default False
+        Apply min–max normalization to interacting cell score values per interaction.
+    use_FDR : bool, default True
+        If ``only_sig_values=True``, determines whether to filter by FDR or raw p-values.
+    use_super_modules : bool, default False
+        Whether to use super-module scores (``obsm['super_module_scores']``) instead of module scores.
+    """
     
     MODULE_KEY = 'super_module_scores' if use_super_modules else 'module_scores'
     
