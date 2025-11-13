@@ -45,7 +45,7 @@ import harreman
    :toctree: reference/
    :nosignatures:
 
-   database.extract_interaction_db
+   preprocessing.extract_interaction_db
 ```
 
 ## Setting up deconvolution AnnData
@@ -55,7 +55,7 @@ import harreman
    :toctree: reference/
    :nosignatures:
 
-   anndata.setup_deconv_adata
+   preprocessing.setup_deconv_adata
 ```
 
 ## Metabolic crosstalk
@@ -97,6 +97,6 @@ import harreman
    :toctree: reference/
    :nosignatures:
 
-   anndata.read_h5ad
-   anndata.write_h5ad
+   read_h5ad
+   write_h5ad
 ```
