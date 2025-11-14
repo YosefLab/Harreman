@@ -7,9 +7,13 @@ to [Semantic Versioning]. Full commit history is available in the
 
 ## Version 0.1
 
+### 0.1.3
+
+First official release of Harreman after preprint publication.
+
 ### 0.1.2
 
-First major release of Harreman.
+First major release of Harreman before preprint publication.
 
 ### 0.1.1
 
