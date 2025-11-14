@@ -49,6 +49,7 @@ dependencies = [
   "matplotlib",
   "seaborn",
   "mplscience",
+  "plotnine",
 ]
 [project.optional-dependencies]
 dev = [
