@@ -695,7 +695,9 @@ def compute_top_scoring_modules(
     
     MODULE_KEY = 'super_module_scores' if use_super_modules else 'module_scores'
     
-    df = zscore(adata.obsm[MODULE_KEY], axis=0)
+    df = pd.DataFrame(zscore(adata.obsm[MODULE_KEY], axis=0), 
+                      index=adata.obsm[MODULE_KEY].index, 
+                      columns=adata.obsm[MODULE_KEY].columns)
 
     top_scoring_modules = pd.Series(index = df.index)
     for mod_id, row in df.iterrows():
