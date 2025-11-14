@@ -43,10 +43,12 @@ dependencies = [
   "scipy",
   "scanpy",
   "anndata",
+  "muon",
   "torch",
   "sparse",
   "matplotlib",
   "seaborn",
+  "mplscience",
 ]
 [project.optional-dependencies]
 dev = [
