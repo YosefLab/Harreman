@@ -58,7 +58,7 @@ extensions = [
     "sphinx_copybutton",
     "sphinx_design",
     "sphinxext.opengraph",
-    "hoverxref.extension",
+#    "hoverxref.extension",
     *[p.stem for p in (HERE / "extensions").glob("*.py")],
 ]
 
