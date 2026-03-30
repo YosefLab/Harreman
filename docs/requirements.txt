@@ -1,2 +1,2 @@
 sphinx<8
-hoverxref
+sphinx-hoverxref
