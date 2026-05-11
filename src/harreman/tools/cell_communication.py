@@ -232,7 +232,7 @@ def cohens_d(x, y):
     
     out = np.empty(x.shape[0])
     
-    for i in prange(x.shape[0]):
+    for i in range(x.shape[0]):
         nx, ny = len(x[i]), len(y[i])
         vx, vy = np.var(x[i], ddof=1), np.var(y[i], ddof=1)
         pooled = np.sqrt(((nx - 1) * vx + (ny - 1) * vy) / (nx + ny - 2))
