@@ -1,11 +1,25 @@
 # Release notes
 
-All versions of this package are documented in this file. his format is based on [Keep a Changelog],
+All versions of this package are documented in this file. This format is based on [Keep a Changelog],
 and this project adheres
 to [Semantic Versioning]. Full commit history is available in the
 [commit logs](https://github.com/Yoseflab/harreman/commits/).
 
 ## Version 0.1
+
+### 0.1.4
+
+#### Bug Fixes
+- Fixed import of `_get_mean_var` in `harreman.vision.signature`
+- Fixed `cohens_d` in `harreman.tools.cell_communication`: replaced `prange` with `range` to resolve parallelism issue
+
+#### New Features
+- Added `harreman.vision.utils` module with shared utility functions
+
+#### Documentation
+- Updated DestVI data loading in tutorials for Slide-seq lung, Visium colon, CD4 T cells, and spatial data notebooks
+- Upgraded ReadTheDocs build environment from Ubuntu 20.04 to 24.04
+- Fixed documentation dependencies and removed deprecated `hoverxref` extension
 
 ### 0.1.3
 
